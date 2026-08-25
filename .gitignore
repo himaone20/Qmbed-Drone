@@ -1,0 +1,18 @@
+# Build artifacts (Arduino / STM32duino)
+build/
+Debug/
+*.elf
+*.bin
+*.hex
+*.map
+
+# IDE
+.vscode/
+.idea/
+
+# Kode referensi pihak lain (tidak di-track)
+Refrensi/
+
+# OS
+Thumbs.db
+.DS_Store
