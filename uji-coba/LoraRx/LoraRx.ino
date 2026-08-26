@@ -1,159 +1,456 @@
 /* ==========================================================================
- * PROGRAM LORA RA-02 (SX1278) - RECEIVER + 4 ESC/MOTOR - STM32F401RCT6
+ * PROGRAM LORA RA-02 (SX1278) - DRONE SIDE (SLAVE) - STM32F401RCT6
  * Sesuai pinout skematik: SPI2 + RST/DIO0 di PORT B
- * Serial biasa di-set manual ke PA9 (TX) / PA10 (RX), 115200 baud
+ * Serial biasa di-set manual ke PA9 (TX) / PA10 (RX), 115200 baud (debug lokal)
  *
- * Menerima data joystick dari transmitter ESP32 dalam format teks CSV:
- *   "R,T,Y,P"   contoh: "128,200,128,90"
- *   R=ROLL, T=THROTTLE, Y=YAW, P=PITCH (masing-masing 0..255,
- *   center 128 untuk ROLL/PITCH/YAW; throttle bawah=0, atas=255)
+ * TOPOLOGI KOMUNIKASI 2 ARAH (half-duplex, skema PING-PONG):
+ *   1) Remote (ESP32, master) mengirim data joystick lalu langsung berpindah
+ *      ke mode terima dan menunggu balasan telemetri.
+ *   2) Drone (STM32, slave - program ini) selalu diam di mode RX. Begitu
+ *      paket joystick diterima, drone langsung membaca sensor BMI160+BMP280
+ *      dan MEMBALAS satu paket telemetri biner ringkas ke remote, lalu
+ *      kembali ke mode RX menunggu paket berikutnya.
+ *   Skema ini memastikan hanya SATU sisi yang memancar pada satu waktu
+ *   (tidak ada tabrakan half-duplex) dan bandwidth dipakai bergantian
+ *   secara efisien untuk kedua arah.
  *
- * KONFIGURASI MOTOR (Quad X):
- *   Motor 1 : CCW | DEPAN-KIRI      -> PB6
- *   Motor 2 : CW  | DEPAN-KANAN     -> PB7
- *   Motor 3 : CCW | BELAKANG-KANAN  -> PB8
- *   Motor 4 : CW  | BELAKANG-KIRI   -> PB9
+ * FORMAT PAKET LORA (BINER, fixed-size -> airtime presisi & minimal):
+ *   Alasan pakai biner (bukan teks/ASCII CSV): payload ASCII seperti
+ *   "0.12,-0.34,...,12.34" bisa 40-60 byte lebih dan airtime-nya (~90-110 ms
+ *   pada SF7/BW125k) jauh melebihi timeout balasan yang wajar, sehingga
+ *   balasan drone SERING TERLEWAT oleh remote (inilah penyebab GUI selalu
+ *   membaca 0 pada versi ASCII sebelumnya). Payload biner fixed-size
+ *   menjamin airtime konsisten & dapat dihitung presisi.
  *
- * KONVERSI CHANNEL (persis seperti DroneSimulator / _on_channels):
- *   roll_pct  = (R - 128) / 127 * 100      -> -100..+100
- *   yaw_pct   = (Y - 128) / 127 * 100      -> -100..+100
- *   pitch_pct = (P - 128) / 127 * 100      -> -100..+100 (positif = maju)
- *   THROTTLE: TENGAH = 0%  -> T <= 128 : 0%, di atas tengah : 0..100%
+ *   Uplink   (Remote -> Drone) : struct UplinkPacket   (6 byte)
+ *     uint8_t magic = 0xA5
+ *     uint8_t r, t, y, p        (0..255, center 128 utk R/Y/P; T:0=bawah,255=atas)
+ *     uint8_t armed             (0 = DISARM, 1 = ARM)
  *
- * MIXING QUAD-X:
- *   M1 (FL CCW) = T + Roll - Pitch + Yaw
- *   M2 (FR CW)  = T - Roll - Pitch - Yaw
- *   M3 (RR CCW) = T - Roll + Pitch + Yaw
- *   M4 (RL CW)  = T + Roll + Pitch - Yaw
- *   (roll kanan -> motor kiri naik; pitch maju -> motor belakang naik;
- *    yaw kanan -> motor CCW naik). Hasil di-clamp 0..100% lalu
- *    dikonversi ke pulsa 1000..2000 us.
+ *   Downlink (Drone -> Remote) : struct DownlinkPacket  (17 byte)
+ *     uint8_t magic = 0x5A
+ *     int16_t ax, ay, az        (m/s^2  x100, contoh 981 = 9.81 m/s^2)
+ *     int16_t gx, gy, gz        (deg/s  x100)
+ *     uint16_t press            (hPa    x10 , contoh 10132 = 1013.2 hPa)
+ *     int16_t  alt              (meter  x100)
+ *     Semua nilai 16-bit dikirim little-endian. TIDAK ada suhu (tidak
+ *     dipakai sama sekali pada proyek ini).
  *
- * Respons motor diberi smoothing eksponensial (sama seperti drone_model.py)
- * agar gerakan halus, bukan patah-patah.
- *
- * KEAMANAN:
- *   - Saat boot semua ESC di-set ke throttle minimum (1000 us)
- *   - Arming: menunggu 5 detik sebelum siap
- *   - FAILSAFE: jika sinyal LoRa hilang > 1 detik, semua motor
- *     langsung (tanpa smoothing) kembali ke 1000 us + LED kedip cepat
- *   - Emergency STOP: ketik "STOP" di serial monitor -> motor minimum.
- *     Normal kembali hanya setelah throttle kembali ke posisi tengah/bawah.
+ * KONTROL ESC 4 MOTOR:
+ *   - Motor 1: PB6 (Depan-Kiri)
+ *   - Motor 2: PB7 (Depan-Kanan)
+ *   - Motor 3: PB8 (Belakang-Kanan)
+ *   - Motor 4: PB9 (Belakang-Kiri)
+ *   - Perintah ARM dari GUI -> Remote -> LoRa -> Drone:
+ *     1) Kirim 1000 us selama 5 detik (Arming sequence, non-blocking)
+ *     2) Setelah 5 detik: ARMED -> 4 motor berputar 20% (1200 us)
+ *     3) Jika DISARM / Failsafe (sinyal hilang > 1 detik) -> Motor STOP (1000 us)
  * ==========================================================================
  * PERSIAPAN:
- * 1. Tools > Board > Generic STM32F4 series -> Board part number: Generic F401RCTx
- * 2. Install library "LoRa" (Sandeep Mistry) via Library Manager
- * 3. Library Servo sudah bawaan core STM32duino
+ *  1. Tools > Board > Generic STM32F4 series -> Board part number: Generic F401RCTx
+ *  2. Install library "LoRa" (Sandeep Mistry) via Library Manager
  *
  * KONFIGURASI PIN (sesuai skematik):
- *   Serial (USART1, di-remap manual)
- *     PA9  -> TX0
- *     PA10 -> RX0
- *     Baudrate: 115200
+ *  Serial (USART1, di-remap manual, untuk debug lokal via USB-TTL)
+ *    PA9  -> TX0
+ *    PA10 -> RX0
+ *    Baudrate: 115200
  *
- *   SPI2 (ke modul LoRa RA-02)
- *     PB13 -> RA02_SCK
- *     PB14 -> RA02_MISO
- *     PB15 -> RA02_MOSI
- *     PB12 -> RA02_NSS (CS)
- *     PB1  -> RA02_RST
- *     PB0  -> RA02_DIO0
+ *  SPI2 (ke modul LoRa RA-02)
+ *    PB13 -> RA02_SCK
+ *    PB14 -> RA02_MISO
+ *    PB15 -> RA02_MOSI
+ *    PB12 -> RA02_NSS (CS)
+ *    PB1  -> RA02_RST
+ *    PB0  -> RA02_DIO0
  *
- *   ESC (signal, semua channel TIM4)
- *     PB6 -> ESC Motor 1
- *     PB7 -> ESC Motor 2
- *     PB8 -> ESC Motor 3
- *     PB9 -> ESC Motor 4
- *     PC13 -> LED status (bawaan board, aktif LOW)
+ *  I2C (ke BMI160 + BMP280, shared bus)
+ *    PB10 -> SCL
+ *    PB3  -> SDA
+ *
+ *  PC4 -> LED indikator status ARM/DISARM (aktif LOW)
  * ==========================================================================
  */
 
 #include <SPI.h>
 #include <LoRa.h>
+#include <Wire.h>
 #include <Servo.h>
 #include <math.h>
+#include <string.h>
 
 /* ---------------- Definisi pin LoRa (sesuai skematik) ---------------- */
-#define LORA_NSS   PB12
-#define LORA_RST   PB1
-#define LORA_DIO0  PB0
+#define LORA_NSS  PB12
+#define LORA_RST  PB1
+#define LORA_DIO0 PB0
 
-/* ---------------- Definisi pin ESC & LED ----------------------------- */
-#define MOTOR1_PIN  PB6    // CCW, DEPAN-KIRI
-#define MOTOR2_PIN  PB7    // CW , DEPAN-KANAN
-#define MOTOR3_PIN  PB8    // CCW, BELAKANG-KANAN
-#define MOTOR4_PIN  PB9    // CW , BELAKANG-KIRI
-#define LED_PIN     PC13   // LED board, aktif LOW
+/* ---------------- Definisi pin ESC 4 Motor ---------------------------- */
+#define MOTOR1_PIN PB6   // Motor 1: CCW (Depan-Kiri)
+#define MOTOR2_PIN PB7   // Motor 2: CW  (Depan-Kanan)
+#define MOTOR3_PIN PB8   // Motor 3: CCW (Belakang-Kanan)
+#define MOTOR4_PIN PB9   // Motor 4: CW  (Belakang-Kiri)
+
+/* ---------------- Definisi pin LED status ----------------------------- */
+#define LED_PIN PC4      // LED indikator ARM/DISARM di PC4 (aktif LOW)
 
 /* ---------------- Objek SPI2 ---------------- */
 SPIClass SPI_2(PB15, PB14, PB13);   // MOSI, MISO, SCK
 
-/* ---------------- Konfigurasi Frekuensi ---------------- */
-/* Harus SAMA dengan transmitter (ESP32): 433 MHz */
-#define LORA_FREQUENCY  433E6
+/* ---------------- Konfigurasi Frekuensi & radio ------------------------ */
+/* Harus SAMA dengan sisi remote (ESP32): 433 MHz */
+#define LORA_FREQUENCY 433E6
 
-/* ---------------- Konfigurasi ESC & Mixing --------------------------- */
-#define ESC_MIN_US          1000    // throttle minimum (0%)
-#define ESC_MAX_US          2000    // throttle maksimum (100%)
-#define ARM_DELAY_MS        5000    // waktu tunggu arming ESC
-#define FAILSAFE_TIMEOUT_MS 1000    // batas hilang sinyal LoRa
-#define THROTTLE_CENTER     128     // stick tengah = 0%
-#define SMOOTH_RATE         3.0f    // konstanta smoothing (sama dgn simulator)
-#define LOOP_DT             0.05f   // perkiraan periode paket (20 Hz)
+/* ---------------- Konfigurasi failsafe & ESC --------------------------- */
+#define LINK_TIMEOUT_MS     1000   // batas hilang sinyal joystick dari remote
+#define ESC_MIN_US          1000   // PWM stop / idle (0%)
+#define ESC_MAX_US          2000   // PWM full throttle (100%)
+#define ESC_ARM_SPIN_US     1200   // 20% throttle saat ARMED (1000 + 1000*0.20)
+#define ARMING_DURATION_MS  5000   // waktu tunggu arming ESC (5 detik)
 
+/* ---------------- Objek & State Motor ESC ----------------------------- */
 Servo motors[4];
 const int MOTOR_PINS[4] = { MOTOR1_PIN, MOTOR2_PIN, MOTOR3_PIN, MOTOR4_PIN };
 
-/* ---------------- State ------------------------------------------------ */
-unsigned long lastPacketMs = 0;
-bool failsafeActive  = true;    // mulai dalam kondisi aman (belum ada sinyal)
-bool emergencyStop   = false;   // terkunci setelah perintah STOP dari serial
-unsigned long ledBlinkMs = 0;
-bool ledState = false;
+enum EscState {
+  ESC_DISARMED,
+  ESC_ARMING,
+  ESC_ARMED
+};
 
-float mPct[4] = { 0, 0, 0, 0 }; // keluaran mixing yang sudah di-smooth (%)
+EscState escState = ESC_DISARMED;
+unsigned long armingStartMs = 0;
 
-/* ---------------- Fungsi bantu ESC ------------------------------------- */
-void forceStop()
+/* ---------------- I2C pins (sensor) ------------------------------------- */
+#define I2C_SCL PB10
+#define I2C_SDA PB3
+
+/* Alamat I2C sensor */
+#define BMI160_ADDR 0x68
+#define BMP280_ADDR 0x76
+
+/* ========================= PROTOKOL PAKET BINER ========================= */
+#define UPLINK_MAGIC   0xA5
+#define DOWNLINK_MAGIC 0x5A
+
+#pragma pack(push, 1)
+struct UplinkPacket {
+  uint8_t magic;   // harus == UPLINK_MAGIC
+  uint8_t r, t, y, p;
+  uint8_t armed;   // 0 = DISARM, 1 = ARM
+};
+
+struct DownlinkPacket {
+  uint8_t  magic;   // harus == DOWNLINK_MAGIC
+  int16_t  ax, ay, az;   // m/s^2  x100
+  int16_t  gx, gy, gz;   // deg/s  x100
+  uint16_t press;        // hPa    x10
+  int16_t  alt;          // meter  x100
+};
+#pragma pack(pop)
+
+/* ========================= FUNGSI KONTROL ESC =========================== */
+
+void setAllMotorsPWM(int us)
 {
+  if (us < ESC_MIN_US) us = ESC_MIN_US;
+  if (us > ESC_MAX_US) us = ESC_MAX_US;
   for (int i = 0; i < 4; i++) {
-    mPct[i] = 0.0f;
-    motors[i].writeMicroseconds(ESC_MIN_US);
+    motors[i].writeMicroseconds(us);
   }
 }
 
-/*
- * Mixing Quad-X + smoothing.
- * Semua input dalam persen (-100..+100, kecuali thr 0..100).
- * Arah sesuai konvensi DroneSimulator:
- *   Roll  positif = miring ke kanan  -> motor kiri naik
- *   Pitch positif = maju             -> motor belakang naik
- *   Yaw   positif = putar ke kanan   -> motor CCW naik
- */
-void applyMix(float rollPct, float yawPct, float pitchPct, float thrPct)
+void updateEscFSM(bool armCommand)
 {
-  float raw[4];
-  raw[0] = thrPct + rollPct - pitchPct + yawPct;   // M1 FL CCW
-  raw[1] = thrPct - rollPct - pitchPct - yawPct;   // M2 FR CW
-  raw[2] = thrPct - rollPct + pitchPct + yawPct;   // M3 RR CCW
-  raw[3] = thrPct + rollPct + pitchPct - yawPct;   // M4 RL CW
+  if (!armCommand) {
+    if (escState != ESC_DISARMED) {
+      escState = ESC_DISARMED;
+      setAllMotorsPWM(ESC_MIN_US);
+      Serial.println("[ESC] DISARMED -> 4 Motor STOP (1000 us)");
+    }
+    return;
+  }
 
-  /* Smoothing eksponensial ala drone_model.py: k = 1 - e^(-rate*dt) */
-  float k = 1.0f - expf(-SMOOTH_RATE * LOOP_DT);
-
-  for (int i = 0; i < 4; i++) {
-    if (raw[i] < 0.0f)   raw[i] = 0.0f;
-    if (raw[i] > 100.0f) raw[i] = 100.0f;
-
-    mPct[i] += (raw[i] - mPct[i]) * k;
-
-    int pulse = ESC_MIN_US + (int)(mPct[i] * 10.0f);
-    if (pulse < ESC_MIN_US) pulse = ESC_MIN_US;
-    if (pulse > ESC_MAX_US) pulse = ESC_MAX_US;
-    motors[i].writeMicroseconds(pulse);
+  // armCommand == true
+  if (escState == ESC_DISARMED) {
+    escState = ESC_ARMING;
+    armingStartMs = millis();
+    setAllMotorsPWM(ESC_MIN_US);
+    Serial.println("[ESC] Mulai Arming 5 detik (1000 us)...");
+  }
+  else if (escState == ESC_ARMING) {
+    if (millis() - armingStartMs >= ARMING_DURATION_MS) {
+      escState = ESC_ARMED;
+      setAllMotorsPWM(ESC_ARM_SPIN_US);
+      Serial.println("[ESC] ARMED! 4 Motor berputar 20% (1200 us)");
+    } else {
+      setAllMotorsPWM(ESC_MIN_US);
+    }
+  }
+  else if (escState == ESC_ARMED) {
+    setAllMotorsPWM(ESC_ARM_SPIN_US);
   }
 }
 
+void updateLedIndicator()
+{
+  if (escState == ESC_DISARMED) {
+    digitalWrite(LED_PIN, HIGH);   // MATI saat DISARM (aktif LOW)
+  }
+  else if (escState == ESC_ARMING) {
+    // Blink tiap detik selama 5 detik arming (500ms ON, 500ms OFF)
+    unsigned long elapsed = millis() - armingStartMs;
+    bool blinkOn = ((elapsed / 500) % 2) == 0;
+    digitalWrite(LED_PIN, blinkOn ? LOW : HIGH);
+  }
+  else if (escState == ESC_ARMED) {
+    digitalWrite(LED_PIN, LOW);    // KONTINYU NYALA saat ARMED & motor berputar
+  }
+}
+
+/* ========================= BMI160 REGISTERS ============================ */
+#define BMI160_REG_CHIP_ID     0x00
+#define BMI160_REG_GYRO_X_L    0x0C
+#define BMI160_REG_ACCEL_X_L   0x12
+#define BMI160_REG_ACC_CONF    0x40
+#define BMI160_REG_ACC_RANGE   0x41
+#define BMI160_REG_GYR_CONF    0x42
+#define BMI160_REG_GYR_RANGE   0x43
+#define BMI160_REG_CMD         0x7E
+
+#define BMI160_CMD_SOFT_RESET  0xB6
+#define BMI160_CMD_ACC_NORMAL  0x11
+#define BMI160_CMD_GYR_NORMAL  0x15
+
+/* ========================= BMP280 REGISTERS ============================= */
+#define BMP280_REG_CHIP_ID     0xD0
+#define BMP280_REG_RESET       0xE0
+#define BMP280_REG_CTRL_MEAS   0xF4
+#define BMP280_REG_CONFIG      0xF5
+#define BMP280_REG_PRESS_MSB   0xF7
+#define BMP280_REG_CALIB_00    0x88
+
+#define BMP280_CHIP_ID_VALUE   0x58
+#define BMP280_RESET_VALUE     0xB6
+
+/* ========================= FUNGSI I2C LOW-LEVEL ========================= */
+
+void i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t data)
+{
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+uint8_t i2c_read_reg(uint8_t addr, uint8_t reg)
+{
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return 0;
+  }
+  if (Wire.requestFrom(addr, (uint8_t)1) == 1) {
+    return Wire.read();
+  }
+  return 0;
+}
+
+bool i2c_read_regs(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len)
+{
+  memset(buf, 0, len);
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  uint8_t count = Wire.requestFrom(addr, len);
+  if (count < len) {
+    return false;
+  }
+  for (uint8_t i = 0; i < len && Wire.available(); i++) {
+    buf[i] = Wire.read();
+  }
+  return true;
+}
+
+/* ========================= BMI160 DRIVER ================================ */
+
+bool bmi160_init(void)
+{
+  // 1. Soft reset
+  i2c_write_reg(BMI160_ADDR, BMI160_REG_CMD, BMI160_CMD_SOFT_RESET);
+  delay(100);
+
+  // 2. Cek Chip ID
+  uint8_t id = i2c_read_reg(BMI160_ADDR, BMI160_REG_CHIP_ID);
+  if (id != 0xD1) {
+    Serial.print("BMI160: wrong chip ID 0x");
+    Serial.println(id, HEX);
+    return false;
+  }
+
+  // 3. Set PMU mode: Accel Normal (0x11), Gyro Normal (0x15)
+  i2c_write_reg(BMI160_ADDR, BMI160_REG_CMD, BMI160_CMD_ACC_NORMAL);
+  delay(50);
+  i2c_write_reg(BMI160_ADDR, BMI160_REG_CMD, BMI160_CMD_GYR_NORMAL);
+  delay(50);
+
+  // 4. Set ODR dan Range setelah normal mode aktif
+  // ACC_CONF: 100Hz, normal filter (0x28)
+  // ACC_RANGE: +/- 2G -> 16384 LSB/g (0x03)
+  i2c_write_reg(BMI160_ADDR, BMI160_REG_ACC_CONF, 0x28);
+  i2c_write_reg(BMI160_ADDR, BMI160_REG_ACC_RANGE, 0x03);
+  delay(10);
+
+  // GYR_CONF: 100Hz, normal filter (0x28)
+  // GYR_RANGE: +/- 2000 dps -> 16.4 LSB/dps (0x00)
+  i2c_write_reg(BMI160_ADDR, BMI160_REG_GYR_CONF, 0x28);
+  i2c_write_reg(BMI160_ADDR, BMI160_REG_GYR_RANGE, 0x00);
+  delay(50);
+
+  return true;
+}
+
+bool bmi160_read(int16_t *ax, int16_t *ay, int16_t *az,
+                 int16_t *gx, int16_t *gy, int16_t *gz)
+{
+  uint8_t buf[12];
+
+  // Baca 12 byte sekaligus (0x0C Gyro sampai 0x17 Accel) dalam satu burst I2C
+  if (!i2c_read_regs(BMI160_ADDR, BMI160_REG_GYRO_X_L, buf, 12)) {
+    return false;
+  }
+
+  *gx = (int16_t)(buf[1]  << 8 | buf[0]);
+  *gy = (int16_t)(buf[3]  << 8 | buf[2]);
+  *gz = (int16_t)(buf[5]  << 8 | buf[4]);
+
+  *ax = (int16_t)(buf[7]  << 8 | buf[6]);
+  *ay = (int16_t)(buf[9]  << 8 | buf[8]);
+  *az = (int16_t)(buf[11] << 8 | buf[10]);
+
+  return true;
+}
+
+/* ========================= BMP280 DRIVER ================================= */
+
+struct bmp280_calib {
+  uint16_t dig_T1;
+  int16_t  dig_T2;
+  int16_t  dig_T3;
+  uint16_t dig_P1;
+  int16_t  dig_P2;
+  int16_t  dig_P3;
+  int16_t  dig_P4;
+  int16_t  dig_P5;
+  int16_t  dig_P6;
+  int16_t  dig_P7;
+  int16_t  dig_P8;
+  int16_t  dig_P9;
+};
+
+bmp280_calib calib;
+int32_t t_fine;   // dipakai internal untuk kompensasi tekanan (suhu tidak dipakai/dikirim)
+
+bool bmp280_init(void)
+{
+  i2c_write_reg(BMP280_ADDR, BMP280_REG_RESET, BMP280_RESET_VALUE);
+  delay(100);
+
+  uint8_t id = i2c_read_reg(BMP280_ADDR, BMP280_REG_CHIP_ID);
+  if (id != BMP280_CHIP_ID_VALUE) {
+    Serial.print("BMP280: wrong chip ID 0x");
+    Serial.println(id, HEX);
+    return false;
+  }
+
+  uint8_t buf[26];
+  i2c_read_regs(BMP280_ADDR, BMP280_REG_CALIB_00, buf, 26);
+
+  calib.dig_T1 = (uint16_t)(buf[1]  << 8 | buf[0]);
+  calib.dig_T2 = (int16_t)(buf[3]  << 8 | buf[2]);
+  calib.dig_T3 = (int16_t)(buf[5]  << 8 | buf[4]);
+  calib.dig_P1 = (uint16_t)(buf[7]  << 8 | buf[6]);
+  calib.dig_P2 = (int16_t)(buf[9]  << 8 | buf[8]);
+  calib.dig_P3 = (int16_t)(buf[11] << 8 | buf[10]);
+  calib.dig_P4 = (int16_t)(buf[13] << 8 | buf[12]);
+  calib.dig_P5 = (int16_t)(buf[15] << 8 | buf[14]);
+  calib.dig_P6 = (int16_t)(buf[17] << 8 | buf[16]);
+  calib.dig_P7 = (int16_t)(buf[19] << 8 | buf[18]);
+  calib.dig_P8 = (int16_t)(buf[21] << 8 | buf[20]);
+  calib.dig_P9 = (int16_t)(buf[23] << 8 | buf[22]);
+
+  /* ctrl_meas: osrs_t=x2, osrs_p=x16, mode=normal (0x57)
+     config: t_sb=50ms, filter=x16, spi3w_en=0 (0x90) */
+  i2c_write_reg(BMP280_ADDR, BMP280_REG_CONFIG, 0x90);
+  i2c_write_reg(BMP280_ADDR, BMP280_REG_CTRL_MEAS, 0x57);
+
+  return true;
+}
+
+/* Kompensasi suhu WAJIB dihitung (menghasilkan t_fine) karena dipakai oleh
+ * kompensasi tekanan, walau nilai suhunya sendiri tidak dipakai/dikirim. */
+void bmp280_compensate_T(int32_t adc_T)
+{
+  int32_t var1, var2;
+  var1 = ((((adc_T >> 3) - ((int32_t)calib.dig_T1 << 1))) * ((int32_t)calib.dig_T2)) >> 11;
+  var2 = (((((adc_T >> 4) - ((int32_t)calib.dig_T1)) *
+            ((adc_T >> 4) - ((int32_t)calib.dig_T1))) >> 12) *
+          ((int32_t)calib.dig_T3)) >> 14;
+  t_fine = var1 + var2;
+}
+
+uint32_t bmp280_compensate_P(int32_t adc_P)
+{
+  int64_t var1, var2, p;
+  var1 = ((int64_t)t_fine) - 128000;
+  var2 = var1 * var1 * (int64_t)calib.dig_P6;
+  var2 = var2 + ((var1 * (int64_t)calib.dig_P5) << 17);
+  var2 = var2 + (((int64_t)calib.dig_P4) << 35);
+  var1 = ((var1 * var1 * (int64_t)calib.dig_P3) >> 8) +
+         ((var1 * (int64_t)calib.dig_P2) << 12);
+  var1 = (((((int64_t)1) << 47) + var1)) * ((int64_t)calib.dig_P1) >> 33;
+  if (var1 == 0) return 0;
+  p = 1048576 - adc_P;
+  p = (((p << 31) - var2) * 3125) / var1;
+  var1 = (((int64_t)calib.dig_P9) * (p >> 13) * (p >> 13)) >> 25;
+  var2 = (((int64_t)calib.dig_P8) * p) >> 19;
+  p = ((p + var1 + var2) >> 8) + (((int64_t)calib.dig_P7) << 4);
+  return (uint32_t)(p >> 8);
+}
+
+/* Baca tekanan (hPa) & altitude (m). Suhu TIDAK dikembalikan/dipakai. */
+void bmp280_read(float *press_hpa, float *alt_m)
+{
+  uint8_t buf[6];
+  i2c_read_regs(BMP280_ADDR, BMP280_REG_PRESS_MSB, buf, 6);
+
+  int32_t adc_P = ((int32_t)buf[0] << 12) | ((int32_t)buf[1] << 4) | ((int32_t)buf[2] >> 4);
+  int32_t adc_T = ((int32_t)buf[3] << 12) | ((int32_t)buf[4] << 4) | ((int32_t)buf[5] >> 4);
+
+  bmp280_compensate_T(adc_T);   // wajib, mengisi t_fine
+  uint32_t P = bmp280_compensate_P(adc_P);
+
+  // Kompensasi Bosch mengembalikan tekanan dalam Pascal (Pa) -> / 100.0f = hPa
+  *press_hpa = P / 100.0f;
+  *alt_m = 44330.0f * (1.0f - powf(*press_hpa / 1013.25f, 0.190284f));
+}
+
+/* ========================= STATE ========================================= */
+bool bmiOK = false;
+bool bmpOK = false;
+float altitude_offset = 0.0f;
+float alt_filtered = 0.0f;
+
+unsigned long lastLinkMs = 0;
+bool linkOK = false;
+
+/* ── Gyro Zero-Bias Calibration Offsets ───────────────────────────────── */
+float gyro_bias_gx = 0.0f;
+float gyro_bias_gy = 0.0f;
+float gyro_bias_gz = 0.0f;
+
+/* ========================= SETUP ========================================= */
 void setup()
 {
   /* Set pin Serial biasa ke PA9 (TX) / PA10 (RX) SEBELUM Serial.begin() */
@@ -163,187 +460,225 @@ void setup()
   delay(500);
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);   // LED nyala saat program jalan (aktif LOW)
+  digitalWrite(LED_PIN, HIGH);   // PC4 mati saat startup / disarmed (aktif LOW)
 
   Serial.println();
-  Serial.println("=== LoRa RA-02 STM32F401RCT6 - RECEIVER + 4 ESC ===");
-  Serial.println("Motor1(PB6,CCW,DepanKiri) Motor2(PB7,CW,DepanKanan)");
-  Serial.println("Motor3(PB8,CCW,BelakangKanan) Motor4(PB9,CW,BelakangKiri)");
-  Serial.println("Throttle: TENGAH=0%, atas=100% | Mixing Quad-X aktif");
+  Serial.println("=== LoRa RA-02 STM32F401RCT6 - DRONE (SLAVE) ===");
+  Serial.println("Mode: terima joystick & ARM, balas telemetri IMU+altitude.");
+  Serial.println("4 Motor ESC: M1(PB6), M2(PB7), M3(PB8), M4(PB9)");
   Serial.println("-------------------------------------------");
 
-  /* SAFETY: semua ESC ke throttle minimum SEBELUM apapun */
+  /* ---------------- Inisialisasi 4 Motor ESC (1000 us) ---------------- */
   for (int i = 0; i < 4; i++) {
     motors[i].attach(MOTOR_PINS[i]);
     motors[i].writeMicroseconds(ESC_MIN_US);
   }
 
-  /* Set pin NSS, RESET, DIO0 untuk modul LoRa */
-  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
+  /* ---------------- Inisialisasi sensor ---------------- */
+  Wire.setSDA(I2C_SDA);
+  Wire.setSCL(I2C_SCL);
+  Wire.begin();
+  Wire.setClock(400000);
 
-  /* Arahkan library LoRa supaya pakai SPI2, bukan SPI1 default */
+  Serial.print("BMI160 init... ");
+  bmiOK = bmi160_init();
+  Serial.println(bmiOK ? "OK" : "FAILED");
+
+  /* Kalibrasi Zero-Bias Gyro (kondisi drone diletakkan diam) */
+  if (bmiOK) {
+    Serial.print("Kalibrasi zero-bias Gyro (jangan gerakkan drone)... ");
+    long sum_gx = 0, sum_gy = 0, sum_gz = 0;
+    int valid_samples = 0;
+    const int SAMPLES = 250;
+    for (int i = 0; i < SAMPLES; i++) {
+      int16_t ax, ay, az, gx, gy, gz;
+      if (bmi160_read(&ax, &ay, &az, &gx, &gy, &gz)) {
+        sum_gx += gx;
+        sum_gy += gy;
+        sum_gz += gz;
+        valid_samples++;
+      }
+      delay(3);
+    }
+    if (valid_samples > 50) {
+      // BMI160 +/- 2000 dps -> 16.4 LSB/dps
+      gyro_bias_gx = (float)sum_gx / valid_samples / 16.4f;
+      gyro_bias_gy = (float)sum_gy / valid_samples / 16.4f;
+      gyro_bias_gz = (float)sum_gz / valid_samples / 16.4f;
+    }
+    Serial.println("OK");
+    Serial.print("  Bias Gyro: X="); Serial.print(gyro_bias_gx, 3);
+    Serial.print(" Y="); Serial.print(gyro_bias_gy, 3);
+    Serial.print(" Z="); Serial.print(gyro_bias_gz, 3);
+    Serial.println(" dps");
+  }
+
+  Serial.print("BMP280 init... ");
+  bmpOK = bmp280_init();
+  if (bmpOK) {
+    Serial.println("OK");
+    Serial.print("Kalibrasi baseline Barometer... ");
+    float sum_a = 0.0f, p, a;
+    int valid_baro = 0;
+    for (int i = 0; i < 30; i++) {
+      if (bmp280_read(&p, &a)) {
+        sum_a += a;
+        valid_baro++;
+      }
+      delay(15);
+    }
+    if (valid_baro > 5) {
+      altitude_offset = sum_a / valid_baro;
+    }
+    alt_filtered = 0.0f;
+    Serial.println("OK");
+    Serial.print("  Altitude baseline: ");
+    Serial.print(altitude_offset, 2);
+    Serial.println(" m");
+  } else {
+    Serial.println("FAILED");
+  }
+
+  /* ---------------- Inisialisasi LoRa ---------------- */
+  LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
   LoRa.setSPI(SPI_2);
 
   if (!LoRa.begin(LORA_FREQUENCY))
   {
     Serial.println("GAGAL! Modul LoRa RA-02 tidak terdeteksi.");
     Serial.println("Cek wiring & pastikan VCC = 3.3V.");
-    while (1)
-    {
-      delay(1000);
-    }
+    while (1) { delay(1000); }
   }
 
-  /* Parameter radio harus SAMA dengan sisi transmitter */
+  /* Parameter radio harus SAMA dengan sisi remote */
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
 
-  Serial.println("LoRa RA-02 siap menerima data joystick...");
+  LoRa.receive();   // langsung siaga di mode terima (slave)
 
-  /* Tunggu ESC melakukan arming (sama seperti program ESC test) */
-  Serial.println("ARMING ESC...");
-  forceStop();
-  for (int i = ARM_DELAY_MS / 1000; i > 0; i--)
-  {
-    Serial.print("Arming dalam ");
-    Serial.print(i);
-    Serial.println(" detik...");
-    delay(1000);
-  }
-  forceStop();
-
-  Serial.println("=== ESC READY (throttle = 0%) ===");
-  Serial.println("Emergency STOP: ketik STOP di serial monitor");
+  Serial.println("LoRa siap. Menunggu paket joystick dari remote...");
   Serial.println("-------------------------------------------");
 }
 
+/* ========================= LOOP =========================================== */
 void loop()
 {
-  /* ---------- Perintah darurat dari serial monitor ---------- */
-  if (Serial.available())
-  {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-
-    if (input.equalsIgnoreCase("STOP"))
-    {
-      emergencyStop = true;
-      forceStop();
-      Serial.println("!!! EMERGENCY STOP !!!");
-      Serial.println("Motor dikunci di 1000 us.");
-      Serial.println("Kembalikan throttle ke TENGAH/BAWAH untuk membuka kunci.");
-    }
-  }
-
-  /* ---------- Terima paket LoRa ---------- */
   int packetSize = LoRa.parsePacket();
 
-  if (packetSize)
+  if (packetSize == sizeof(UplinkPacket))
   {
-    String received = "";
-    while (LoRa.available())
-    {
-      received += (char)LoRa.read();
+    uint8_t buf[sizeof(UplinkPacket)];
+    for (uint8_t i = 0; i < sizeof(UplinkPacket) && LoRa.available(); i++) {
+      buf[i] = (uint8_t)LoRa.read();
     }
 
-    int rssi = LoRa.packetRssi();
-    float snr = LoRa.packetSnr();
+    UplinkPacket up;
+    memcpy(&up, buf, sizeof(UplinkPacket));
 
-    /* Parsing format CSV "R,T,Y,P" */
-    int rVal, tVal, yVal, pVal;
-    if (sscanf(received.c_str(), "%d,%d,%d,%d", &rVal, &tVal, &yVal, &pVal) == 4)
+    if (up.magic == UPLINK_MAGIC)
     {
-      lastPacketMs = millis();
-
-      if (failsafeActive)
-      {
-        failsafeActive = false;
-        digitalWrite(LED_PIN, LOW);
-        Serial.println(">>> Sinyal kembali normal <<<");
+      lastLinkMs = millis();
+      if (!linkOK) {
+        linkOK = true;
+        Serial.println(">>> Link dengan remote aktif <<<");
       }
 
-      /* Konversi channel persis seperti DroneSimulator._on_channels */
-      float rollPct  = (rVal - 128) / 127.0f * 100.0f;
-      float yawPct   = (yVal - 128) / 127.0f * 100.0f;
-      float pitchPct = (pVal - 128) / 127.0f * 100.0f;
-      /* Throttle: TENGAH = 0% (setengah bawah stick tidak berfungsi) */
-      float thrPct   = (tVal <= THROTTLE_CENTER)
-                       ? 0.0f
-                       : (tVal - THROTTLE_CENTER) / 127.0f * 100.0f;
+      /* ---------------- Update State Motor ESC ---------------- */
+      bool armCmd = (up.armed == 1);
+      updateEscFSM(armCmd);
 
-      /* Buka kunci emergency stop hanya jika sudah di tengah/bawah */
-      if (emergencyStop && tVal <= THROTTLE_CENTER + 5)
-      {
-        emergencyStop = false;
-        Serial.println(">>> Emergency stop dilepas (throttle di tengah/bawah). <<<");
+      /* ---------------- Baca sensor & susun balasan ---------------- */
+      float ax_g = 0, ay_g = 0, az_g = 0, gx_dps = 0, gy_dps = 0, gz_dps = 0;
+      float press = 0.0f, alt = 0.0f;
+
+      if (bmiOK) {
+        int16_t ax, ay, az, gx, gy, gz;
+        if (bmi160_read(&ax, &ay, &az, &gx, &gy, &gz)) {
+          // BMI160: +/- 2G -> 16384 LSB/g
+          ax_g = (ax / 16384.0f) * 9.80665f;
+          ay_g = (ay / 16384.0f) * 9.80665f;
+          az_g = (az / 16384.0f) * 9.80665f;
+
+          // BMI160: +/- 2000 dps -> 16.4 LSB/dps
+          gx_dps = (gx / 16.4f) - gyro_bias_gx;
+          gy_dps = (gy / 16.4f) - gyro_bias_gy;
+          gz_dps = (gz / 16.4f) - gyro_bias_gz;
+
+          // Deadband filter: hilangkan noise mikro saat diam (< 0.12 dps)
+          if (fabsf(gx_dps) < 0.12f) gx_dps = 0.0f;
+          if (fabsf(gy_dps) < 0.12f) gy_dps = 0.0f;
+          if (fabsf(gz_dps) < 0.12f) gz_dps = 0.0f;
+        }
       }
 
-      if (emergencyStop || failsafeActive)
-      {
-        /* Kondisi tidak aman: paksa motor ke minimum tanpa smoothing */
-        forceStop();
-      }
-      else
-      {
-        applyMix(rollPct, yawPct, pitchPct, thrPct);
+      if (bmpOK) {
+        float raw_p, raw_a;
+        if (bmp280_read(&raw_p, &raw_a)) {
+          press = raw_p;
+          float raw_rel_alt = raw_a - altitude_offset;
+          // Digital IIR Low-Pass Filter: y[k] = 0.85 * y[k-1] + 0.15 * x[k]
+          alt_filtered = 0.85f * alt_filtered + 0.15f * raw_rel_alt;
+          alt = alt_filtered;
+        }
       }
 
-      /* Status untuk serial monitor */
-      Serial.print("[RX] R:");
-      Serial.print(rVal);
-      Serial.print(" T:");
-      Serial.print(tVal);
-      Serial.print(" Y:");
-      Serial.print(yVal);
-      Serial.print(" P:");
-      Serial.print(pVal);
-      Serial.print(" | M:");
-      for (int i = 0; i < 4; i++)
-      {
-        Serial.print(ESC_MIN_US + (int)(mPct[i] * 10.0f));
-        Serial.print(i < 3 ? "/" : " us");
-      }
-      if (emergencyStop)  Serial.print(" [ESTOP]");
-      if (failsafeActive) Serial.print(" [FAILSAFE]");
-      Serial.print(" | RSSI: ");
-      Serial.print(rssi);
-      Serial.print(" dBm | SNR: ");
-      Serial.println(snr);
+      /* Balas ke remote: paket biner ringkas, TANPA suhu */
+      DownlinkPacket down;
+      down.magic = DOWNLINK_MAGIC;
+      down.ax = (int16_t)(ax_g * 100.0f);
+      down.ay = (int16_t)(ay_g * 100.0f);
+      down.az = (int16_t)(az_g * 100.0f);
+      down.gx = (int16_t)(gx_dps * 100.0f);
+      down.gy = (int16_t)(gy_dps * 100.0f);
+      down.gz = (int16_t)(gz_dps * 100.0f);
+      down.press = (uint16_t)(press * 10.0f);
+      down.alt = (int16_t)(alt * 100.0f);
+
+      LoRa.beginPacket();
+      LoRa.write((uint8_t *)&down, sizeof(DownlinkPacket));
+      LoRa.endPacket();
+
+      LoRa.receive();   // kembali siaga menunggu paket joystick berikutnya
+
+      /* Debug lokal via USB-TTL (opsional, tidak dipakai GUI karena drone
+         tidak terhubung langsung ke laptop pada topologi final) */
+      Serial.print("[RX] R:"); Serial.print(up.r);
+      Serial.print(" T:"); Serial.print(up.t);
+      Serial.print(" Y:"); Serial.print(up.y);
+      Serial.print(" P:"); Serial.print(up.p);
+      Serial.print(" | AX:"); Serial.print(ax_g, 2);
+      Serial.print(" AY:"); Serial.print(ay_g, 2);
+      Serial.print(" AZ:"); Serial.print(az_g, 2);
+      Serial.print(" | P:"); Serial.print(press, 2);
+      Serial.print(" A:"); Serial.println(alt, 2);
     }
     else
     {
-      /* Format tidak dikenal: tampilkan apa adanya */
-      Serial.print("[RX] Data mentah: ");
-      Serial.print(received);
-      Serial.print(" | RSSI: ");
-      Serial.print(rssi);
-      Serial.print(" dBm | SNR: ");
-      Serial.println(snr);
+      LoRa.receive();
+      Serial.println("[RX] Magic byte uplink tidak cocok, paket diabaikan.");
     }
   }
-
-  /* ---------- FAILSAFE: sinyal hilang lebih lama dari batas ---------- */
-  if (!failsafeActive && (millis() - lastPacketMs > FAILSAFE_TIMEOUT_MS))
+  else if (packetSize > 0)
   {
-    failsafeActive = true;
-    forceStop();
-    Serial.println("!!! FAILSAFE: sinyal LoRa hilang > 1 detik. Motor = 0%. !!!");
+    /* Ukuran paket tidak sesuai protokol biner: buang & abaikan */
+    while (LoRa.available()) { LoRa.read(); }
+    LoRa.receive();
   }
 
-  /* ---------- Indikator LED ---------- */
-  if (failsafeActive)
-  {
-    /* Kedip cepat saat tidak ada sinyal */
-    if (millis() - ledBlinkMs > 100)
-    {
-      ledBlinkMs = millis();
-      ledState = !ledState;
-      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    }
+  /* ---------------- Update proses arming saat timer berjalan ---------------- */
+  if (escState == ESC_ARMING) {
+    updateEscFSM(true);
   }
-  else
+
+  /* ---------------- Update LED PC4 (Indikator Arming / Armed) ---------------- */
+  updateLedIndicator();
+
+  /* ---------------- Link timeout & Failsafe motor ---------------- */
+  if (linkOK && (millis() - lastLinkMs > LINK_TIMEOUT_MS))
   {
-    digitalWrite(LED_PIN, LOW);   // nyala terus saat sinyal normal
+    linkOK = false;
+    updateEscFSM(false);   // FAILSAFE: matikan motor seketika
+    Serial.println("! Link terputus: sinyal remote hilang > 1 detik. Motor STOP.");
   }
 }

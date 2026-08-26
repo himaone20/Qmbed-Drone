@@ -1,21 +1,35 @@
+
 """
-Drone 3D Viewer - PySide6
-Membaca data BMI160 + BMP280 dari STM32F401 via serial.
-Menampilkan animasi drone 3D isometrik yang mengikuti orientasi sensor.
+Drone Telemetry Viewer - PySide6
+Dashboard telemetry drone bergaya Ground Control Station (GCS) profesional
+dengan tema Sky Blue & White.
+
+Data diterima dari SATU koneksi serial USB ke Remote (ESP32 + LoRa RA-02).
+Remote bertindak sebagai hub: mengirim joystick ke drone via LoRa sekaligus
+meneruskan telemetri balasan drone (IMU + altitude) ke laptop. Suhu (BMP280)
+tidak dipakai sama sekali pada proyek ini.
+  - [IMU] AX:.. AY:.. AZ:.. GX:.. GY:.. GZ:..    (BMI160 di drone)
+  - [BMP] P:..  A:..                             (BMP280 di drone, tanpa suhu)
+  - [TX]  R:..  T:..  Y:..  P:..                 (joystick remote ESP32)
+
+Tab :
+  - ATTITUDE   : artificial horizon + drone 3D + altitude tape + metric cards
+  - RC CONTROL : dual joystick (Mode 2) + readout raw/calibrated + calibrate
 """
 
 import sys
 import re
 import math
 import time
-from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
 from PySide6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QRadialGradient,
-    QLinearGradient, QPolygonF, QPainterPath
+    QPainter, QPen, QBrush, QColor, QFont, QFontMetricsF,
+    QRadialGradient, QLinearGradient, QPolygonF, QPainterPath
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton
+    QLabel, QComboBox, QPushButton, QFrame, QTabWidget,
+    QGraphicsDropShadowEffect
 )
 
 try:
@@ -30,68 +44,95 @@ IMU_RE = re.compile(
     r"\s*GX:([-\d.]+)\s*GY:([-\d.]+)\s*GZ:([-\d.]+)"
 )
 BMP_RE = re.compile(
-    r"\[BMP\]\s*T:([-\d.]+)\s*P:([-\d.]+)\s*A:([-\d.]+)"
+    r"\[BMP\]\s*P:([-\d.]+)\s*A:([-\d.]+)"
+)
+TX_RE = re.compile(
+    r"\[TX\]\s*R:(\d+)\s*T:(\d+)\s*Y:(\d+)\s*P:(\d+)"
 )
 
-# ─── Catppuccin Mocha ───
-COL_BG       = QColor("#1e1e2e")
-COL_BG_DARK  = QColor("#181825")
-COL_SURF     = QColor("#313244")
-COL_OVERLAY  = QColor("#45475a")
-COL_SUBTLE   = QColor("#585b70")
-COL_TEXT     = QColor("#cdd6f4")
-COL_SUBTEXT  = QColor("#a6adc8")
-COL_LAVENDER = QColor("#b4befe")
-COL_BLUE     = QColor("#89b4fa")
-COL_SAPPHIRE = QColor("#74c7ec")
-COL_TEAL     = QColor("#94e2d5")
-COL_GREEN    = QColor("#a6e3a1")
-COL_YELLOW   = QColor("#f9e2af")
-COL_PEACH    = QColor("#fab387")
-COL_MAROON   = QColor("#eba0ac")
-COL_RED      = QColor("#f38ba8")
-COL_MAUVE    = QColor("#cba6f7")
-COL_PINK     = QColor("#f5c2e7")
-COL_ROSEWATER= QColor("#f5e0dc")
+# ─────────────── Palette : Sky Blue & White ───────────────
+COL_BG          = QColor("#F5F9FF")   # window bg
+COL_CARD        = QColor("#FFFFFF")   # card bg
+COL_CARD_ALT    = QColor("#F1F5F9")   # inner card / muted
+COL_BORDER      = QColor("#E2E8F0")   # subtle border
+COL_DIVIDER     = QColor("#CBD5E1")
+COL_TEXT        = QColor("#0F172A")   # slate 900
+COL_SUBTEXT     = QColor("#64748B")   # slate 500
+COL_MUTED       = QColor("#94A3B8")
+COL_ACCENT      = QColor("#2563EB")   # blue 600 - primary
+COL_ACCENT_2    = QColor("#3B82F6")   # blue 500
+COL_ACCENT_LT   = QColor("#7DD3FC")   # sky 300
+COL_ACCENT_XLT  = QColor("#BFE3FF")   # very light sky
+COL_ACCENT_DK   = QColor("#1D4ED8")   # blue 700
+COL_SKY_TOP     = QColor("#BFE3FF")
+COL_SKY_MID     = QColor("#5FA8F5")
+COL_SKY_BOT     = QColor("#2E7FE0")
+COL_GROUND_TOP  = QColor("#F1F5F9")
+COL_GROUND_BOT  = QColor("#FFFFFF")
+COL_OK          = QColor("#22C55E")   # green 500
+COL_WARN        = QColor("#F59E0B")   # amber 500
+COL_ERR         = QColor("#EF4444")   # red 500
 
 DEG = 180.0 / math.pi
 RAD = math.pi / 180.0
 
 
-def darken(c, f=0.6):
-    return QColor(int(c.red()*f), int(c.green()*f), int(c.blue()*f))
+# ─────────────── Typography ───────────────
+# Prefer modern variable/geometric sans-serif; Qt will fall back gracefully
+# through the family list until it finds one installed on the system.
+FONT_UI = "Segoe UI, Inter, 'Segoe UI Variable', Arial, sans-serif"
+FONT_MONO = "Consolas, 'Cascadia Mono', 'JetBrains Mono', 'Fira Code', monospace"
+FONT_TITLE = "Segoe UI, 'Space Grotesk', Inter, Arial, sans-serif"
+# CSS-friendly (Qt stylesheet) equivalents
+CSS_UI = FONT_UI
+CSS_MONO = FONT_MONO
+CSS_TITLE = FONT_TITLE
 
 
-def style_btn(bg, fg, hover=None):
-    if hover is None:
-        hover = darken(bg, 0.85)
-    return f"""
-        QPushButton {{
-            background: {bg.name()}; color: {fg.name()};
-            border: none; border-radius: 5px;
-            font: bold 11px 'Consolas'; padding: 0 14px;
-        }}
-        QPushButton:hover {{ background: {hover.name()}; }}
-        QPushButton:disabled {{ background: {COL_OVERLAY.name()}; color: {COL_SUBTLE.name()}; }}
-    """
+def qfont(family=FONT_UI, size=10, weight=QFont.Normal, letter_spacing=None):
+    """Create a QFont from a CSS-style family list (comma-separated with
+    optional quotes). Qt uses only the first family from setFamily, so we
+    also apply setFamilies() to get real fallback behaviour."""
+    families = [f.strip().strip("'\"") for f in family.split(",") if f.strip()]
+    f = QFont(families[0] if families else "Segoe UI", size)
+    try:
+        f.setFamilies(families)
+    except Exception:
+        pass
+    f.setWeight(weight)
+    f.setStyleStrategy(QFont.PreferAntialias)
+    f.setHintingPreference(QFont.PreferNoHinting)
+    if letter_spacing is not None:
+        f.setLetterSpacing(QFont.AbsoluteSpacing, letter_spacing)
+    return f
+
+
+def add_shadow(widget, blur=18, dx=0, dy=2, alpha=28):
+    eff = QGraphicsDropShadowEffect(widget)
+    eff.setBlurRadius(blur)
+    eff.setOffset(dx, dy)
+    eff.setColor(QColor(15, 23, 42, alpha))
+    widget.setGraphicsEffect(eff)
 
 
 # ───────────────────── Complementary Filter ─────────────────────
 
 class OrientationFilter:
-    def __init__(self, alpha=0.96, dt=0.01):
-        self.alpha = alpha
+    def __init__(self, dt=0.12):
         self.dt = dt
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
         self._last_time = None
+        self._gz_deadband = 0.12  # dps deadband untuk meniadakan micro-drift saat diam
+        self._first_run = True
 
     def reset(self):
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
         self._last_time = None
+        self._first_run = True
 
     def update(self, ax, ay, az, gx, gy, gz):
         now = time.monotonic()
@@ -99,31 +140,77 @@ class OrientationFilter:
             self.dt = now - self._last_time
         self._last_time = now
         if self.dt <= 0 or self.dt > 0.5:
-            self.dt = 0.01
+            self.dt = 0.12
 
-        acc_roll = math.atan2(ay, az) * DEG
-        acc_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az)) * DEG
+        acc_total = math.sqrt(ax*ax + ay*ay + az*az)
+        if acc_total > 1.0:
+            acc_roll  = math.atan2(ay, az) * DEG
+            acc_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az)) * DEG
+        else:
+            acc_roll = self.roll
+            acc_pitch = self.pitch
 
-        self.roll = self.alpha * (self.roll + gx * self.dt) + (1 - self.alpha) * acc_roll
-        self.pitch = self.alpha * (self.pitch + gy * self.dt) + (1 - self.alpha) * acc_pitch
-        self.yaw += gz * self.dt
+        # Pada sampel pertama setelah connect/reset, langsung kunci sudut accelerometer
+        # tanpa delay agar drone tidak merayap/bergerak sendiri dari 0 derajat
+        if self._first_run:
+            self.roll = acc_roll
+            self.pitch = acc_pitch
+            self._first_run = False
+            return
+
+        # Adaptive complementary filter berdasarkan dt aktual
+        tau = 0.8
+        alpha = tau / (tau + self.dt)
+
+        self.roll  = alpha * (self.roll  + gx * self.dt) + (1.0 - alpha) * acc_roll
+        self.pitch = alpha * (self.pitch + gy * self.dt) + (1.0 - alpha) * acc_pitch
+
+        # Deadband filter untuk Gyro Z (Yaw): abaikan noise mikro di bawah threshold
+        gz_filtered = gz if abs(gz) >= self._gz_deadband else 0.0
+        self.yaw += gz_filtered * self.dt
+
         if self.yaw > 180:
             self.yaw -= 360
         elif self.yaw < -180:
             self.yaw += 360
 
 
-# ───────────────────── Drone 3D Widget ─────────────────────
+# ───────────────────── 3D helpers ─────────────────────
 
-class DroneWidget(QWidget):
+def rot_matrix(roll_deg, pitch_deg, yaw_deg):
+    r = roll_deg * RAD
+    p = pitch_deg * RAD
+    y = yaw_deg * RAD
+    cr, sr = math.cos(r), math.sin(r)
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+    return [
+        [cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
+        [sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
+        [-sp,    cp*sr,             cp*cr           ],
+    ]
+
+
+def mv(m, v):
+    return (
+        m[0][0]*v[0] + m[0][1]*v[1] + m[0][2]*v[2],
+        m[1][0]*v[0] + m[1][1]*v[1] + m[1][2]*v[2],
+        m[2][0]*v[0] + m[2][1]*v[1] + m[2][2]*v[2],
+    )
+
+
+# ───────────────────── Horizon + Drone 3D Widget ─────────────────────
+
+class HorizonDroneWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(400, 350)
+        self.setMinimumSize(380, 280)
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
         self.altitude = 0.0
         self._prop_angle = 0.0
+        self._connected = False
 
     def set_orientation(self, roll, pitch, yaw):
         self.roll = roll
@@ -133,248 +220,1092 @@ class DroneWidget(QWidget):
     def set_altitude(self, alt):
         self.altitude = alt
 
-    def paintEvent(self, event):
-        w, h = self.width(), self.height()
-        cx, cy = w / 2, h / 2
+    def set_connected(self, ok):
+        self._connected = ok
 
+    def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
 
-        bg = QLinearGradient(0, 0, 0, h)
-        bg.setColorAt(0.0, QColor("#181825"))
-        bg.setColorAt(0.6, QColor("#1e1e2e"))
-        bg.setColorAt(1.0, QColor("#11111b"))
-        p.fillRect(self.rect(), bg)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD))
+        p.drawRoundedRect(rect, 12, 12)
 
-        self._draw_ground(p, cx, cy, w, h)
+        margin = 12
+        compass_h = 34
+        inner = QRectF(rect.left() + margin,
+                       rect.top() + margin + compass_h + 6,
+                       rect.width() - 2*margin,
+                       rect.height() - 2*margin - compass_h - 6)
 
-        ground_y = cy + 60
-        alt_px = max(-80, min(160, self.altitude * 3))
-
-        shadow_r = max(15, 55 - int(alt_px * 0.15))
-        p.setPen(Qt.NoPen)
-        shadow = QRadialGradient(cx, ground_y, shadow_r)
-        shadow.setColorAt(0.0, QColor(0, 0, 0, 70))
-        shadow.setColorAt(1.0, QColor(0, 0, 0, 0))
-        p.setBrush(QBrush(shadow))
-        p.drawEllipse(QPointF(cx, ground_y), shadow_r, int(shadow_r * 0.3))
-
-        if alt_px > 2:
-            p.setPen(QPen(QColor(COL_TEAL.red(), COL_TEAL.green(),
-                                 COL_TEAL.blue(), 50), 1, Qt.DashLine))
-            p.drawLine(int(cx), int(ground_y), int(cx), int(ground_y - alt_px))
-
-        drone_y = cy - 10 - alt_px
-        self._draw_drone(p, cx, drone_y)
-
-        if alt_px > 3:
-            p.setPen(COL_TEAL)
-            p.setFont(QFont("Consolas", 9))
-            p.drawText(int(cx + 80), int(drone_y + 5), f"{self.altitude:.2f} m")
+        self._draw_compass_tape(p, QRectF(rect.left()+margin, rect.top()+margin,
+                                          rect.width()-2*margin, compass_h))
+        self._draw_horizon(p, inner)
+        self._draw_horizon_overlay(p, inner)
+        self._draw_drone(p, inner.center().x(), inner.center().y())
 
         p.end()
 
-    def _draw_ground(self, p, cx, cy, w, h):
-        ground_y = cy + 60
+    def _draw_compass_tape(self, p, rect):
+        p.save()
+        p.setClipRect(rect)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD_ALT))
+        p.drawRoundedRect(rect, 6, 6)
 
-        for i in range(-4, 5):
-            y = ground_y + i * 10
-            alpha = max(8, 35 - abs(i) * 5)
-            c = QColor(COL_OVERLAY)
-            c.setAlpha(alpha)
-            p.setPen(QPen(c, 1))
-            spread = 1.0 - abs(i) * 0.06
-            p.drawLine(int(cx - w * 0.45 * spread), int(y),
-                       int(cx + w * 0.45 * spread), int(y))
+        cx = rect.center().x()
+        px_per_deg = 3.2
+        yaw = self.yaw
 
-        for i in range(-5, 6):
-            x_off = i * 45
-            alpha = max(5, 28 - abs(i) * 4)
-            c = QColor(COL_OVERLAY)
-            c.setAlpha(alpha)
-            p.setPen(QPen(c, 1))
-            p.drawLine(int(cx + x_off * 0.15), int(ground_y - 40),
-                       int(cx + x_off), int(ground_y + 60))
+        p.setFont(qfont(FONT_UI, 8, QFont.DemiBold))
+        for deg in range(-180, 361, 5):
+            rel = ((deg - yaw + 540) % 360) - 180
+            x = cx + rel * px_per_deg
+            if x < rect.left() or x > rect.right():
+                continue
+            major = (deg % 30 == 0)
+            mid = (deg % 10 == 0)
+            if major:
+                p.setPen(QPen(COL_TEXT, 1.5))
+                p.drawLine(int(x), int(rect.top()+5), int(x), int(rect.top()+16))
+                label = self._heading_label(deg % 360)
+                p.setPen(COL_TEXT)
+                p.drawText(QRectF(x-18, rect.top()+17, 36, 14),
+                           Qt.AlignCenter, label)
+            elif mid:
+                p.setPen(QPen(COL_SUBTEXT, 1))
+                p.drawLine(int(x), int(rect.top()+7), int(x), int(rect.top()+14))
+            else:
+                p.setPen(QPen(COL_MUTED, 1))
+                p.drawLine(int(x), int(rect.top()+9), int(x), int(rect.top()+13))
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(COL_ACCENT))
+        tri = QPolygonF([
+            QPointF(cx, rect.top()+3),
+            QPointF(cx-5, rect.top()+11),
+            QPointF(cx+5, rect.top()+11),
+        ])
+        p.drawPolygon(tri)
+        p.restore()
+
+    @staticmethod
+    def _heading_label(deg):
+        deg = deg % 360
+        mapping = {0: "N", 90: "E", 180: "S", 270: "W",
+                   45: "NE", 135: "SE", 225: "SW", 315: "NW"}
+        if deg in mapping:
+            return mapping[deg]
+        return f"{deg:03d}"
+
+    def _draw_horizon(self, p, rect):
+        p.save()
+        path = QPainterPath()
+        path.addRoundedRect(rect, 10, 10)
+        p.setClipPath(path)
+
+        cx = rect.center().x()
+        cy = rect.center().y()
+        px_per_deg_pitch = rect.height() / 90.0
+        pitch_offset = self.pitch * px_per_deg_pitch
+
+        p.translate(cx, cy)
+        p.rotate(-self.roll)
+
+        big = max(rect.width(), rect.height()) * 2.2
+        sky = QLinearGradient(0, -big, 0, pitch_offset)
+        sky.setColorAt(0.0, COL_SKY_BOT)
+        sky.setColorAt(0.6, COL_SKY_MID)
+        sky.setColorAt(1.0, COL_SKY_TOP)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(sky))
+        p.drawRect(QRectF(-big, -big, big*2, big + pitch_offset))
+
+        ground = QLinearGradient(0, pitch_offset, 0, big)
+        ground.setColorAt(0.0, COL_GROUND_TOP)
+        ground.setColorAt(1.0, COL_GROUND_BOT)
+        p.setBrush(QBrush(ground))
+        p.drawRect(QRectF(-big, pitch_offset, big*2, big - pitch_offset))
+
+        p.setPen(QPen(COL_ACCENT_DK, 1.6))
+        p.drawLine(int(-big), int(pitch_offset), int(big), int(pitch_offset))
+
+        p.setFont(qfont(FONT_UI, 7, QFont.DemiBold))
+        skip_minor = px_per_deg_pitch < 3.0
+        for pdeg in range(-40, 41, 5):
+            if pdeg == 0:
+                continue
+            if skip_minor and pdeg % 10 != 0:
+                continue
+            y = pitch_offset - pdeg * px_per_deg_pitch
+            if abs(y) > big * 0.6:
+                continue
+            major = (pdeg % 10 == 0)
+            length = 46 if major else 22
+            color = QColor(COL_ACCENT_DK) if pdeg > 0 else QColor(COL_SUBTEXT)
+            color.setAlpha(180)
+            p.setPen(QPen(color, 1.2))
+            p.drawLine(int(-length/2), int(y), int(length/2), int(y))
+            if major:
+                p.setPen(color)
+                p.drawText(QRectF(-length/2 - 28, y-7, 22, 14),
+                           Qt.AlignRight | Qt.AlignVCenter, f"{pdeg:+d}")
+                p.drawText(QRectF(length/2 + 6, y-7, 22, 14),
+                           Qt.AlignLeft | Qt.AlignVCenter, f"{pdeg:+d}")
+        p.restore()
+
+    def _draw_horizon_overlay(self, p, rect):
+        p.save()
+        cx = rect.center().x()
+        cy = rect.center().y()
+
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rect, 10, 10)
+
+        arc_r = min(rect.width(), rect.height()) * 0.42
+        p.translate(cx, cy)
+        p.setPen(QPen(QColor(255, 255, 255, 200), 1.6))
+        arc_rect = QRectF(-arc_r, -arc_r, 2*arc_r, 2*arc_r)
+        p.drawArc(arc_rect, (90 - 60) * 16, 120 * 16)
+
+        for deg in (-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60):
+            ang = (90 - deg) * RAD
+            outer = arc_r
+            inner = arc_r - (10 if deg % 30 == 0 else 6)
+            x1 = math.cos(ang) * inner
+            y1 = -math.sin(ang) * inner
+            x2 = math.cos(ang) * outer
+            y2 = -math.sin(ang) * outer
+            p.setPen(QPen(QColor(255, 255, 255, 220), 1.4))
+            p.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        p.save()
+        p.rotate(self.roll)
+        pointer = QPolygonF([
+            QPointF(0, -arc_r + 2),
+            QPointF(-6, -arc_r + 14),
+            QPointF(6, -arc_r + 14),
+        ])
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(COL_ACCENT))
+        p.drawPolygon(pointer)
+        p.restore()
+
+        p.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        p.setPen(QPen(COL_ACCENT_DK, 1))
+        ref = QPolygonF([
+            QPointF(0, -arc_r - 4),
+            QPointF(-6, -arc_r - 14),
+            QPointF(6, -arc_r - 14),
+        ])
+        p.drawPolygon(ref)
+
+        p.restore()
+
+    def _chase_cam_project(self, v, sin_e, cos_e, cam_dist, focal):
+        """Proyeksikan satu titik 3D (body frame: X=depan, Y=kanan, Z=atas)
+        ke koordinat layar memakai kamera chase-view yang diam di belakang
+        & sedikit di atas drone. Mengembalikan (sx, sy, depth, k)."""
+        wx, wy, wz = v
+        xc = wy
+        yc = wx * sin_e + wz * cos_e
+        zc = cam_dist + wx * cos_e - wz * sin_e
+        if zc < 1.0:
+            zc = 1.0
+        k = focal / zc
+        return xc * k, -yc * k, zc, k
 
     def _draw_drone(self, p, cx, cy):
         p.save()
         p.translate(cx, cy)
 
-        pitch_rad = self.pitch * RAD
-        roll_rad = self.roll * RAD
+        s = max(0.55, min(1.0, min(self.width(), self.height()) / 520.0))
+        arm_len  = 58 * s
+        body_len = 20 * s
+        body_wid = 9  * s
+        motor_r  = 6.5 * s
+        prop_r   = 22 * s
 
-        sx = 1.0 / max(0.3, math.cos(roll_rad))
-        sy = 1.0 / max(0.3, math.cos(pitch_rad))
-        sx = max(0.4, min(2.5, sx))
-        sy = max(0.4, min(2.5, sy))
-        p.scale(sx, sy)
+        # ── Kamera chase-view: diam di belakang & sedikit di atas drone,
+        # SELALU mengikuti heading (yaw diabaikan di matriks rotasi) sehingga
+        # yaw TIDAK memutar seluruh tampilan -- inilah yang menghilangkan
+        # efek pusing "seolah dilihat dari atas berputar-putar". Hanya roll
+        # & pitch drone yang membuat badan/lengan terlihat miring relatif
+        # terhadap kamera yang stabil, persis seperti kamera FPV/chase-cam
+        # yang menempel di ekor drone. Rotasi (mv/rot_matrix) memakai
+        # variabel wx,wy,wz yang SAMA persis seperti versi sebelumnya agar
+        # arah kemiringan roll/pitch tetap konsisten (hanya proyeksinya
+        # yang diupgrade dari 2D datar menjadi perspektif 3D).
+        CAM_ELEV_DEG = 24.0
+        sin_e = math.sin(CAM_ELEV_DEG * RAD)
+        cos_e = math.cos(CAM_ELEV_DEG * RAD)
+        cam_dist = arm_len * 3.4
+        focal = arm_len * 4.4
 
-        p.rotate(self.yaw)
+        def proj(v):
+            return self._chase_cam_project(v, sin_e, cos_e, cam_dist, focal)
 
-        arm_len = 72
-        body_r = 20
-        motor_r = 9
+        # Matriks rotasi: -roll agar arah bank (miring) kanan/kiri sinkron dengan
+        # indikator busur derajat di atas & visual horizon.
+        M = rot_matrix(-self.roll, self.pitch, 0.0)   # yaw sengaja diabaikan
 
-        arms = [
-            ("FR",  45, COL_RED,    True),
-            ("FL", 135, COL_BLUE,   True),
-            ("BL", 225, COL_SUBTLE, False),
-            ("BR", 315, COL_SUBTLE, False),
+        d = arm_len / math.sqrt(2)
+        # Koordinat body standar: +X depan, +Y kanan, +Z atas
+        arms_def = [
+            ("FR", ( d,  d, 0), COL_ACCENT),
+            ("FL", ( d, -d, 0), COL_ACCENT),
+            ("BR", (-d,  d, 0), COL_MUTED),
+            ("BL", (-d, -d, 0), COL_MUTED),
         ]
 
-        front_y = -arm_len * 0.707
-        back_y = arm_len * 0.707
-        depth_order = sorted(arms, key=lambda a: (
-            math.sin(a[1] * RAD) * arm_len
-        ))
+        rotated = []
+        for name, v, color in arms_def:
+            wv = mv(M, v)
+            sx, sy, zc, k = proj(wv)
+            rotated.append((name, wv, sx, sy, zc, k, color))
 
-        for name, angle, color, is_front in depth_order:
-            a = angle * RAD
-            ax_ = math.cos(a) * arm_len
-            ay_ = math.sin(a) * arm_len
+        # gambar yang paling jauh (zc besar) duluan agar yang dekat menimpa
+        rotated.sort(key=lambda a: -a[4])
 
-            depth = (ay_ + arm_len) / (2 * arm_len)
-            d_alpha = int(140 + depth * 115)
-            d_alpha = max(90, min(255, d_alpha))
-            d_scale = 0.8 + depth * 0.3
+        self._prop_angle = (self._prop_angle + 30) % 360
+        near_zc = cam_dist - arm_len
+        far_zc = cam_dist + arm_len
 
-            arm_pen = QColor(COL_SUBTLE)
-            arm_pen.setAlpha(d_alpha)
-            p.setPen(QPen(arm_pen, int(4 * d_scale)))
-            p.drawLine(0, 0, int(ax_), int(ay_))
+        # ── lengan (arm), dari pusat badan (selalu di layar (0,0)) ke tiap
+        # ujung motor; ketebalan & alpha mengikuti kedalaman (depth cue) ──
+        for name, wv, sx, sy, zc, k, color in rotated:
+            depth_t = 1.0 - (zc - near_zc) / max(1.0, (far_zc - near_zc))
+            depth_t = max(0.0, min(1.0, depth_t))
+            arm_col = QColor(COL_TEXT)
+            arm_col.setAlpha(int(150 + depth_t * 95))
+            thick = max(1.6, 3.2 * k / (focal / cam_dist))
+            p.setPen(QPen(arm_col, thick, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(0, 0), QPointF(sx, sy))
 
-            m_color = QColor(COL_OVERLAY)
-            m_color.setAlpha(d_alpha)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(m_color))
-            p.drawEllipse(QPointF(ax_, ay_), motor_r, motor_r)
+        self._draw_body(p, M, proj, body_len, body_wid)
 
-            self._prop_angle += 22
-            prop_r = int(26 * d_scale)
-            prop_alpha = max(70, d_alpha - 40)
+        # ── motor + baling-baling, sebagai elips 3D (bukan lingkaran datar)
+        # dengan squash & rotasi mengikuti kemiringan piringan baling-baling
+        # relatif terhadap arah pandang kamera ──
+        cam_fwd = (cos_e, 0.0, -sin_e)
+        for name, wv, sx, sy, zc, k, color in rotated:
+            depth_t = 1.0 - (zc - near_zc) / max(1.0, (far_zc - near_zc))
+            depth_t = max(0.0, min(1.0, depth_t))
+            scale = k / (focal / cam_dist)
+
+            m_grad = QRadialGradient(sx - 2, sy - 2, motor_r * scale * 1.6)
+            m_grad.setColorAt(0.0, QColor("#FFFFFF"))
+            m_grad.setColorAt(0.6, QColor("#CBD5E1"))
+            m_grad.setColorAt(1.0, QColor("#64748B"))
+            p.setPen(QPen(COL_TEXT, 1))
+            p.setBrush(QBrush(m_grad))
+            p.drawEllipse(QPointF(sx, sy), motor_r * scale, motor_r * scale)
+
+            # normal piringan (sumbu Z lokal drone) & tangen horizontal,
+            # dipakai untuk menghitung squash + rotasi elips baling-baling
+            normal_w = mv(M, (0.0, 0.0, 1.0))
+            facing = abs(normal_w[0]*cam_fwd[0] + normal_w[1]*cam_fwd[1]
+                         + normal_w[2]*cam_fwd[2])
+            squash = max(0.24, min(1.0, facing))
+
+            eps = 0.06
+            tang_w = mv(M, (wv[0]*0 + 1.0, 0.0, 0.0))  # arah lokal X drone
+            p1 = proj((wv[0] + tang_w[0]*eps, wv[1] + tang_w[1]*eps,
+                       wv[2] + tang_w[2]*eps))
+            p2 = proj((wv[0] - tang_w[0]*eps, wv[1] - tang_w[1]*eps,
+                       wv[2] - tang_w[2]*eps))
+            tdx, tdy = p1[0] - p2[0], p1[1] - p2[1]
+            ang = math.degrees(math.atan2(tdy, tdx)) if (abs(tdx) + abs(tdy)) > 1e-6 else 0.0
 
             p.save()
-            p.translate(ax_, ay_)
-            p.rotate(self._prop_angle * (1 if name in ("FR", "BL") else -1))
+            p.translate(sx, sy)
+            p.rotate(ang)
 
-            pc = QColor(COL_BLUE)
-            pc.setAlpha(prop_alpha)
-            disc = QRadialGradient(0, 0, prop_r)
-            disc.setColorAt(0.0, QColor(pc.red(), pc.green(), pc.blue(), prop_alpha))
-            disc.setColorAt(0.6, QColor(pc.red(), pc.green(), pc.blue(), prop_alpha // 3))
-            disc.setColorAt(1.0, QColor(pc.red(), pc.green(), pc.blue(), 0))
-            p.setBrush(QBrush(disc))
+            r = prop_r * scale
+            disc = QRadialGradient(0, 0, r)
+            base = QColor(color)
+            disc.setColorAt(0.0, QColor(base.red(), base.green(), base.blue(), 90))
+            disc.setColorAt(0.55, QColor(base.red(), base.green(), base.blue(), 40))
+            disc.setColorAt(1.0, QColor(base.red(), base.green(), base.blue(), 0))
             p.setPen(Qt.NoPen)
-            p.drawEllipse(QPointF(0, 0), prop_r, prop_r)
+            p.setBrush(QBrush(disc))
+            p.drawEllipse(QPointF(0, 0), r, r * squash)
 
-            p.setPen(QPen(pc, 2))
-            p.drawLine(-prop_r, 0, prop_r, 0)
-            p.drawLine(0, -prop_r, 0, prop_r)
-
+            dir_sign = 1 if name in ("FR", "BL") else -1
+            p.save()
+            p.rotate(self._prop_angle * dir_sign)
+            blade_col = QColor(base)
+            blade_col.setAlpha(int(150 * scale))
+            p.setPen(QPen(blade_col, 1.4))
+            p.drawLine(QPointF(-r*0.9, 0), QPointF(r*0.9, 0))
+            p.drawLine(QPointF(0, -r*0.9*squash), QPointF(0, r*0.9*squash))
             p.restore()
 
-        body_grad = QRadialGradient(-3, -3, body_r * 1.2)
-        body_grad.setColorAt(0.0, QColor("#6c7086"))
-        body_grad.setColorAt(0.5, QColor("#313244"))
-        body_grad.setColorAt(1.0, QColor("#1e1e2e"))
-        p.setPen(QPen(COL_SUBTLE, 2))
-        p.setBrush(QBrush(body_grad))
-        p.drawEllipse(QPointF(0, 0), body_r, body_r)
-
-        p.setPen(Qt.NoPen)
-        front_y_pos = -(body_r + 3)
-        p.setBrush(QBrush(COL_RED))
-        path_front = QPainterPath()
-        path_front.moveTo(0, front_y_pos - 10)
-        path_front.lineTo(-7, front_y_pos + 4)
-        path_front.lineTo(7, front_y_pos + 4)
-        path_front.closeSubpath()
-        p.drawPath(path_front)
-
-        p.setBrush(QBrush(COL_BLUE))
-        back_y_pos = body_r + 3
-        p.drawRoundedRect(-8, back_y_pos, 16, 6, 2, 2)
-
-        led = QRadialGradient(0, 0, 5)
-        led.setColorAt(0.0, COL_GREEN)
-        led.setColorAt(0.4, QColor(COL_GREEN.red(), COL_GREEN.green(),
-                                   COL_GREEN.blue(), 150))
-        led.setColorAt(1.0, QColor(COL_GREEN.red(), COL_GREEN.green(),
-                                   COL_GREEN.blue(), 0))
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(led))
-        p.drawEllipse(QPointF(0, 0), 5, 5)
+            ring = QColor(base)
+            ring.setAlpha(85)
+            p.setPen(QPen(ring, 1.2))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QPointF(0, 0), r, r * squash)
+            p.restore()
 
         p.restore()
 
+    def _draw_body(self, p, M, proj, body_len, body_wid):
+        """Badan/fuselage digambar sebagai poligon 3D (bukan lingkaran datar
+        + segitiga yaw seperti versi lama) sehingga ikut miring & mengecil
+        secara perspektif mengikuti roll/pitch, konsisten dengan lengan."""
+        nose   = mv(M, ( body_len * 1.35, 0.0,        0.0))
+        rightw = mv(M, ( body_len * 0.10, body_wid,   0.0))
+        tail   = mv(M, (-body_len * 1.05, 0.0,        0.0))
+        leftw  = mv(M, ( body_len * 0.10, -body_wid,  0.0))
+        canopy = mv(M, ( body_len * 0.25, 0.0,  body_wid * 0.8))
 
-# ───────────────────── Info Panel ─────────────────────
+        pts_screen = []
+        depths = []
+        for v in (nose, rightw, tail, leftw):
+            sx, sy, zc, k = proj(v)
+            pts_screen.append(QPointF(sx, sy))
+            depths.append(zc)
+        csx, csy, czc, cscale = proj(canopy)
 
-class InfoPanel(QWidget):
+        avg_depth = sum(depths) / len(depths)
+        near_ref = 1.15
+        far_ref = 0.75
+        depth_norm = max(0.0, min(1.0, (avg_depth - far_ref) / max(1e-6, near_ref - far_ref)))
+
+        grad = QLinearGradient(pts_screen[3], pts_screen[1])
+        grad.setColorAt(0.0, QColor("#FFFFFF"))
+        grad.setColorAt(0.55, QColor("#E2E8F0"))
+        grad.setColorAt(1.0, QColor("#94A3B8"))
+        p.setPen(QPen(COL_ACCENT_DK, 1.3))
+        p.setBrush(QBrush(grad))
+        p.drawPolygon(QPolygonF(pts_screen))
+
+        # penanda hidung (nose tip) supaya arah depan drone selalu jelas
+        p.setPen(QPen(COL_ACCENT_DK, 1.0))
+        p.setBrush(QBrush(COL_ACCENT))
+        nose_tip = pts_screen[0]
+        p.drawEllipse(nose_tip, 2.4, 2.4)
+
+        # LED status (kanopi), sedikit di depan & di atas pusat badan
+        led_r = max(3.0, body_len * 0.22 * cscale / (cscale if cscale else 1))
+        led = QRadialGradient(csx, csy, body_len * 0.5)
+        c = COL_OK if self._connected else COL_MUTED
+        led.setColorAt(0.0, c)
+        led.setColorAt(0.5, QColor(c.red(), c.green(), c.blue(), 160))
+        led.setColorAt(1.0, QColor(c.red(), c.green(), c.blue(), 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(led))
+        p.drawEllipse(QPointF(csx, csy), body_wid * 0.6, body_wid * 0.6)
+
+
+# ───────────────────── Altitude Tape ─────────────────────
+
+class AltitudeTapeWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(90)
-        self.roll = 0.0
-        self.pitch = 0.0
-        self.yaw = 0.0
+        self.setFixedWidth(110)
+        self.setMinimumHeight(300)
         self.altitude = 0.0
-        self.temp = 0.0
-        self.pressure = 0.0
+        self.vspeed = 0.0
+        self._last_alt = 0.0
+        self._last_t = time.monotonic()
 
-    def update_values(self, roll, pitch, yaw, alt, temp, press):
-        self.roll = roll
-        self.pitch = pitch
-        self.yaw = yaw
+    def set_altitude(self, alt):
+        now = time.monotonic()
+        dt = now - self._last_t
+        if dt > 0.05:
+            inst_vs = (alt - self._last_alt) / dt
+            # IIR Filter untuk Vertical Speed (m/s) agar tidak melonjak akibat noise barometer
+            self.vspeed = 0.75 * self.vspeed + 0.25 * inst_vs
+            if abs(self.vspeed) < 0.05:
+                self.vspeed = 0.0
+            self._last_alt = alt
+            self._last_t = now
         self.altitude = alt
-        self.temp = temp
-        self.pressure = press
         self.update()
 
     def paintEvent(self, event):
-        w, h = self.width(), self.height()
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), COL_BG_DARK)
 
-        p.setFont(QFont("Consolas", 10, QFont.Bold))
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD))
+        p.drawRoundedRect(rect, 12, 12)
 
-        col_w = w // 4
-        x_start = 16
-
-        self._draw_metric(p, x_start, 8, "ROLL", f"{self.roll:+.1f}\u00b0", COL_BLUE)
-        self._draw_metric(p, x_start + col_w, 8, "PITCH", f"{self.pitch:+.1f}\u00b0", COL_TEAL)
-        self._draw_metric(p, x_start + col_w * 2, 8, "YAW", f"{self.yaw:+.1f}\u00b0", COL_MAUVE)
-        self._draw_metric(p, x_start + col_w * 3, 8, "ALT", f"{self.altitude:+.2f} m", COL_GREEN)
-
-        p.setFont(QFont("Consolas", 9))
         p.setPen(COL_SUBTEXT)
-        p.drawText(x_start, h - 12, f"Temp: {self.temp:.1f}\u00b0C")
-        p.drawText(x_start + 160, h - 12, f"Press: {self.pressure:.1f} hPa")
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.2))
+        p.drawText(QRectF(rect.left(), rect.top()+8, rect.width(), 14),
+                   Qt.AlignCenter, "ALTITUDE \u00B7 M")
 
-        bar_x = x_start + 340
-        bar_w = w - bar_x - 20
-        bar_h = 10
-        bar_y = h - 20
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(COL_OVERLAY))
-        p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 5, 5)
-        alt_fill = max(0, min(1.0, abs(self.altitude) / 50.0))
-        if alt_fill > 0.01:
-            bar_color = QLinearGradient(bar_x, 0, bar_x + bar_w, 0)
-            bar_color.setColorAt(0.0, COL_TEAL)
-            bar_color.setColorAt(1.0, COL_GREEN)
-            p.setBrush(QBrush(bar_color))
-            p.drawRoundedRect(bar_x, bar_y, int(bar_w * alt_fill), bar_h, 5, 5)
+        tape = QRectF(rect.left()+8, rect.top()+28,
+                      rect.width()-16, rect.height()-28-56)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD_ALT))
+        p.drawRoundedRect(tape, 6, 6)
+
+        p.save()
+        p.setClipRect(tape)
+
+        cy = tape.center().y()
+        px_per_m = 32.0
+        alt = self.altitude
+
+        p.setFont(qfont(FONT_UI, 8))
+        m_start = int(math.floor(alt - 5))
+        m_end = int(math.ceil(alt + 5))
+        step = 1.0
+        v = m_start
+        while v <= m_end + 0.01:
+            y = cy - (v - alt) * px_per_m
+            if tape.top() <= y <= tape.bottom():
+                major = abs(v - round(v)) < 0.01
+                if major:
+                    p.setPen(QPen(COL_TEXT, 1.4))
+                    p.drawLine(int(tape.right()-14), int(y),
+                               int(tape.right()-4), int(y))
+                    p.setPen(COL_TEXT)
+                    p.drawText(QRectF(tape.left()+2, y-7,
+                                      tape.width()-20, 14),
+                               Qt.AlignRight | Qt.AlignVCenter,
+                               f"{int(round(v)):+d}")
+                else:
+                    p.setPen(QPen(COL_MUTED, 1))
+                    p.drawLine(int(tape.right()-9), int(y),
+                               int(tape.right()-4), int(y))
+            v += step
+        p.restore()
+
+        box_w = tape.width() - 6
+        box_h = 24
+        box = QRectF(tape.left()+3, cy - box_h/2, box_w, box_h)
+        p.setPen(QPen(COL_ACCENT_DK, 1.2))
+        p.setBrush(QBrush(COL_ACCENT))
+        p.drawRoundedRect(box, 4, 4)
+        p.setPen(QColor("#FFFFFF"))
+        p.setFont(qfont(FONT_MONO, 11, QFont.Bold))
+        p.drawText(box, Qt.AlignCenter, f"{alt:+.2f}")
+
+        # V/Speed box: own row with two clearly separated lines
+        vs_rect = QRectF(rect.left()+6, rect.bottom()-46,
+                         rect.width()-12, 38)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD_ALT))
+        p.drawRoundedRect(vs_rect, 6, 6)
+        p.setPen(COL_SUBTEXT)
+        p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=0.8))
+        p.drawText(QRectF(vs_rect.left(), vs_rect.top()+3,
+                          vs_rect.width(), 12),
+                   Qt.AlignCenter, "V/SPEED M/S")
+        p.setPen(COL_TEXT if abs(self.vspeed) < 3 else COL_WARN)
+        p.setFont(qfont(FONT_MONO, 12, QFont.Bold))
+        p.drawText(QRectF(vs_rect.left(), vs_rect.top()+16,
+                          vs_rect.width(), 20),
+                   Qt.AlignCenter, f"{self.vspeed:+.2f}")
 
         p.end()
 
-    def _draw_metric(self, p, x, y, label, value, color):
+
+# ───────────────────── Joystick Widget ─────────────────────
+
+class JoystickWidget(QWidget):
+    """Kartu joystick dengan 4 zona terpisah secara eksplisit sehingga tidak
+    ada teks yang saling tumpang tindih:
+      1) Header  : judul (kiri) + badge mode (kanan)
+      2) Top     : label sumbu-Y, terpusat di atas pad
+      3) Pad     : lingkaran gimbal, dengan kolom khusus di kanan untuk label sumbu-X
+      4) Footer  : dua pill readout nilai X/Y
+    """
+
+    def __init__(self, title="STICK", mode="MODE 2",
+                 vx_label="X", vy_label="Y", parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(260, 300)
+        self._target_x = 0.5
+        self._target_y = 0.5
+        self._x = 0.5
+        self._y = 0.5
+        self._title = title
+        self._mode = mode
+        self._vx_label = vx_label
+        self._vy_label = vy_label
+        self._trail_points = []
+        self._max_trail = 12
+
+    def set_labels(self, vx, vy):
+        self._vx_label = vx
+        self._vy_label = vy
+
+    def set_position(self, nx: float, ny: float):
+        self._target_x = max(0.0, min(1.0, nx))
+        self._target_y = max(0.0, min(1.0, ny))
+
+    def animate(self):
+        ease = 0.22
+        old_x, old_y = self._x, self._y
+        self._x += (self._target_x - self._x) * ease
+        self._y += (self._target_y - self._y) * ease
+        if abs(self._x - old_x) > 0.001 or abs(self._y - old_y) > 0.001:
+            self._trail_points.append((self._x, self._y))
+            if len(self._trail_points) > self._max_trail:
+                self._trail_points.pop(0)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # card
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD))
+        p.drawRoundedRect(rect, 12, 12)
+
+        # ── Zone 1: header row (title left, mode badge right) ──
+        header_h = 30.0
+        header_rect = QRectF(rect.left() + 14, rect.top() + 8,
+                             rect.width() - 28, header_h)
+        p.setPen(COL_TEXT)
+        p.setFont(qfont(FONT_UI, 10, QFont.Bold, letter_spacing=0.8))
+        p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                   self._title.upper())
+
+        badge_font = qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.2)
+        p.setFont(badge_font)
+        badge_txt = self._mode.upper()
+        badge_w = QFontMetricsF(badge_font).horizontalAdvance(badge_txt) + 18
+        badge_rect = QRectF(header_rect.right() - badge_w,
+                            header_rect.center().y() - 9, badge_w, 18)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(COL_ACCENT_XLT))
+        p.drawRoundedRect(badge_rect, 9, 9)
+        p.setPen(COL_ACCENT_DK)
+        p.drawText(badge_rect, Qt.AlignCenter, badge_txt)
+
+        # ── Zone 2: axis-Y label strip, directly under header ──
+        ylabel_rect = QRectF(rect.left(), header_rect.bottom() + 2,
+                             rect.width(), 16)
         p.setPen(COL_SUBTEXT)
-        p.setFont(QFont("Consolas", 8))
-        p.drawText(x, y + 10, label)
-        p.setPen(color)
-        p.setFont(QFont("Consolas", 14, QFont.Bold))
-        p.drawText(x, y + 32, value)
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.6))
+        p.drawText(ylabel_rect, Qt.AlignCenter, self._vy_label.upper())
+
+        # ── Zone 4 (reserved first): footer readout pills ──
+        footer_h = 34.0
+        footer_top = rect.bottom() - 10 - footer_h
+
+        # geometry for the pad (between y-label strip and footer),
+        # with a fixed right gutter reserved for the axis-X label so the
+        # label can never overlap the circular pad.
+        gutter = 46.0
+        pad_top = ylabel_rect.bottom() + 4
+        pad_bottom = footer_top - 8
+        pad_left = rect.left() + 14
+        pad_right = rect.right() - gutter
+        cx = (pad_left + pad_right) / 2
+        cy = (pad_top + pad_bottom) / 2
+        radius = min(pad_right - pad_left, pad_bottom - pad_top) * 0.5 - 4
+
+        # outer subtle halo
+        halo = QRadialGradient(cx, cy, radius * 1.18)
+        halo.setColorAt(0.0, QColor(COL_ACCENT_XLT.red(), COL_ACCENT_XLT.green(),
+                                    COL_ACCENT_XLT.blue(), 0))
+        halo.setColorAt(0.85, QColor(COL_ACCENT_XLT.red(), COL_ACCENT_XLT.green(),
+                                     COL_ACCENT_XLT.blue(), 0))
+        halo.setColorAt(1.0, QColor(COL_ACCENT_2.red(), COL_ACCENT_2.green(),
+                                    COL_ACCENT_2.blue(), 40))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), radius * 1.18, radius * 1.18)
+
+        # outer disc (light gradient)
+        disc = QRadialGradient(cx - radius*0.2, cy - radius*0.2, radius * 1.4)
+        disc.setColorAt(0.0, QColor("#FFFFFF"))
+        disc.setColorAt(0.8, COL_CARD_ALT)
+        disc.setColorAt(1.0, QColor("#E2E8F0"))
+        p.setPen(QPen(COL_BORDER, 1.5))
+        p.setBrush(QBrush(disc))
+        p.drawEllipse(QPointF(cx, cy), radius, radius)
+
+        # inner reference rings
+        for frac in (0.33, 0.66):
+            p.setPen(QPen(COL_BORDER, 1, Qt.DotLine))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), radius * frac, radius * frac)
+
+        # crosshair
+        p.setPen(QPen(COL_DIVIDER, 1))
+        p.drawLine(int(cx - radius), int(cy), int(cx + radius), int(cy))
+        p.drawLine(int(cx), int(cy - radius), int(cx), int(cy + radius))
+
+        # deadzone circle
+        dead_r = radius * 0.07
+        dead_col = QColor(COL_ERR)
+        dead_col.setAlpha(140)
+        p.setPen(QPen(dead_col, 1.2, Qt.DashLine))
+        fill_col = QColor(COL_ERR)
+        fill_col.setAlpha(25)
+        p.setBrush(QBrush(fill_col))
+        p.drawEllipse(QPointF(cx, cy), dead_r, dead_r)
+
+        # trail
+        n_trail = len(self._trail_points)
+        for i, (tx, ty) in enumerate(self._trail_points):
+            t_alpha = int(30 + 100 * (i / max(n_trail, 1)))
+            tx_px = cx + (tx - 0.5) * 2 * radius
+            ty_px = cy + (ty - 0.5) * 2 * radius
+            trail_r = 2.5 + 2.2 * (i / max(n_trail, 1))
+            tc = QColor(COL_ACCENT_LT)
+            tc.setAlpha(t_alpha)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(tc))
+            p.drawEllipse(QPointF(tx_px, ty_px), trail_r, trail_r)
+
+        # knob position
+        sx = cx + (self._x - 0.5) * 2 * radius
+        sy = cy + (self._y - 0.5) * 2 * radius
+
+        # connector line center → knob
+        p.setPen(QPen(COL_ACCENT, 2.0, Qt.SolidLine))
+        p.drawLine(int(cx), int(cy), int(sx), int(sy))
+
+        # knob glow
+        knob = radius * 0.16
+        for scale, alpha in ((2.8, 22), (2.0, 40), (1.5, 70)):
+            gc = QColor(COL_ACCENT_2)
+            gc.setAlpha(alpha)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(gc))
+            p.drawEllipse(QPointF(sx, sy), knob * scale, knob * scale)
+
+        # knob body
+        knob_grad = QRadialGradient(sx - knob * 0.3, sy - knob * 0.35, knob * 1.4)
+        knob_grad.setColorAt(0.0, QColor("#FFFFFF"))
+        knob_grad.setColorAt(0.5, COL_ACCENT_XLT)
+        knob_grad.setColorAt(1.0, COL_ACCENT)
+        p.setPen(QPen(COL_ACCENT_DK, 1.4))
+        p.setBrush(QBrush(knob_grad))
+        p.drawEllipse(QPointF(sx, sy), knob, knob)
+
+        # specular
+        spec = QRadialGradient(sx - knob * 0.3, sy - knob * 0.35, knob * 0.55)
+        spec.setColorAt(0.0, QColor(255, 255, 255, 200))
+        spec.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(spec))
+        p.drawEllipse(QPointF(sx - knob * 0.2, sy - knob * 0.25),
+                      knob * 0.45, knob * 0.35)
+
+        # ── axis-X label: dedicated vertical gutter to the right of the pad,
+        # rotated so it never collides with the pad or the readout pills ──
+        p.save()
+        gutter_rect = QRectF(pad_right + 6, pad_top, gutter - 6, pad_bottom - pad_top)
+        p.translate(gutter_rect.center())
+        p.rotate(90)
+        rotated_rect = QRectF(-gutter_rect.height()/2, -gutter_rect.width()/2,
+                              gutter_rect.height(), gutter_rect.width())
+        p.setPen(COL_SUBTEXT)
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.6))
+        p.drawText(rotated_rect, Qt.AlignCenter, self._vx_label.upper())
+        p.restore()
+
+        # ── Zone 4: footer readout — two separate pills, never overlapping ──
+        val_x = int(self._x * 255)
+        val_y = int((1.0 - self._y) * 255)
+        pill_gap = 8.0
+        pill_w = (rect.width() - 28 - pill_gap) / 2.0
+        pill_left = QRectF(rect.left() + 14, footer_top, pill_w, footer_h)
+        pill_right = QRectF(pill_left.right() + pill_gap, footer_top, pill_w, footer_h)
+
+        for pill, lbl, val, col in (
+            (pill_left, self._vy_label, val_y, COL_ACCENT),
+            (pill_right, self._vx_label, val_x, COL_ACCENT_DK),
+        ):
+            p.setPen(QPen(COL_BORDER, 1))
+            p.setBrush(QBrush(COL_CARD_ALT))
+            p.drawRoundedRect(pill, 7, 7)
+
+            dot_x = pill.left() + 12
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(col))
+            p.drawEllipse(QPointF(dot_x, pill.top() + 10), 3, 3)
+            p.setPen(COL_SUBTEXT)
+            p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.2))
+            p.drawText(QRectF(dot_x + 8, pill.top() + 2, pill.width() - 20, 12),
+                       Qt.AlignLeft | Qt.AlignVCenter, lbl.upper())
+
+            p.setPen(COL_TEXT)
+            p.setFont(qfont(FONT_MONO, 13, QFont.Bold))
+            p.drawText(QRectF(pill.left() + 8, pill.top() + 13, pill.width() - 16, 18),
+                       Qt.AlignLeft | Qt.AlignVCenter, f"{val:>3}")
+
+        p.end()
+
+
+# ───────────────────── Metric Card ─────────────────────
+
+class MetricCard(QFrame):
+    """Kartu metrik dengan 3 zona vertikal terpisah (label / nilai / satuan)
+    yang dihitung memakai QRectF + alignment Qt, bukan baseline manual, agar
+    tidak pernah tumpang tindih pada resolusi/DPI apa pun."""
+
+    def __init__(self, label, unit, accent, parent=None):
+        super().__init__(parent)
+        self.setObjectName("MetricCard")
+        self._label = label
+        self._unit = unit
+        self._accent = accent
+        self._value = 0.0
+        self._fmt = "{:+.1f}"
+        self.setMinimumHeight(96)
+        self.setStyleSheet(f"""
+            #MetricCard {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-left: 4px solid {accent.name()};
+                border-radius: 10px;
+            }}
+        """)
+        add_shadow(self, blur=14, dy=1, alpha=18)
+
+    def set_format(self, fmt):
+        self._fmt = fmt
+
+    def set_value(self, v):
+        self._value = v
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(16, 0, -14, 0)
+
+        # Zone 1: accent dot + label (top strip)
+        label_h = 22.0
+        label_rect = QRectF(r.left(), r.top(), r.width(), label_h)
+        dot_r = 3.0
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(self._accent))
+        p.drawEllipse(QPointF(label_rect.left() + dot_r, label_rect.center().y()), dot_r, dot_r)
+        p.setPen(COL_SUBTEXT)
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.4))
+        p.drawText(label_rect.adjusted(dot_r * 2 + 6, 0, 0, 0),
+                   Qt.AlignLeft | Qt.AlignVCenter, self._label.upper())
+
+        # Zone 2: big value (middle, generous height so glyphs never clip)
+        unit_h = 20.0
+        value_rect = QRectF(r.left(), r.top() + label_h,
+                            r.width(), r.height() - label_h - unit_h)
+        p.setPen(COL_TEXT)
+        p.setFont(qfont(FONT_TITLE, 21, QFont.Bold, letter_spacing=-0.3))
+        val_text = self._fmt.format(self._value)
+        p.drawText(value_rect, Qt.AlignLeft | Qt.AlignVCenter, val_text)
+
+        # Zone 3: unit (bottom strip, separated by a hairline)
+        unit_rect = QRectF(r.left(), r.bottom() - unit_h, r.width(), unit_h)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.drawLine(QPointF(unit_rect.left(), unit_rect.top()),
+                   QPointF(unit_rect.right(), unit_rect.top()))
+        p.setPen(COL_MUTED)
+        p.setFont(qfont(FONT_UI, 7, QFont.DemiBold, letter_spacing=1.2))
+        p.drawText(unit_rect.adjusted(0, 1, 0, 0),
+                   Qt.AlignLeft | Qt.AlignVCenter, self._unit.upper())
+
+        p.end()
+
+
+# ───────────────────── Header Bar ─────────────────────
+
+class HeaderBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(64)
+        self.setStyleSheet(f"background:{COL_CARD.name()};")
+        add_shadow(self, blur=16, dy=2, alpha=22)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(22, 10, 22, 10)
+        lay.setSpacing(14)
+
+        # square brand mark
+        self._logo = QLabel("Q")
+        self._logo.setFixedSize(36, 36)
+        self._logo.setAlignment(Qt.AlignCenter)
+        self._logo.setStyleSheet(
+            f"background:{COL_ACCENT.name()};"
+            f"color:white;"
+            f"border-radius:10px;"
+            f"font-family:{CSS_TITLE};"
+            f"font-weight:800;"
+            f"font-size:18px;"
+            f"letter-spacing:0px;"
+        )
+        lay.addWidget(self._logo)
+
+        # wordmark "QMBED"
+        self._title = QLabel("QMBED")
+        self._title.setStyleSheet(
+            f"color:{COL_TEXT.name()};"
+            f"font-family:{CSS_TITLE};"
+            f"font-weight:800;"
+            f"font-size:22px;"
+            f"letter-spacing:8px;"
+            f"padding-left:2px;"
+        )
+        lay.addWidget(self._title)
+
+        lay.addStretch()
+
+        self._status = QLabel("\u25CF  DISCONNECTED")
+        self._status.setStyleSheet(
+            "color:#B91C1C; background:#FEE2E2;"
+            f"font-family:{CSS_UI}; font-weight:700; font-size:10px;"
+            "letter-spacing:2px;"
+            "padding:7px 14px; border-radius:14px;"
+        )
+        lay.addWidget(self._status)
+
+    def set_status(self, connected, port=None):
+        if connected:
+            txt = f"\u25CF  CONNECTED  {port or ''}".strip()
+            self._status.setStyleSheet(
+                "color:#15803D; background:#DCFCE7;"
+                f"font-family:{CSS_UI}; font-weight:700; font-size:10px;"
+                "letter-spacing:2px;"
+                "padding:7px 14px; border-radius:14px;"
+            )
+        else:
+            txt = "\u25CF  DISCONNECTED"
+            self._status.setStyleSheet(
+                "color:#B91C1C; background:#FEE2E2;"
+                f"font-family:{CSS_UI}; font-weight:700; font-size:10px;"
+                "letter-spacing:2px;"
+                "padding:7px 14px; border-radius:14px;"
+            )
+        self._status.setText(txt)
+
+
+# ───────────────────── Secondary Info Bar ─────────────────────
+
+class SecondaryInfoBar(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("InfoBar")
+        self.setFixedHeight(52)
+        self.setStyleSheet(f"""
+            #InfoBar {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 10px;
+            }}
+        """)
+        self.press = 0.0
+        self.rate = 0.0
+        self._last_sample_ts = 0.0
+
+    def update_press(self, press):
+        self.press = press
+        self.update()
+
+    def note_sample(self):
+        now = time.monotonic()
+        if self._last_sample_ts > 0:
+            dt = now - self._last_sample_ts
+            if dt > 0:
+                inst_hz = 1.0 / dt
+                self.rate = self.rate * 0.85 + inst_hz * 0.15
+        self._last_sample_ts = now
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect())
+
+        cols = [
+            ("PRESSURE",  f"{self.press:.1f} hPa", COL_ACCENT_2),
+            ("DATA RATE", f"{self.rate:.0f} Hz",   COL_OK),
+        ]
+        col_w = rect.width() / len(cols)
+        for i, (lbl, val, col) in enumerate(cols):
+            x = i * col_w
+            if i > 0:
+                p.setPen(QPen(COL_BORDER, 1))
+                p.drawLine(QPointF(x, rect.top() + 10), QPointF(x, rect.bottom() - 10))
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(col))
+            p.drawEllipse(QPointF(x + 20, rect.center().y()), 4, 4)
+
+            text_rect = QRectF(x + 32, rect.top(), col_w - 40, rect.height())
+            label_rect = QRectF(text_rect.left(), rect.top() + 8, text_rect.width(), 14)
+            value_rect = QRectF(text_rect.left(), rect.top() + 24, text_rect.width(), 20)
+
+            p.setPen(COL_SUBTEXT)
+            p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.2))
+            p.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter, lbl)
+            p.setPen(COL_TEXT)
+            p.setFont(qfont(FONT_UI, 12, QFont.DemiBold))
+            p.drawText(value_rect, Qt.AlignLeft | Qt.AlignVCenter, val)
+
+        p.end()
+
+
+# ───────────────────── Readout Card (RC values) ─────────────────────
+
+class RCReadoutCard(QFrame):
+    """Strip telemetri 4 channel RC dengan zona yang benar-benar terpisah:
+    header (judul + badge kalibrasi) di atas, lalu 4 kolom channel yang
+    masing-masing punya nama channel, nilai numerik, dan mini deflection-bar
+    sendiri sehingga tidak ada teks yang bertumpukan."""
+
+    CHANNELS = [
+        ("R", "ROLL", COL_ACCENT),
+        ("T", "THROTTLE", COL_ACCENT_LT),
+        ("Y", "YAW", COL_ACCENT_DK),
+        ("P", "PITCH", COL_OK),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("RCReadout")
+        self.setFixedHeight(108)
+        self.setStyleSheet(f"""
+            #RCReadout {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 10px;
+            }}
+        """)
+        self.r = 128
+        self.t = 128
+        self.y = 128
+        self.p = 128
+        self.calibrated = False
+
+    def set_values(self, r, t, y, p, calibrated):
+        self.r, self.t, self.y, self.p = r, t, y, p
+        self.calibrated = calibrated
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect())
+
+        # ── header row ──
+        header_rect = QRectF(rect.left() + 16, rect.top() + 8,
+                             rect.width() - 32, 18)
+        p.setPen(COL_SUBTEXT)
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.6))
+        p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                   "RC CHANNELS  \u00B7  RANGE 0\u2013255")
+
+        badge_txt = "CALIBRATED" if self.calibrated else "RAW DATA"
+        badge_bg = COL_OK if self.calibrated else COL_MUTED
+        badge_font = qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.6)
+        badge_w = QFontMetricsF(badge_font).horizontalAdvance(badge_txt) + 20
+        badge_rect = QRectF(header_rect.right() - badge_w,
+                            header_rect.top() - 1, badge_w, 18)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(badge_bg))
+        p.drawRoundedRect(badge_rect, 9, 9)
+        p.setPen(QColor("#FFFFFF"))
+        p.setFont(badge_font)
+        p.drawText(badge_rect, Qt.AlignCenter, badge_txt)
+
+        # hairline separating header from channel grid
+        sep_y = header_rect.bottom() + 8
+        p.setPen(QPen(COL_BORDER, 1))
+        p.drawLine(QPointF(rect.left() + 16, sep_y), QPointF(rect.right() - 16, sep_y))
+
+        # ── 4 channel columns ──
+        values = [self.r, self.t, self.y, self.p]
+        grid = QRectF(rect.left() + 16, sep_y + 8,
+                      rect.width() - 32, rect.bottom() - (sep_y + 8) - 10)
+        col_w = grid.width() / 4.0
+
+        for i, ((code, name, col), val) in enumerate(zip(self.CHANNELS, values)):
+            cx0 = grid.left() + i * col_w
+            col_rect = QRectF(cx0, grid.top(), col_w - 10, grid.height())
+
+            if i > 0:
+                p.setPen(QPen(COL_BORDER, 1))
+                p.drawLine(QPointF(cx0 - 5, grid.top()), QPointF(cx0 - 5, grid.bottom()))
+
+            # name row: colored dot + "R · ROLL"
+            name_rect = QRectF(col_rect.left(), col_rect.top(), col_rect.width(), 16)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(col))
+            p.drawEllipse(QPointF(name_rect.left() + 3, name_rect.center().y()), 3, 3)
+            p.setPen(COL_SUBTEXT)
+            p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.2))
+            p.drawText(name_rect.adjusted(11, 0, 0, 0),
+                       Qt.AlignLeft | Qt.AlignVCenter, f"{code} \u00B7 {name}")
+
+            # value row
+            value_rect = QRectF(col_rect.left(), name_rect.bottom() + 2,
+                                col_rect.width(), 22)
+            p.setPen(COL_TEXT)
+            p.setFont(qfont(FONT_MONO, 15, QFont.Bold))
+            p.drawText(value_rect, Qt.AlignLeft | Qt.AlignVCenter, f"{val:>3}")
+
+            # deflection bar row (0-255, center mark at 128)
+            bar_rect = QRectF(col_rect.left(), value_rect.bottom() + 4,
+                              col_rect.width(), 6)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(COL_CARD_ALT))
+            p.drawRoundedRect(bar_rect, 3, 3)
+
+            frac = max(0.0, min(1.0, val / 255.0))
+            fill_w = bar_rect.width() * frac
+            fill_col = QColor(col)
+            p.setBrush(QBrush(fill_col))
+            p.drawRoundedRect(QRectF(bar_rect.left(), bar_rect.top(),
+                                     max(4.0, fill_w), bar_rect.height()), 3, 3)
+
+            center_x = bar_rect.left() + bar_rect.width() * 0.5
+            p.setPen(QPen(COL_SUBTEXT, 1.4))
+            p.drawLine(QPointF(center_x, bar_rect.top() - 2),
+                      QPointF(center_x, bar_rect.bottom() + 2))
+
+        p.end()
+
+
+# ───────────────────── Status Banner (Stick Calibration) ─────────────────────
+
+class StatusBanner(QLabel):
+    """Small banner used for stick calibration hints/results."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(28)
+        self.setAlignment(Qt.AlignCenter)
+        self.hide()
+
+    def show_info(self, text):
+        self._apply(text, "#1E40AF", "#DBEAFE", "#93C5FD")
+
+    def show_ok(self, text):
+        self._apply(text, "#166534", "#DCFCE7", "#86EFAC")
+
+    def show_warn(self, text):
+        self._apply(text, "#92400E", "#FEF3C7", "#FCD34D")
+
+    def show_err(self, text):
+        self._apply(text, "#991B1B", "#FEE2E2", "#FCA5A5")
+
+    def _apply(self, text, fg, bg, border):
+        self.setText(text)
+        self.setStyleSheet(
+            f"color:{fg}; background:{bg}; border:1px solid {border};"
+            f"border-radius:8px; font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif; letter-spacing:1px;"
+        )
+        self.show()
 
 
 # ───────────────────── Main Window ─────────────────────
@@ -382,94 +1313,61 @@ class InfoPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Drone 3D Viewer — BMI160 + BMP280")
-        self.setMinimumSize(620, 560)
-        self.resize(720, 600)
+        self.setWindowTitle("QMBED")
+        self.setMinimumSize(960, 760)
+        self.resize(1080, 820)
 
+        # ── serial ──
         self._serial = None
         self._buf = b""
 
-        self._orient = OrientationFilter(alpha=0.96, dt=0.01)
+        # ── IMU / baro state ──
+        self._orient = OrientationFilter()
         self._alt_offset = 0.0
         self._alt_smooth = 0.0
-        self._temp = 0.0
         self._press = 0.0
         self._first_alt = True
 
+        # ── joystick state ──
+        self._js_calib_center = None  # (r,t,y,p) or None
+        self._js_calib_sampling = False
+        self._js_calib_samples = []
+        self._js_calib_sample_max = 60
+        self._js_raw = (128, 128, 128, 128)
+        self._js_calibrated = False
+        self._armed = False
+
+        # ── central ──
         central = QWidget()
-        central.setStyleSheet(f"background:{COL_BG_DARK.name()};")
+        central.setStyleSheet(f"background:{COL_BG.name()};")
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setContentsMargins(14, 10, 14, 12)
-        root.setSpacing(8)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        top = QHBoxLayout()
-        top.setSpacing(6)
+        # ── header ──
+        self._header = HeaderBar()
+        root.addWidget(self._header)
 
-        lbl = QLabel("PORT")
-        lbl.setStyleSheet(f"color:{COL_SUBTEXT.name()}; font:bold 10px 'Consolas'; letter-spacing:2px;")
-        top.addWidget(lbl)
+        # ── body ──
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(16, 14, 16, 14)
+        body_lay.setSpacing(12)
+        root.addWidget(body, stretch=1)
 
-        self._port_cb = QComboBox()
-        self._port_cb.setMinimumWidth(130)
-        self._port_cb.setFixedHeight(30)
-        self._port_cb.setStyleSheet(f"""
-            QComboBox {{
-                background: {COL_SURF.name()}; color: {COL_TEXT.name()};
-                border: 1px solid {COL_SUBTLE.name()}; border-radius: 5px;
-                padding: 4px 10px; font: 11px 'Consolas';
-            }}
-            QComboBox::drop-down {{ border: none; width: 24px; }}
-            QComboBox QAbstractItemView {{
-                background: {COL_SURF.name()}; color: {COL_TEXT.name()};
-                border: 1px solid {COL_SUBTLE.name()};
-                selection-background-color: {COL_OVERLAY.name()};
-            }}
-        """)
-        top.addWidget(self._port_cb)
+        # toolbar
+        body_lay.addWidget(self._build_toolbar())
 
-        self._refresh_btn = QPushButton("\u21bb")
-        self._refresh_btn.setFixedSize(30, 30)
-        self._refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COL_OVERLAY.name()}; color: {COL_TEXT.name()};
-                border: none; border-radius: 5px; font: 14px 'Consolas';
-            }}
-            QPushButton:hover {{ background: {COL_SUBTLE.name()}; }}
-        """)
-        self._refresh_btn.clicked.connect(self._refresh_ports)
-        top.addWidget(self._refresh_btn)
+        # tabs
+        self._tabs = QTabWidget()
+        self._style_tabs(self._tabs)
+        self._tabs.addTab(self._build_attitude_tab(), "ATTITUDE")
+        self._tabs.addTab(self._build_rc_tab(), "RC CONTROL")
+        body_lay.addWidget(self._tabs, stretch=1)
 
-        self._connect_btn = QPushButton("CONNECT")
-        self._connect_btn.setFixedHeight(30)
-        self._connect_btn.setStyleSheet(style_btn(COL_GREEN, COL_BG_DARK, COL_TEAL))
-        self._connect_btn.clicked.connect(self._toggle_serial)
-        top.addWidget(self._connect_btn)
-
-        self._calib_btn = QPushButton("CALIBRATE")
-        self._calib_btn.setFixedHeight(30)
-        self._calib_btn.setStyleSheet(style_btn(COL_MAUVE, COL_BG_DARK, COL_LAVENDER))
-        self._calib_btn.clicked.connect(self._calibrate)
-        top.addWidget(self._calib_btn)
-
-        self._status_lbl = QLabel("\u25cf  Disconnected")
-        self._status_lbl.setStyleSheet(f"color:{COL_RED.name()}; font: bold 10px 'Consolas';")
-        top.addWidget(self._status_lbl)
-        top.addStretch()
-        root.addLayout(top)
-
-        sep = QLabel()
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background:{COL_SUBTLE.name()};")
-        root.addWidget(sep)
-
-        self._drone = DroneWidget()
-        root.addWidget(self._drone, stretch=1)
-
-        self._info = InfoPanel()
-        root.addWidget(self._info)
-
+        # ── timers ──
         self._serial_timer = QTimer(self)
         self._serial_timer.timeout.connect(self._read_serial)
         self._serial_timer.start(16)
@@ -478,54 +1376,508 @@ class MainWindow(QMainWindow):
         self._anim_timer.timeout.connect(self._tick)
         self._anim_timer.start(16)
 
+        self._calib_timer = QTimer(self)
+        self._calib_timer.timeout.connect(self._tick_stick_calibration)
+        self._calib_timer.setInterval(50)
+
         self._refresh_ports()
 
-    def _tick(self):
-        self._drone.update()
+    # ────────── styling helpers ──────────
 
-    def _calibrate(self):
+    def _style_tabs(self, tabs: QTabWidget):
+        tabs.setDocumentMode(True)
+        tabs.tabBar().setExpanding(False)
+        tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: none;
+                background: transparent;
+                top: -1px;
+            }}
+            QTabBar {{
+                background: transparent;
+                qproperty-drawBase: 0;
+            }}
+            QTabBar::tab {{
+                background: {COL_CARD_ALT.name()};
+                color: {COL_SUBTEXT.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 8px;
+                padding: 8px 22px;
+                margin-right: 6px;
+                margin-bottom: 6px;
+                font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                letter-spacing: 2px;
+                min-width: 110px;
+            }}
+            QTabBar::tab:selected {{
+                background: {COL_ACCENT.name()};
+                color: white;
+                border: 1px solid {COL_ACCENT_DK.name()};
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: {COL_ACCENT_XLT.name()};
+                color: {COL_ACCENT_DK.name()};
+                border-color: {COL_ACCENT_LT.name()};
+            }}
+        """)
+
+    # ────────── toolbar ──────────
+
+    def _build_toolbar(self):
+        tb = QFrame()
+        tb.setObjectName("Toolbar")
+        tb.setFixedHeight(54)
+        tb.setStyleSheet(f"""
+            #Toolbar {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 10px;
+            }}
+        """)
+        add_shadow(tb, blur=14, dy=2, alpha=18)
+
+        lay = QHBoxLayout(tb)
+        lay.setContentsMargins(14, 8, 14, 8)
+        lay.setSpacing(10)
+
+        lbl = QLabel("SERIAL PORT")
+        lbl.setStyleSheet(
+            f"color:{COL_SUBTEXT.name()};"
+            f"font-family:{CSS_UI};"
+            f"font-weight:700; font-size:9px; letter-spacing:3px;"
+        )
+        lay.addWidget(lbl)
+
+        self._port_cb = QComboBox()
+        self._port_cb.setMinimumWidth(160)
+        self._port_cb.setFixedHeight(32)
+        self._port_cb.setStyleSheet(f"""
+            QComboBox {{
+                background: {COL_CARD_ALT.name()};
+                color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-family: {CSS_MONO};
+                font-size: 11px;
+            }}
+            QComboBox:hover {{ border-color: {COL_ACCENT.name()}; }}
+            QComboBox::drop-down {{ border: none; width: 22px; }}
+            QComboBox QAbstractItemView {{
+                background: {COL_CARD.name()};
+                color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()};
+                selection-background-color: {COL_ACCENT_XLT.name()};
+                selection-color: {COL_TEXT.name()};
+                outline: none;
+                font-family: {CSS_MONO};
+            }}
+        """)
+        lay.addWidget(self._port_cb)
+
+        self._refresh_btn = QPushButton("\u21BB")
+        self._refresh_btn.setFixedSize(32, 32)
+        self._refresh_btn.setToolTip("Refresh ports")
+        self._refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COL_CARD_ALT.name()};
+                color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 6px;
+                font-family: {CSS_UI};
+                font-weight: 700;
+                font-size: 14px;
+            }}
+            QPushButton:hover {{
+                background: {COL_ACCENT_XLT.name()};
+                border-color: {COL_ACCENT.name()};
+            }}
+        """)
+        self._refresh_btn.clicked.connect(self._refresh_ports)
+        lay.addWidget(self._refresh_btn)
+
+        self._connect_btn = QPushButton("CONNECT")
+        self._connect_btn.setFixedHeight(32)
+        self._connect_btn.setCursor(Qt.PointingHandCursor)
+        self._apply_connect_style(False)
+        self._connect_btn.clicked.connect(self._toggle_serial)
+        lay.addWidget(self._connect_btn)
+
+        # separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet(f"color:{COL_BORDER.name()};")
+        sep.setFixedHeight(28)
+        lay.addWidget(sep)
+
+        self._cal_imu_btn = self._make_secondary_btn("CALIBRATE IMU",
+                                                    tooltip="Zero roll/pitch/yaw filter.")
+        self._cal_imu_btn.clicked.connect(self._calibrate_imu)
+        lay.addWidget(self._cal_imu_btn)
+
+        self._cal_stick_btn = self._make_secondary_btn(
+            "CALIBRATE STICKS",
+            tooltip="Hold sticks centered; sample and set center as origin."
+        )
+        self._cal_stick_btn.setEnabled(False)
+        self._cal_stick_btn.clicked.connect(self._start_stick_calibration)
+        lay.addWidget(self._cal_stick_btn)
+
+        self._arm_btn = QPushButton("ARM")
+        self._arm_btn.setFixedHeight(32)
+        self._arm_btn.setCursor(Qt.PointingHandCursor)
+        self._arm_btn.setToolTip("Arm / Disarm drone motors.")
+        self._arm_btn.setEnabled(False)
+        self._apply_arm_style(False)
+        self._arm_btn.clicked.connect(self._toggle_arm)
+        lay.addWidget(self._arm_btn)
+
+        self._reset_stick_btn = self._make_secondary_btn(
+            "RESET STICK CAL",
+            variant="danger",
+            tooltip="Discard stick calibration center."
+        )
+        self._reset_stick_btn.setVisible(False)
+        self._reset_stick_btn.clicked.connect(self._reset_stick_calibration)
+        lay.addWidget(self._reset_stick_btn)
+
+        lay.addStretch()
+
+        self._hint = QLabel("Awaiting connection")
+        self._hint.setStyleSheet(
+            f"color:{COL_MUTED.name()};"
+            f"font-family:{CSS_UI};"
+            f"font-size:10px; font-style:italic;"
+        )
+        lay.addWidget(self._hint)
+
+        return tb
+
+    def _make_secondary_btn(self, text, variant="default", tooltip=""):
+        btn = QPushButton(text)
+        btn.setFixedHeight(32)
+        btn.setCursor(Qt.PointingHandCursor)
+        if tooltip:
+            btn.setToolTip(tooltip)
+        if variant == "danger":
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COL_CARD.name()};
+                    color: #B91C1C;
+                    border: 1px solid #FCA5A5;
+                    border-radius: 6px;
+                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                    letter-spacing:2px;
+                    padding: 0 14px;
+                }}
+                QPushButton:hover {{
+                    background: #FEE2E2;
+                }}
+                QPushButton:disabled {{
+                    background: {COL_CARD_ALT.name()};
+                    color: {COL_MUTED.name()};
+                    border-color: {COL_BORDER.name()};
+                }}
+            """)
+        else:
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COL_CARD.name()};
+                    color: {COL_ACCENT.name()};
+                    border: 1px solid {COL_ACCENT.name()};
+                    border-radius: 6px;
+                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                    letter-spacing:2px;
+                    padding: 0 14px;
+                }}
+                QPushButton:hover {{
+                    background: {COL_ACCENT_XLT.name()};
+                }}
+                QPushButton:disabled {{
+                    background: {COL_CARD_ALT.name()};
+                    color: {COL_MUTED.name()};
+                    border-color: {COL_BORDER.name()};
+                }}
+            """)
+        return btn
+
+    def _apply_connect_style(self, connected):
+        if connected:
+            self._connect_btn.setText("DISCONNECT")
+            self._connect_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #FEE2E2; color: #B91C1C;
+                    border: 1px solid #FCA5A5;
+                    border-radius: 6px;
+                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                    letter-spacing:2px;
+                    padding: 0 16px;
+                }}
+                QPushButton:hover {{ background: #FCA5A5; color:#7F1D1D; }}
+            """)
+        else:
+            self._connect_btn.setText("CONNECT")
+            self._connect_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COL_ACCENT.name()}; color: white;
+                    border: none; border-radius: 6px;
+                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                    letter-spacing:2px;
+                    padding: 0 16px;
+                }}
+                QPushButton:hover {{ background: {COL_ACCENT_DK.name()}; }}
+                QPushButton:disabled {{ background: {COL_MUTED.name()}; color:white; }}
+            """)
+
+    def _apply_arm_style(self, armed: bool):
+        if armed:
+            self._arm_btn.setText("DISARM")
+            self._arm_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #DC2626; color: white;
+                    border: 1px solid #B91C1C;
+                    border-radius: 6px;
+                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                    letter-spacing: 2px;
+                    padding: 0 16px;
+                }}
+                QPushButton:hover {{
+                    background: #B91C1C;
+                }}
+                QPushButton:disabled {{
+                    background: {COL_MUTED.name()};
+                    color: white;
+                    border-color: {COL_BORDER.name()};
+                }}
+            """)
+        else:
+            self._arm_btn.setText("ARM")
+            self._arm_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #FEF3C7; color: #B45309;
+                    border: 1px solid #FCD34D;
+                    border-radius: 6px;
+                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                    letter-spacing: 2px;
+                    padding: 0 16px;
+                }}
+                QPushButton:hover {{
+                    background: #FDE68A; color: #92400E;
+                }}
+                QPushButton:disabled {{
+                    background: {COL_CARD_ALT.name()};
+                    color: {COL_MUTED.name()};
+                    border-color: {COL_BORDER.name()};
+                }}
+            """)
+
+    def _toggle_arm(self):
+        self._armed = not self._armed
+        self._apply_arm_style(self._armed)
+        if self._serial and self._serial.is_open:
+            cmd = b"ARM\n" if self._armed else b"DISARM\n"
+            try:
+                self._serial.write(cmd)
+                self._serial.flush()
+            except Exception as e:
+                self._hint.setText(f"Serial write error: {e}")
+                return
+
+        if self._armed:
+            self._hint.setText("Drone ARMING / ARMED (Motors Live)")
+        else:
+            self._hint.setText("Drone DISARMED (Safe)")
+
+    # ────────── tabs ──────────
+
+    def _build_attitude_tab(self):
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 10, 0, 0)
+        lay.setSpacing(12)
+
+        main_row = QHBoxLayout()
+        main_row.setSpacing(12)
+        self._horizon = HorizonDroneWidget()
+        add_shadow(self._horizon, blur=22, dy=3, alpha=25)
+        self._alt_tape = AltitudeTapeWidget()
+        add_shadow(self._alt_tape, blur=18, dy=3, alpha=22)
+        main_row.addWidget(self._horizon, stretch=1)
+        main_row.addWidget(self._alt_tape)
+        lay.addLayout(main_row, stretch=1)
+
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(10)
+        self._card_roll  = MetricCard("ROLL",  "degrees",  COL_ACCENT)
+        self._card_pitch = MetricCard("PITCH", "degrees",  COL_ACCENT_LT)
+        self._card_yaw   = MetricCard("YAW",   "degrees",  COL_ACCENT_DK)
+        self._card_alt   = MetricCard("ALTITUDE", "meters", COL_OK)
+        self._card_alt.set_format("{:+.2f}")
+        for c in (self._card_roll, self._card_pitch, self._card_yaw, self._card_alt):
+            cards_row.addWidget(c, stretch=1)
+        lay.addLayout(cards_row)
+
+        self._info_bar = SecondaryInfoBar()
+        lay.addWidget(self._info_bar)
+
+        return page
+
+    def _build_rc_tab(self):
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 10, 0, 0)
+        lay.setSpacing(12)
+
+        self._stick_banner = StatusBanner()
+        lay.addWidget(self._stick_banner)
+
+        sticks_row = QHBoxLayout()
+        sticks_row.setSpacing(12)
+
+        self._joy_left = JoystickWidget("LEFT STICK", mode="MODE 2",
+                                        vx_label="YAW", vy_label="THROTTLE")
+        self._joy_right = JoystickWidget("RIGHT STICK", mode="MODE 2",
+                                         vx_label="ROLL", vy_label="PITCH")
+        add_shadow(self._joy_left, blur=22, dy=3, alpha=22)
+        add_shadow(self._joy_right, blur=22, dy=3, alpha=22)
+        sticks_row.addWidget(self._joy_left, stretch=1)
+        sticks_row.addWidget(self._joy_right, stretch=1)
+        lay.addLayout(sticks_row, stretch=1)
+
+        self._rc_readout = RCReadoutCard()
+        lay.addWidget(self._rc_readout)
+
+        return page
+
+    # ────────── lifecycle ──────────
+
+    def _tick(self):
+        self._horizon.update()
+        self._joy_left.animate()
+        self._joy_right.animate()
+
+    # ────────── IMU calibration ──────────
+
+    def _calibrate_imu(self):
         self._orient.reset()
         self._alt_offset = 0.0
         self._alt_smooth = 0.0
         self._first_alt = True
-        self._drone.set_orientation(0, 0, 0)
-        self._drone.set_altitude(0.0)
-        self._info.update_values(0, 0, 0, 0.0, self._temp, self._press)
+        self._horizon.set_orientation(0, 0, 0)
+        self._horizon.set_altitude(0.0)
+        self._alt_tape.set_altitude(0.0)
+        self._card_roll.set_value(0)
+        self._card_pitch.set_value(0)
+        self._card_yaw.set_value(0)
+        self._card_alt.set_value(0)
+        self._hint.setText("IMU calibrated \u2713")
+
+    # ────────── Stick calibration ──────────
+
+    def _start_stick_calibration(self):
+        if not self._serial or not self._serial.is_open:
+            return
+        self._js_calib_sampling = True
+        self._js_calib_samples = []
+        self._cal_stick_btn.setEnabled(False)
+        self._cal_stick_btn.setText("SAMPLING\u2026")
+        self._stick_banner.show_info(
+            "SAMPLING \u2013 hold both sticks perfectly centered, do not move."
+        )
+        self._calib_timer.start()
+
+    def _tick_stick_calibration(self):
+        if len(self._js_calib_samples) >= self._js_calib_sample_max:
+            self._finish_stick_calibration()
+
+    def _finish_stick_calibration(self):
+        self._js_calib_sampling = False
+        self._calib_timer.stop()
+        self._cal_stick_btn.setText("CALIBRATE STICKS")
+        self._cal_stick_btn.setEnabled(True)
+
+        samples = self._js_calib_samples
+        if len(samples) < 5:
+            self._stick_banner.show_err("FAILED \u2013 not enough data. Try again.")
+            return
+
+        n = len(samples)
+        cr = sum(s[0] for s in samples) // n
+        ct = sum(s[1] for s in samples) // n
+        cy = sum(s[2] for s in samples) // n
+        cp = sum(s[3] for s in samples) // n
+        self._js_calib_center = (cr, ct, cy, cp)
+        self._js_calibrated = True
+
+        self._stick_banner.show_ok(
+            f"CALIBRATED  \u2022  Center R={cr}  T={ct}  Y={cy}  P={cp}  "
+            f"\u2022  {n} samples"
+        )
+        self._reset_stick_btn.setVisible(True)
+
+    def _reset_stick_calibration(self):
+        self._js_calib_center = None
+        self._js_calib_samples = []
+        self._js_calibrated = False
+        self._stick_banner.show_warn(
+            "STICK CALIBRATION CLEARED \u2013 showing RAW joystick data."
+        )
+        self._reset_stick_btn.setVisible(False)
+
+    # ────────── ports / serial ──────────
 
     def _refresh_ports(self):
         self._port_cb.clear()
         if not HAS_SERIAL:
             self._port_cb.addItem("(pyserial not installed)")
             return
-        for p in serial.tools.list_ports.comports():
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            self._port_cb.addItem("(no ports found)")
+        for p in ports:
             self._port_cb.addItem(p.device)
 
     def _toggle_serial(self):
         if self._serial and self._serial.is_open:
+            if self._armed:
+                try:
+                    self._serial.write(b"DISARM\n")
+                    self._serial.flush()
+                except Exception:
+                    pass
             self._serial.close()
             self._serial = None
-            self._connect_btn.setText("CONNECT")
-            self._connect_btn.setStyleSheet(style_btn(COL_GREEN, COL_BG_DARK, COL_TEAL))
-            self._status_lbl.setText("\u25cf  Disconnected")
-            self._status_lbl.setStyleSheet(f"color:{COL_RED.name()}; font: bold 10px 'Consolas';")
+            self._armed = False
+            self._apply_arm_style(False)
+            self._apply_connect_style(False)
+            self._header.set_status(False)
+            self._horizon.set_connected(False)
+            self._cal_stick_btn.setEnabled(False)
+            self._arm_btn.setEnabled(False)
+            self._hint.setText("Disconnected")
             return
         if not HAS_SERIAL:
-            self._status_lbl.setText("\u25cf  pyserial missing")
+            self._hint.setText("pyserial not installed")
             return
         port = self._port_cb.currentText()
         if not port or port.startswith("("):
+            self._hint.setText("Select a valid port")
             return
         try:
             self._serial = serial.Serial(port, 115200, timeout=0.02)
             self._buf = b""
             self._first_alt = True
-            self._connect_btn.setText("DISCONNECT")
-            self._connect_btn.setStyleSheet(style_btn(COL_RED, COL_BG_DARK, COL_MAROON))
-            self._status_lbl.setText(f"\u25cf  Connected  {port}")
-            self._status_lbl.setStyleSheet(f"color:{COL_GREEN.name()}; font: bold 10px 'Consolas';")
+            self._apply_connect_style(True)
+            self._header.set_status(True, port)
+            self._horizon.set_connected(True)
+            self._cal_stick_btn.setEnabled(True)
+            self._arm_btn.setEnabled(True)
+            self._hint.setText(f"Streaming from {port}")
         except Exception as e:
-            self._status_lbl.setText(f"\u25cf  {e}")
-            self._status_lbl.setStyleSheet(f"color:{COL_RED.name()};")
+            self._hint.setText(f"Error: {e}")
+            self._header.set_status(False)
 
     def _read_serial(self):
         if not self._serial or not self._serial.is_open:
@@ -542,34 +1894,68 @@ class MainWindow(QMainWindow):
             line, self._buf = self._buf.split(b"\n", 1)
             self._parse_line(line.decode("ascii", errors="ignore").strip())
 
+    # ────────── data processing ──────────
+
+    def _push_att_metrics(self):
+        self._card_roll.set_value(self._orient.roll)
+        self._card_pitch.set_value(self._orient.pitch)
+        self._card_yaw.set_value(self._orient.yaw)
+        self._card_alt.set_value(self._alt_smooth)
+        self._horizon.set_orientation(self._orient.roll,
+                                      self._orient.pitch,
+                                      self._orient.yaw)
+        self._alt_tape.set_altitude(self._alt_smooth)
+        self._horizon.set_altitude(self._alt_smooth)
+        self._info_bar.update_press(self._press)
+
+    def _push_rc_values(self):
+        r, t, y, p = self._js_raw
+        if self._js_calib_center:
+            cr, ct, cy_, cp = self._js_calib_center
+            r = max(0, min(255, 128 + (r - cr)))
+            t = max(0, min(255, 128 + (t - ct)))
+            y = max(0, min(255, 128 + (y - cy_)))
+            p = max(0, min(255, 128 + (p - cp)))
+
+        # Left stick: X = YAW, Y = THROTTLE
+        # Right stick: X = ROLL, Y = PITCH
+        # Normalize 0..255 -> 0..1; joy widget Y=0 at top so invert
+        self._joy_left.set_position(y / 255.0, 1.0 - t / 255.0)
+        self._joy_right.set_position(r / 255.0, 1.0 - p / 255.0)
+        self._rc_readout.set_values(r, t, y, p, self._js_calibrated)
+
     def _parse_line(self, text: str):
         m = IMU_RE.search(text)
         if m:
             ax, ay, az = [float(v) for v in m.groups()[:3]]
             gx, gy, gz = [float(v) for v in m.groups()[3:]]
             self._orient.update(ax, ay, az, gx, gy, gz)
-            self._drone.set_orientation(self._orient.roll, self._orient.pitch, self._orient.yaw)
-            self._info.update_values(
-                self._orient.roll, self._orient.pitch, self._orient.yaw,
-                self._alt_smooth, self._temp, self._press
-            )
+            self._info_bar.note_sample()
+            self._push_att_metrics()
             return
 
         m = BMP_RE.search(text)
         if m:
-            self._temp = float(m.group(1))
-            self._press = float(m.group(2))
-            alt = float(m.group(3))
+            self._press = float(m.group(1))
+            alt = float(m.group(2))
             if self._first_alt:
                 self._alt_offset = alt
+                self._alt_smooth = 0.0
                 self._first_alt = False
             corrected = alt - self._alt_offset
-            self._alt_smooth += (corrected - self._alt_smooth) * 0.15
-            self._drone.set_altitude(self._alt_smooth)
-            self._info.update_values(
-                self._orient.roll, self._orient.pitch, self._orient.yaw,
-                self._alt_smooth, self._temp, self._press
-            )
+            # Digital IIR Low-Pass Filter: y[k] = 0.80 * y[k-1] + 0.20 * x[k]
+            self._alt_smooth = 0.80 * self._alt_smooth + 0.20 * corrected
+            self._push_att_metrics()
+            return
+
+        m = TX_RE.search(text)
+        if m:
+            r, t, y, p = [int(v) for v in m.groups()]
+            self._js_raw = (r, t, y, p)
+            if self._js_calib_sampling:
+                self._js_calib_samples.append((r, t, y, p))
+            self._push_rc_values()
+            return
 
 
 def main():
@@ -577,12 +1963,13 @@ def main():
     try:
         app = QApplication(sys.argv)
         app.setStyle("Fusion")
+        app.setFont(qfont(FONT_UI, 10))
         win = MainWindow()
         win.show()
         sys.exit(app.exec())
     except Exception:
         traceback.print_exc()
-        input("\nTekan Enter untuk keluar...")
+        input("\nTekan Enter untuk keluar.")
 
 
 if __name__ == "__main__":

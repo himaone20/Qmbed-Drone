@@ -1,30 +1,90 @@
-/*
-  Bagian untuk Konfigurasi Umum (Pin, Alamat I2C, Parameter Task)
-  Program Studi Teknologi Rekayasa Instrumentasi dan Kontrol
-  Departemen Teknik Elektro dan Informatika
-  Sekolah Vokasi
-  Universitas Gadjah Mada
-  2025
-*/
+/* ==========================================================================
+ * CONFIG.H — Konfigurasi Pinout, Parameter Sensor, ESC, LoRa & FreeRTOS
+ * Target Board: STM32F401RCT6 (Generic F401RCTx)
+ * ==========================================================================
+ */
 
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// === Konfigurasi Pin I2C (dipakai bersama oleh BMI160 & BMP280) ===
-#define I2C_SDA PB7
-#define I2C_SCL PB6
-#define I2C_CLOCK 400000
+#include <Arduino.h>
 
-// === Alamat I2C Sensor ===
-#define BMI160_ADDR 0x68
-// #define BMP280_ADDR 0x76   // TODO: tentukan alamat BMP280 saat referensi library sudah ada
+/* ── Serial Debug (USART1) ───────────────────────────────────────────── */
+#define SERIAL_TX_PIN         PA9
+#define SERIAL_RX_PIN         PA10
+#define SERIAL_BAUD           115200
 
-// === Parameter Complementary Filter (BMI160) ===
-#define CF_ALPHA 0.98f
+/* ── LoRa RA-02 (SX1278 di SPI2) ─────────────────────────────────────── */
+#define LORA_SCK_PIN          PB13
+#define LORA_MISO_PIN         PB14
+#define LORA_MOSI_PIN         PB15
+#define LORA_NSS_PIN          PB12
+#define LORA_RST_PIN          PB1
+#define LORA_DIO0_PIN         PB0
+#define LORA_FREQUENCY        433E6
+#define LORA_SPREADING_FACTOR 7
+#define LORA_SIGNAL_BANDWIDTH 125E3
+#define LORA_CODING_RATE      5
 
-// === Parameter Task FreeRTOS: Task Baca Sensor ===
-#define TASK_SENSOR_PERIOD_MS   4     // 250 Hz, samakan dengan referensi (dt >= 0.004 s)
-#define TASK_SENSOR_PRIORITY    2
-#define TASK_SENSOR_STACK_SIZE  256   // dalam words, sesuaikan lagi saat implementasi penuh
+/* ── I2C Bus (Sensor BMI160 + BMP280) ────────────────────────────────── */
+#define I2C_SCL_PIN           PB10
+#define I2C_SDA_PIN           PB3
+#define I2C_CLOCK_SPEED       400000
+#define BMI160_ADDR           0x68
+#define BMP280_ADDR           0x76
+
+/* ── ESC 4 Motor (Quad-X) ────────────────────────────────────────────── */
+#define MOTOR1_PIN            PB6    // Motor 1: CCW (Depan-Kiri)
+#define MOTOR2_PIN            PB7    // Motor 2: CW  (Depan-Kanan)
+#define MOTOR3_PIN            PB8    // Motor 3: CCW (Belakang-Kanan)
+#define MOTOR4_PIN            PB9    // Motor 4: CW  (Belakang-Kiri)
+
+#define ESC_MIN_US            1000   // PWM Stop / Idle (0%)
+#define ESC_MAX_US            2000   // PWM Full (100%)
+#define ESC_ARM_SPIN_US       1200   // 20% throttle saat ARMED (1000 + 1000*0.20)
+#define ARMING_DURATION_MS    5000   // Waktu tunggu arming (5 detik)
+#define LINK_TIMEOUT_MS       1000   // Failsafe timeout jika LoRa hilang > 1s
+
+/* ── LED Indikator ───────────────────────────────────────────────────── */
+#define LED_PIN               PC4    // Aktif LOW (Arming blink 1Hz, Armed ON, Disarm OFF)
+
+/* ── FreeRTOS Task Configuration ─────────────────────────────────────── */
+#define TASK_SENSOR_PERIOD_MS    10     // 100 Hz periodik
+#define TASK_SENSOR_PRIORITY     3      // Prioritas tinggi (Realtime Sensor Read)
+#define TASK_SENSOR_STACK_SIZE   256    // Stack size (words)
+
+#define TASK_LORA_PERIOD_MS      5      // Polling periodik ~5 ms
+#define TASK_LORA_PRIORITY       2      // Prioritas menengah (Radio & Control)
+#define TASK_LORA_STACK_SIZE     384    // Stack size (words)
+
+/* ── Protokol Paket Biner LoRa ───────────────────────────────────────── */
+#define UPLINK_MAGIC          0xA5
+#define DOWNLINK_MAGIC        0x5A
+
+#pragma pack(push, 1)
+struct UplinkPacket {
+  uint8_t magic;    // harus == UPLINK_MAGIC (0xA5)
+  uint8_t r, t, y, p;
+  uint8_t armed;    // 0 = DISARM, 1 = ARM
+};
+
+struct DownlinkPacket {
+  uint8_t  magic;   // harus == DOWNLINK_MAGIC (0x5A)
+  int16_t  ax, ay, az;   // m/s^2  x100
+  int16_t  gx, gy, gz;   // deg/s  x100
+  uint16_t press;        // hPa    x10
+  int16_t  alt;          // meter  x100
+};
+#pragma pack(pop)
+
+/* ── Shared Telemetry Struct (Protected by Mutex) ─────────────────────── */
+struct SensorData {
+  float ax, ay, az;      // m/s^2
+  float gx, gy, gz;      // deg/s
+  float press;           // hPa
+  float alt;             // meter relatif
+  bool  bmiOK;
+  bool  bmpOK;
+};
 
 #endif // CONFIG_H
