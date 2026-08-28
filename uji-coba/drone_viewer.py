@@ -21,6 +21,7 @@ import sys
 import re
 import math
 import time
+from collections import deque
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
 from PySide6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QFontMetricsF,
@@ -29,7 +30,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QFrame, QTabWidget,
-    QGraphicsDropShadowEffect
+    QGraphicsDropShadowEffect, QFormLayout, QDoubleSpinBox
 )
 
 try:
@@ -48,6 +49,10 @@ BMP_RE = re.compile(
 )
 TX_RE = re.compile(
     r"\[TX\]\s*R:(\d+)\s*T:(\d+)\s*Y:(\d+)\s*P:(\d+)"
+)
+SMC_RE = re.compile(
+    r"\[SMC\]\s*ROLL:([-\d.]+)\s*PITCH:([-\d.]+)"
+    r"\s*UR:([-\d.]+)\s*UP:([-\d.]+)\s*UY:([-\d.]+)"
 )
 
 # ─────────────── Palette : Sky Blue & White ───────────────
@@ -944,6 +949,103 @@ class JoystickWidget(QWidget):
         p.end()
 
 
+# ───────────────────── SMC Tuning Plot ─────────────────────
+
+class SmcPlotWidget(QWidget):
+    """Scrolling attitude and SMC-output traces from the flight controller."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(440, 390)
+        self._samples = deque(maxlen=180)
+        self._roll = self._pitch = 0.0
+        self._ur = self._up = self._uy = 0.0
+
+    def add_sample(self, roll, pitch, u_roll, u_pitch, u_yaw):
+        self._roll, self._pitch = roll, pitch
+        self._ur, self._up, self._uy = u_roll, u_pitch, u_yaw
+        self._samples.append((time.monotonic(), roll, pitch, u_roll, u_pitch, u_yaw))
+        self.update()
+
+    def _status(self):
+        if len(self._samples) < 20:
+            return "WAITING FOR DATA", COL_MUTED
+        recent = list(self._samples)[-20:]
+        early = list(self._samples)[-40:-20]
+        recent_amp = max(max(abs(s[1]), abs(s[2])) for s in recent)
+        if not early:
+            return "MONITORING", COL_WARN
+        early_amp = max(max(abs(s[1]), abs(s[2])) for s in early)
+        if recent_amp > max(4.0, early_amp * 1.35):
+            return "DIVERGING - CHECK SIGNS", COL_ERR
+        if recent_amp < max(1.0, early_amp * 0.70):
+            return "STABLE / DAMPING", COL_OK
+        return "OSCILLATING / HOLD", COL_WARN
+
+    def _draw_trace(self, p, rect, values, color, scale):
+        if len(self._samples) < 2:
+            return
+        start = self._samples[0][0]
+        end = self._samples[-1][0]
+        span = max(1.0, end - start)
+        points = []
+        for sample, value in zip(self._samples, values):
+            x = rect.left() + (sample[0] - start) / span * rect.width()
+            y = rect.center().y() - (value / scale) * (rect.height() * 0.42)
+            points.append(QPointF(x, y))
+        p.setPen(QPen(color, 1.8))
+        for i in range(1, len(points)):
+            p.drawLine(points[i - 1], points[i])
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect().adjusted(0, 0, -1, -1))
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD))
+        p.drawRoundedRect(rect, 12, 12)
+
+        title = QRectF(rect.left() + 16, rect.top() + 10, rect.width() - 32, 20)
+        status, status_col = self._status()
+        p.setPen(COL_TEXT)
+        p.setFont(qfont(FONT_UI, 9, QFont.Bold, letter_spacing=1.5))
+        p.drawText(title, Qt.AlignLeft | Qt.AlignVCenter, "LIVE SMC RESPONSE")
+        p.setPen(status_col)
+        p.drawText(title, Qt.AlignRight | Qt.AlignVCenter, status)
+
+        top = QRectF(rect.left() + 16, rect.top() + 42, rect.width() - 32, (rect.height() - 90) * 0.48)
+        bottom = QRectF(rect.left() + 16, top.bottom() + 20, rect.width() - 32, (rect.height() - 90) * 0.48)
+        for plot, label, scale in ((top, "ATTITUDE (deg)", 30.0), (bottom, "SMC OUTPUT (us)", 180.0)):
+            p.setPen(QPen(COL_BORDER, 1))
+            p.setBrush(QBrush(COL_CARD_ALT))
+            p.drawRoundedRect(plot, 6, 6)
+            p.setPen(QPen(COL_DIVIDER, 1, Qt.DashLine))
+            p.drawLine(QPointF(plot.left(), plot.center().y()), QPointF(plot.right(), plot.center().y()))
+            p.setPen(COL_SUBTEXT)
+            p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.0))
+            p.drawText(QRectF(plot.left() + 6, plot.top() + 4, plot.width() - 12, 13), Qt.AlignLeft, label)
+            p.drawText(QRectF(plot.right() - 36, plot.center().y() - 7, 30, 14), Qt.AlignRight, "0")
+
+        samples = list(self._samples)
+        self._draw_trace(p, top, [s[1] for s in samples], COL_ACCENT, 30.0)
+        self._draw_trace(p, top, [s[2] for s in samples], COL_OK, 30.0)
+        self._draw_trace(p, bottom, [s[3] for s in samples], COL_ACCENT, 180.0)
+        self._draw_trace(p, bottom, [s[4] for s in samples], COL_OK, 180.0)
+        self._draw_trace(p, bottom, [s[5] for s in samples], COL_WARN, 180.0)
+
+        p.setFont(qfont(FONT_MONO, 8, QFont.Bold))
+        p.setPen(COL_ACCENT)
+        p.drawText(QRectF(top.left(), top.bottom() + 2, 95, 14), Qt.AlignLeft, f"ROLL {self._roll:+.2f}")
+        p.setPen(COL_OK)
+        p.drawText(QRectF(top.left() + 105, top.bottom() + 2, 100, 14), Qt.AlignLeft, f"PITCH {self._pitch:+.2f}")
+        p.setPen(COL_ACCENT)
+        p.drawText(QRectF(bottom.left(), bottom.bottom() + 2, 85, 14), Qt.AlignLeft, f"UR {self._ur:+.1f}")
+        p.setPen(COL_OK)
+        p.drawText(QRectF(bottom.left() + 90, bottom.bottom() + 2, 85, 14), Qt.AlignLeft, f"UP {self._up:+.1f}")
+        p.setPen(COL_WARN)
+        p.drawText(QRectF(bottom.left() + 180, bottom.bottom() + 2, 85, 14), Qt.AlignLeft, f"UY {self._uy:+.1f}")
+        p.end()
+
+
 # ───────────────────── Metric Card ─────────────────────
 
 class MetricCard(QFrame):
@@ -1365,6 +1467,7 @@ class MainWindow(QMainWindow):
         self._style_tabs(self._tabs)
         self._tabs.addTab(self._build_attitude_tab(), "ATTITUDE")
         self._tabs.addTab(self._build_rc_tab(), "RC CONTROL")
+        self._tabs.addTab(self._build_smc_tab(), "SMC TUNING")
         body_lay.addWidget(self._tabs, stretch=1)
 
         # ── timers ──
@@ -1751,6 +1854,92 @@ class MainWindow(QMainWindow):
 
         return page
 
+    def _build_smc_tab(self):
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 10, 0, 0)
+        root.setSpacing(12)
+
+        card = QFrame()
+        card.setStyleSheet(f"""
+            background: {COL_CARD.name()}; border: 1px solid {COL_BORDER.name()};
+            border-radius: 10px;
+        """)
+        add_shadow(card, blur=18, dy=2, alpha=20)
+        form = QFormLayout(card)
+        form.setContentsMargins(22, 18, 22, 18)
+        form.setSpacing(12)
+
+        title = QLabel("SLIDING MODE CONTROLLER")
+        title.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:800; font-size:14px; letter-spacing:2px;")
+        form.addRow(title)
+
+        self._smc_inputs = {}
+        fields = [
+            ("K1", "k1", 5.0, 0.1, 30.0, 0.1),
+            ("K2", "k2", 2.0, 0.1, 30.0, 0.1),
+            ("EPS", "eps", 8.0, 0.1, 100.0, 0.1),
+            ("FORCE TO PWM", "force", 30.0, 0.1, 200.0, 0.5),
+            ("MAX CORRECTION (us)", "delta", 180.0, 10.0, 500.0, 5.0),
+        ]
+        for label, key, value, low, high, step in fields:
+            spin = QDoubleSpinBox()
+            spin.setRange(low, high)
+            spin.setValue(value)
+            spin.setSingleStep(step)
+            spin.setDecimals(2)
+            spin.setSuffix(" us" if key == "delta" else "")
+            spin.setStyleSheet(f"background:{COL_CARD_ALT.name()}; color:{COL_TEXT.name()}; padding:5px; border:1px solid {COL_BORDER.name()}; border-radius:5px;")
+            self._smc_inputs[key] = spin
+
+            name = QLabel(label)
+            name.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:12px;")
+            form.addRow(name, spin)
+
+        self._smc_apply_btn = self._make_secondary_btn("APPLY SMC PARAMETERS")
+        self._smc_apply_btn.clicked.connect(self._apply_smc_parameters)
+        form.addRow(self._smc_apply_btn)
+        root.addWidget(card, 1)
+
+        self._smc_plot = SmcPlotWidget()
+        add_shadow(self._smc_plot, blur=18, dy=2, alpha=20)
+        root.addWidget(self._smc_plot, 2)
+
+        guide = QLabel(
+            "EFEK PARAMETER\n\n"
+            "K1\nLebih besar: drone kembali level lebih cepat. Terlalu besar: overshoot dan osilasi.\n\n"
+            "K2\nLebih besar: lebih kuat melawan gangguan. Terlalu besar: motor bergetar/chattering.\n\n"
+            "EPS\nLebih besar: koreksi lebih halus, tetapi leveling lebih lambat/longgar. Lebih kecil: koreksi tajam, tetapi lebih banyak chattering.\n\n"
+            "FORCE TO PWM\nMengubah torsi kendali hasil SMC menjadi koreksi PWM. Lebih besar membuat SMC lebih agresif.\n\n"
+            "MAX CORRECTION\nBatas keselamatan koreksi PWM per motor. Lebih besar memberi kemampuan pemulihan lebih besar, tetapi beda tenaga motor juga lebih besar.\n\n"
+            "Mulai tanpa propeller. Ubah satu parameter per kali, lalu uji kembali."
+        )
+        guide.setWordWrap(True)
+        guide.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        guide.setStyleSheet(f"""
+            background:{COL_CARD.name()}; color:{COL_SUBTEXT.name()}; border:1px solid {COL_BORDER.name()};
+            border-radius:10px; padding:20px; font-size:11px; line-height:1.4;
+        """)
+        root.addWidget(guide, 1)
+        return page
+
+    def _apply_smc_parameters(self):
+        if not self._serial or not self._serial.is_open:
+            self._hint.setText("Connect to remote before applying SMC parameters.")
+            return
+        values = self._smc_inputs
+        command = "SMC {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}\n".format(
+            values["k1"].value(), values["k2"].value(), values["eps"].value(),
+            values["force"].value(), values["delta"].value()
+        )
+        try:
+            self._serial.write(command.encode("ascii"))
+            self._serial.flush()
+            self._hint.setText("SMC parameters sent to remote and drone.")
+        except Exception as e:
+            self._hint.setText(f"SMC parameter write error: {e}")
+
     # ────────── lifecycle ──────────
 
     def _tick(self):
@@ -1955,6 +2144,13 @@ class MainWindow(QMainWindow):
             if self._js_calib_sampling:
                 self._js_calib_samples.append((r, t, y, p))
             self._push_rc_values()
+            return
+
+        m = SMC_RE.search(text)
+        if m:
+            roll, pitch, u_roll, u_pitch, u_yaw = [float(v) for v in m.groups()]
+            if hasattr(self, "_smc_plot"):
+                self._smc_plot.add_sample(roll, pitch, u_roll, u_pitch, u_yaw)
             return
 
 

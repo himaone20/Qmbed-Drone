@@ -42,6 +42,34 @@ bool linkOK = false;
 float altitude_offset = 0.0f;
 float alt_filtered = 0.0f;
 
+/* Perintah joystick valid terakhir dari remote. Nilai netral aman saat boot. */
+uint8_t lastRollCmd = 128;
+uint8_t lastThrottleCmd = 0;
+uint8_t lastYawCmd = 128;
+uint8_t lastPitchCmd = 128;
+float throttleSmoothed = ESC_ARM_SPIN_US;
+unsigned long throttleRampLastMs = 0;
+float lastURoll = 0.0f;
+float lastUPitch = 0.0f;
+float lastUYaw = 0.0f;
+
+struct SmcParams {
+  float k1;
+  float k2;
+  float eps;
+  float forceToPwm;
+  float deltaMaxPwm;
+};
+
+SmcParams gSmcParams = {
+  SMC_K1_DEFAULT,
+  SMC_K2_DEFAULT,
+  SMC_EPS_DEFAULT,
+  SMC_FORCE_TO_PWM_DEFAULT,
+  SMC_DELTA_MAX_DEFAULT
+};
+SemaphoreHandle_t smcMutex = NULL;
+
 /* ── Gyro Zero-Bias Calibration Offsets ───────────────────────────────── */
 float gyro_bias_gx = 0.0f;
 float gyro_bias_gy = 0.0f;
@@ -62,11 +90,123 @@ void setAllMotorsPWM(int us)
   }
 }
 
+void updateThrottleCommand(uint8_t t)
+{
+  int throttleDelta = (int)t - 128;
+  if (abs(throttleDelta) <= THROTTLE_DEADBAND) {
+    throttleDelta = 0;
+  }
+
+  unsigned long now = millis();
+  float elapsedSeconds = (now - throttleRampLastMs) / 1000.0f;
+  throttleRampLastMs = now;
+
+  // Stick tengah tidak mengubah PWM; nilai throttle terakhir tetap dipakai.
+  float stickNorm = throttleDelta >= 0 ?
+    (float)throttleDelta / 127.0f : (float)throttleDelta / 128.0f;
+  throttleSmoothed += stickNorm * THROTTLE_RATE_US_PER_S * elapsedSeconds;
+  throttleSmoothed = constrain(throttleSmoothed,
+                               (float)ESC_MIN_US, (float)ESC_MAX_US);
+}
+
+void writeSmcMotorMix(float basePwm, float uRoll, float uPitch, float uYaw)
+{
+  // Quad-X, arah putaran nyata: M1 FL CW, M2 FR CCW, M3 BR CW, M4 BL CCW.
+  // uRoll + = naikkan kiri (dikoreksi dari tanda sensor), uPitch + = naikkan depan,
+  // uYaw + = meredam rotasi (CW motor naik, CCW motor turun).
+  int motorPwm[4] = {
+    (int)(basePwm + uRoll + uPitch + uYaw),  // M1 FL CW
+    (int)(basePwm - uRoll + uPitch - uYaw),  // M2 FR CCW
+    (int)(basePwm - uRoll - uPitch + uYaw),  // M3 BR CW
+    (int)(basePwm + uRoll - uPitch - uYaw)   // M4 BL CCW
+  };
+
+  for (int i = 0; i < 4; i++) {
+    motorPwm[i] = constrain(motorPwm[i], ESC_MIN_US, ESC_MAX_US);
+    motors[i].writeMicroseconds(motorPwm[i]);
+  }
+}
+
+void computeSmc(const SensorData &sensor, const SmcParams &params,
+                float *uRoll, float *uPitch, float *uYaw)
+{
+  // Hover mode: target roll/pitch is level. Yaw uses rate damping only.
+  float rollError = -sensor.roll;
+  float pitchError = -sensor.pitch;
+  float rollSurface = -sensor.gx + params.k1 * rollError;
+  float pitchSurface = -sensor.gy + params.k1 * pitchError;
+
+  float rollTorque = SMC_IX_DEFAULT *
+    (params.k1 * (params.k1 * rollError - sensor.gx) +
+     params.k2 * tanhf(rollSurface / params.eps));
+  float pitchTorque = SMC_IY_DEFAULT *
+    (params.k1 * (params.k1 * pitchError - sensor.gy) +
+     params.k2 * tanhf(pitchSurface / params.eps));
+  float yawTorque = SMC_IZ_DEFAULT *
+    (-params.k1 * sensor.gz - params.k2 * tanhf(sensor.gz / params.eps));
+
+  *uRoll = constrain((rollTorque / SMC_ARM_LENGTH_DEFAULT) * params.forceToPwm,
+                     -params.deltaMaxPwm, params.deltaMaxPwm);
+  *uPitch = constrain((pitchTorque / SMC_ARM_LENGTH_DEFAULT) * params.forceToPwm,
+                      -params.deltaMaxPwm, params.deltaMaxPwm);
+  *uYaw = constrain((yawTorque / SMC_ARM_LENGTH_DEFAULT) * params.forceToPwm,
+                    -params.deltaMaxPwm, params.deltaMaxPwm);
+}
+
+void TaskControl(void *pvParameters)
+{
+  (void)pvParameters;
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(TASK_CONTROL_PERIOD_MS);
+  unsigned long lastDebugMs = 0;
+
+  for (;;) {
+    if (escState == ESC_ARMED) {
+      SensorData sensor = gSensorData;
+      SmcParams params = gSmcParams;
+      if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        sensor = gSensorData;
+        xSemaphoreGive(sensorMutex);
+      }
+      if (xSemaphoreTake(smcMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        params = gSmcParams;
+        xSemaphoreGive(smcMutex);
+      }
+
+      updateThrottleCommand(lastThrottleCmd);
+      float uRoll = 0.0f, uPitch = 0.0f, uYaw = 0.0f;
+      if (sensor.bmiOK && throttleSmoothed >= MIX_ACTIVE_MIN_US) {
+        computeSmc(sensor, params, &uRoll, &uPitch, &uYaw);
+      }
+      lastURoll = uRoll;
+      lastUPitch = uPitch;
+      lastUYaw = uYaw;
+      writeSmcMotorMix(throttleSmoothed, uRoll, uPitch, uYaw);
+
+#if SMC_BENCH_DEBUG
+      if (millis() - lastDebugMs >= 100) {
+        lastDebugMs = millis();
+        Serial.print("[SMC] R:"); Serial.print(sensor.roll, 2);
+        Serial.print(" P:"); Serial.print(sensor.pitch, 2);
+        Serial.print(" T_CMD:"); Serial.print(lastThrottleCmd);
+        Serial.print(" T_PWM:"); Serial.print(throttleSmoothed, 1);
+        Serial.print(" U_R:"); Serial.print(uRoll, 1);
+        Serial.print(" U_P:"); Serial.print(uPitch, 1);
+        Serial.print(" U_Y:"); Serial.println(uYaw, 1);
+      }
+#endif
+    }
+    vTaskDelayUntil(&lastWakeTime, period);
+  }
+}
+
 void updateEscFSM(bool armCommand)
 {
   if (!armCommand) {
     if (escState != ESC_DISARMED) {
       escState = ESC_DISARMED;
+      throttleSmoothed = ESC_ARM_SPIN_US;
+      throttleRampLastMs = millis();
       setAllMotorsPWM(ESC_MIN_US);
       Serial.println("[ESC] DISARMED -> 4 Motor STOP (1000 us)");
     }
@@ -77,20 +217,20 @@ void updateEscFSM(bool armCommand)
   if (escState == ESC_DISARMED) {
     escState = ESC_ARMING;
     armingStartMs = millis();
+    throttleSmoothed = ESC_ARM_SPIN_US;
+    throttleRampLastMs = millis();
     setAllMotorsPWM(ESC_MIN_US);
     Serial.println("[ESC] Mulai Arming 5 detik (1000 us)...");
   }
   else if (escState == ESC_ARMING) {
     if (millis() - armingStartMs >= ARMING_DURATION_MS) {
       escState = ESC_ARMED;
-      setAllMotorsPWM(ESC_ARM_SPIN_US);
-      Serial.println("[ESC] ARMED! 4 Motor berputar 20% (1200 us)");
+      throttleSmoothed = ESC_ARM_SPIN_US;
+      throttleRampLastMs = millis();
+      Serial.println("[ESC] ARMED! Motor mengikuti throttle dan Quad-X mixer.");
     } else {
       setAllMotorsPWM(ESC_MIN_US);
     }
-  }
-  else if (escState == ESC_ARMED) {
-    setAllMotorsPWM(ESC_ARM_SPIN_US);
   }
 }
 
@@ -353,6 +493,8 @@ void TaskSensors(void *pvParameters)
   float ax_f = 0, ay_f = 0, az_f = 9.81f;
   float gx_f = 0, gy_f = 0, gz_f = 0;
   float press_f = 1013.25f;
+  float roll_f = 0, pitch_f = 0;
+  bool attitudeInitialized = false;
 
   for (;;)
   {
@@ -382,6 +524,20 @@ void TaskSensors(void *pvParameters)
         gx_f = 0.70f * gx_f + 0.30f * raw_gx;
         gy_f = 0.70f * gy_f + 0.30f * raw_gy;
         gz_f = 0.70f * gz_f + 0.30f * raw_gz;
+
+        float rollAcc = atan2f(ay_f, az_f) * 180.0f / PI;
+        float pitchAcc = atan2f(-ax_f, sqrtf(ay_f * ay_f + az_f * az_f)) * 180.0f / PI;
+        if (!attitudeInitialized) {
+          // Start from gravity angle so SMC never corrects a false 0-degree attitude.
+          roll_f = rollAcc;
+          pitch_f = pitchAcc;
+          attitudeInitialized = true;
+        } else {
+          roll_f = SMC_CF_ALPHA * (roll_f + gx_f * (TASK_SENSOR_PERIOD_MS / 1000.0f)) +
+            (1.0f - SMC_CF_ALPHA) * rollAcc;
+          pitch_f = SMC_CF_ALPHA * (pitch_f + gy_f * (TASK_SENSOR_PERIOD_MS / 1000.0f)) +
+            (1.0f - SMC_CF_ALPHA) * pitchAcc;
+        }
       }
     }
 
@@ -404,6 +560,9 @@ void TaskSensors(void *pvParameters)
       gSensorData.gz = gz_f;
       gSensorData.press = press_f;
       gSensorData.alt = alt_filtered;
+      gSensorData.roll = roll_f;
+      gSensorData.pitch = pitch_f;
+      gSensorData.yawRate = gz_f;
       xSemaphoreGive(sensorMutex);
     }
 
@@ -439,6 +598,10 @@ void TaskLoRa_Control(void *pvParameters)
         }
 
         /* Update State Motor ESC (ARM / DISARM) */
+        lastRollCmd = up.r;
+        lastThrottleCmd = up.t;
+        lastYawCmd = up.y;
+        lastPitchCmd = up.p;
         bool armCmd = (up.armed == 1);
         updateEscFSM(armCmd);
 
@@ -449,7 +612,7 @@ void TaskLoRa_Control(void *pvParameters)
           xSemaphoreGive(sensorMutex);
         }
 
-        /* Balas ke remote: DownlinkPacket biner (17 byte) */
+        /* Balas ke remote: DownlinkPacket biner (27 byte, termasuk data SMC) */
         DownlinkPacket down;
         down.magic = DOWNLINK_MAGIC;
         down.ax = (int16_t)(snap.ax * 100.0f);
@@ -460,6 +623,11 @@ void TaskLoRa_Control(void *pvParameters)
         down.gz = (int16_t)(snap.gz * 100.0f);
         down.press = (uint16_t)(snap.press * 10.0f);
         down.alt = (int16_t)(snap.alt * 100.0f);
+        down.roll = (int16_t)(snap.roll * 100.0f);
+        down.pitch = (int16_t)(snap.pitch * 100.0f);
+        down.uRoll = (int16_t)(lastURoll * 100.0f);
+        down.uPitch = (int16_t)(lastUPitch * 100.0f);
+        down.uYaw = (int16_t)(lastUYaw * 100.0f);
 
         LoRa.beginPacket();
         LoRa.write((uint8_t *)&down, sizeof(DownlinkPacket));
@@ -473,6 +641,12 @@ void TaskLoRa_Control(void *pvParameters)
         Serial.print(" Y:"); Serial.print(up.y);
         Serial.print(" P:"); Serial.print(up.p);
         Serial.print(" ARM:"); Serial.print(up.armed);
+        if (escState == ESC_ARMED) {
+          Serial.print(" | M1:"); Serial.print(motors[0].readMicroseconds());
+          Serial.print(" M2:"); Serial.print(motors[1].readMicroseconds());
+          Serial.print(" M3:"); Serial.print(motors[2].readMicroseconds());
+          Serial.print(" M4:"); Serial.print(motors[3].readMicroseconds());
+        }
         Serial.print(" | AX:"); Serial.print(snap.ax, 2);
         Serial.print(" AY:"); Serial.print(snap.ay, 2);
         Serial.print(" AZ:"); Serial.print(snap.az, 2);
@@ -484,6 +658,31 @@ void TaskLoRa_Control(void *pvParameters)
         LoRa.receive();
         Serial.println("[RX] Magic byte uplink tidak cocok, paket diabaikan.");
       }
+    }
+    else if (packetSize == sizeof(ConfigPacket))
+    {
+      uint8_t buf[sizeof(ConfigPacket)];
+      for (uint8_t i = 0; i < sizeof(ConfigPacket) && LoRa.available(); i++) {
+        buf[i] = (uint8_t)LoRa.read();
+      }
+
+      ConfigPacket config;
+      memcpy(&config, buf, sizeof(ConfigPacket));
+      if (config.magic == CONFIG_MAGIC && config.k1 > 0.0f && config.k2 > 0.0f &&
+          config.eps > 0.1f && config.forceToPwm > 0.0f && config.deltaMaxPwm > 0.0f) {
+        if (xSemaphoreTake(smcMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          gSmcParams.k1 = config.k1;
+          gSmcParams.k2 = config.k2;
+          gSmcParams.eps = config.eps;
+          gSmcParams.forceToPwm = config.forceToPwm;
+          gSmcParams.deltaMaxPwm = config.deltaMaxPwm;
+          xSemaphoreGive(smcMutex);
+        }
+        Serial.print("[SMC] Params k1="); Serial.print(config.k1, 2);
+        Serial.print(" k2="); Serial.print(config.k2, 2);
+        Serial.print(" eps="); Serial.println(config.eps, 2);
+      }
+      LoRa.receive();
     }
     else if (packetSize > 0)
     {
@@ -619,6 +818,7 @@ void setup()
 
   /* ── Inisialisasi Mutex & FreeRTOS Tasks ────────────────────────────── */
   sensorMutex = xSemaphoreCreateMutex();
+  smcMutex = xSemaphoreCreateMutex();
 
   xTaskCreate(
     TaskSensors,
@@ -635,6 +835,15 @@ void setup()
     TASK_LORA_STACK_SIZE,
     NULL,
     TASK_LORA_PRIORITY,
+    NULL
+  );
+
+  xTaskCreate(
+    TaskControl,
+    "Control",
+    TASK_CONTROL_STACK_SIZE,
+    NULL,
+    TASK_CONTROL_PRIORITY,
     NULL
   );
 

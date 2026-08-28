@@ -31,12 +31,14 @@
  *     uint8_t r, t, y, p
  *     uint8_t armed             (0 = DISARM, 1 = ARM)
  *
- *   Downlink (Drone -> Remote) : struct DownlinkPacket  (17 byte)
+ *   Downlink (Drone -> Remote) : struct DownlinkPacket  (27 byte)
  *     uint8_t magic = 0x5A
  *     int16_t ax, ay, az        (m/s^2  x100)
  *     int16_t gx, gy, gz        (deg/s  x100)
  *     uint16_t press            (hPa    x10)
  *     int16_t  alt              (meter  x100)
+ *     int16_t roll, pitch        (derajat x100, filter onboard)
+ *     int16_t uRoll, uPitch, uYaw (koreksi SMC PWM x100)
  *     TIDAK ada suhu (tidak dipakai sama sekali pada proyek ini).
  *
  * Mapping joystick (sama dengan program JoystickTest):
@@ -73,6 +75,7 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <string.h>
+#include <stdio.h>
 
 /* ---------------- Definisi pin LoRa (sesuai skematik) ---------------- */
 /* SCK=18, MISO=19, MOSI=23 adalah default VSPI ESP32, sehingga library
@@ -88,6 +91,7 @@
 /* HARUS identik dengan definisi di LoraRx.ino (sisi drone). */
 #define UPLINK_MAGIC   0xA5
 #define DOWNLINK_MAGIC 0x5A
+#define CONFIG_MAGIC   0xC3
 
 #pragma pack(push, 1)
 struct UplinkPacket {
@@ -102,6 +106,17 @@ struct DownlinkPacket {
   int16_t  gx, gy, gz;   // deg/s  x100
   uint16_t press;        // hPa    x10
   int16_t  alt;          // meter  x100
+  int16_t  roll, pitch;  // derajat x100, complementary filter onboard
+  int16_t  uRoll, uPitch, uYaw; // koreksi SMC PWM x100
+};
+
+struct ConfigPacket {
+  uint8_t magic;
+  float k1;
+  float k2;
+  float eps;
+  float forceToPwm;
+  float deltaMaxPwm;
 };
 #pragma pack(pop)
 
@@ -119,13 +134,13 @@ const float JOYSTICK_FILTER_ALPHA = 0.35f; // 0..1, makin kecil makin halus
 /* Nilai ini dihitung dari AIRTIME AKTUAL paket biner pada radio SF7/BW125k/
  * CR4/5 (preamble 8, CRC on, explicit header):
  *   uplink (5 byte)   airtime ~31 ms
- *   downlink (17 byte) airtime ~52 ms
+ *   downlink (27 byte) airtime ~62 ms
  * REPLY_TIMEOUT_MS diberi margin ekstra utk waktu proses drone (baca sensor
  * I2C, overhead SPI LoRa) + jitter. CYCLE_PERIOD_MS >= uplink + timeout.
  * PENTING: jika nilai timeout < airtime downlink, balasan drone akan SELALU
  * terlewat (baca 0 di GUI) walau modul & sensor bekerja normal. */
-const unsigned long CYCLE_PERIOD_MS  = 120;  // total siklus (~8.3 Hz)
-const unsigned long REPLY_TIMEOUT_MS = 75;   // jendela tunggu balasan drone
+const unsigned long CYCLE_PERIOD_MS  = 145;  // total siklus (~6.9 Hz), termasuk telemetri SMC
+const unsigned long REPLY_TIMEOUT_MS = 100;  // margin untuk paket downlink 27 byte + proses STM32
 
 // Balikkan arah sumbu melalui software jika orientasi modul terbalik.
 const bool INVERT_LEFT_X  = true;  // ROLL     (kiri = ROLL kiri)
@@ -136,8 +151,9 @@ const bool INVERT_RIGHT_Y = true;  // PITCH    (atas = maju)
 // Jika sumbu X dan Y joystick tertukar (VRX/VRY terbalik) sehingga
 // ROLL dan THROTTLE kebalik, set SWAP_LEFT_X_Y = true.
 // SWAP_RIGHT_X_Y untuk joystick kanan (YAW/PITCH).
-const bool SWAP_LEFT_X_Y  = true;
-const bool SWAP_RIGHT_X_Y = true;
+// Wiring mengikuti deklarasi PIN_*: stick kiri Y=throttle dan stick kanan Y=pitch.
+const bool SWAP_LEFT_X_Y  = false;
+const bool SWAP_RIGHT_X_Y = false;
 
 // -------------------------------- state -----------------------------------
 const int N_CH = 4;
@@ -149,6 +165,8 @@ float filt[N_CH];
 
 bool loraOK = false;   // status deteksi modul LoRa saat init
 bool armedState = false; // status ARM/DISARM dari GUI
+bool smcConfigPending = false;
+ConfigPacket pendingSmcConfig;
 
 // ------------------------------ fungsi ADC --------------------------------
 int readRaw(int ch)
@@ -303,7 +321,33 @@ void loop()
       armedState = true;
     } else if (input.equalsIgnoreCase("DISARM") || input.equalsIgnoreCase("STOP")) {
       armedState = false;
+    } else if (input.startsWith("SMC ")) {
+      float k1, k2, eps, forceToPwm, deltaMaxPwm;
+      int parsed = sscanf(input.c_str(), "SMC %f %f %f %f %f",
+                          &k1, &k2, &eps, &forceToPwm, &deltaMaxPwm);
+      if (parsed == 5 && k1 > 0.0f && k2 > 0.0f && eps > 0.1f &&
+          forceToPwm > 0.0f && deltaMaxPwm > 0.0f) {
+        pendingSmcConfig.magic = CONFIG_MAGIC;
+        pendingSmcConfig.k1 = k1;
+        pendingSmcConfig.k2 = k2;
+        pendingSmcConfig.eps = eps;
+        pendingSmcConfig.forceToPwm = forceToPwm;
+        pendingSmcConfig.deltaMaxPwm = deltaMaxPwm;
+        smcConfigPending = true;
+        Serial.println("[SMC] Parameter diterima, dikirim ke drone.");
+      } else {
+        Serial.println("[SMC] Format: SMC k1 k2 eps forceToPwm deltaMaxPwm");
+      }
     }
+  }
+
+  if (smcConfigPending) {
+    LoRa.beginPacket();
+    LoRa.write((uint8_t *)&pendingSmcConfig, sizeof(ConfigPacket));
+    LoRa.endPacket();
+    smcConfigPending = false;
+    LoRa.receive();
+    delay(20);
   }
 
   /* ---------- [1] Baca joystick & kirim ke drone (uplink, biner) ---------- */
@@ -312,10 +356,10 @@ void loop()
 
   UplinkPacket up;
   up.magic = UPLINK_MAGIC;
-  up.r = (uint8_t)cmd[0];
-  up.t = (uint8_t)cmd[3];
-  up.y = (uint8_t)cmd[2];
-  up.p = (uint8_t)cmd[1];
+  up.r = (uint8_t)cmd[1];
+  up.t = (uint8_t)cmd[2];
+  up.y = (uint8_t)cmd[3];
+  up.p = (uint8_t)cmd[0];
   up.armed = armedState ? 1 : 0;
 
   LoRa.beginPacket();
@@ -323,10 +367,10 @@ void loop()
   LoRa.endPacket();
 
   /* Teruskan data joystick ke GUI via USB (format dikenali drone_viewer.py) */
-  Serial.print("[TX] R:"); Serial.print(cmd[0]);
-  Serial.print(" T:");     Serial.print(cmd[3]);
-  Serial.print(" Y:");     Serial.print(cmd[2]);
-  Serial.print(" P:");     Serial.println(cmd[1]);
+  Serial.print("[TX] R:"); Serial.print(cmd[1]);
+  Serial.print(" T:");     Serial.print(cmd[2]);
+  Serial.print(" Y:");     Serial.print(cmd[3]);
+  Serial.print(" P:");     Serial.println(cmd[0]);
 
   /* ---------- [2] Beralih ke RX, tunggu balasan telemetri drone ---------- */
   LoRa.receive();
@@ -365,6 +409,12 @@ void loop()
 
         Serial.print("[BMP] P:"); Serial.print(press, 2);
         Serial.print(" A:");      Serial.println(alt, 2);
+
+        Serial.print("[SMC] ROLL:"); Serial.print(down.roll / 100.0f, 2);
+        Serial.print(" PITCH:"); Serial.print(down.pitch / 100.0f, 2);
+        Serial.print(" UR:"); Serial.print(down.uRoll / 100.0f, 2);
+        Serial.print(" UP:"); Serial.print(down.uPitch / 100.0f, 2);
+        Serial.print(" UY:"); Serial.println(down.uYaw / 100.0f, 2);
       }
     }
     else if (packetSize > 0)
