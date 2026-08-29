@@ -54,6 +54,9 @@ SMC_RE = re.compile(
     r"\[SMC\]\s*ROLL:([-\d.]+)\s*PITCH:([-\d.]+)"
     r"\s*UR:([-\d.]+)\s*UP:([-\d.]+)\s*UY:([-\d.]+)"
 )
+CAL_OK_RE = re.compile(
+    r"\[CAL\]\s*OK\s*CR=(\d+)\s*CT=(\d+)\s*CY=(\d+)\s*CP=(\d+)"
+)
 
 # ─────────────── Palette : Sky Blue & White ───────────────
 COL_BG          = QColor("#F5F9FF")   # window bg
@@ -1431,12 +1434,12 @@ class MainWindow(QMainWindow):
         self._first_alt = True
 
         # ── joystick state ──
-        self._js_calib_center = None  # (r,t,y,p) or None
-        self._js_calib_sampling = False
-        self._js_calib_samples = []
-        self._js_calib_sample_max = 60
+        # Kalibrasi dilakukan dan disimpan di ESP32. GUI hanya memicu "CAL
+        # SAMPLE" lalu membaca balasan "[CAL] OK CR=.. CT=.. CY=.. CP=..".
         self._js_raw = (128, 128, 128, 128)
         self._js_calibrated = False
+        self._js_calib_center_display = None  # (cr,ct,cy,cp) ADC untuk banner
+        self._js_calib_sampling = False       # menunggu balasan dari ESP32
         self._armed = False
 
         # ── central ──
@@ -1480,8 +1483,8 @@ class MainWindow(QMainWindow):
         self._anim_timer.start(16)
 
         self._calib_timer = QTimer(self)
-        self._calib_timer.timeout.connect(self._tick_stick_calibration)
-        self._calib_timer.setInterval(50)
+        self._calib_timer.timeout.connect(self._on_calib_timeout)
+        self._calib_timer.setInterval(2000)  # timeout menunggu balasan ESP32
 
         self._refresh_ports()
 
@@ -1964,56 +1967,62 @@ class MainWindow(QMainWindow):
         self._hint.setText("IMU calibrated \u2713")
 
     # ────────── Stick calibration ──────────
+    # ESP32 melakukan semua sampling & penyimpanan center. GUI hanya:
+    #   1) mengirim "CAL SAMPLE" saat tombol ditekan
+    #   2) menunggu balasan "[CAL] OK CR=.. CT=.. CY=.. CP=.."
+    #   3) menampilkan hasil & mengaktifkan tombol RESET.
 
     def _start_stick_calibration(self):
         if not self._serial or not self._serial.is_open:
             return
         self._js_calib_sampling = True
-        self._js_calib_samples = []
+        self._js_calibrated = False
         self._cal_stick_btn.setEnabled(False)
         self._cal_stick_btn.setText("SAMPLING\u2026")
         self._stick_banner.show_info(
             "SAMPLING \u2013 hold both sticks perfectly centered, do not move."
         )
+        try:
+            self._serial.write(b"CAL SAMPLE\n")
+            self._serial.flush()
+        except Exception as e:
+            self._hint.setText(f"Gagal kirim kalibrasi ke remote: {e}")
+            self._on_calib_timeout()
+            return
         self._calib_timer.start()
 
-    def _tick_stick_calibration(self):
-        if len(self._js_calib_samples) >= self._js_calib_sample_max:
-            self._finish_stick_calibration()
-
-    def _finish_stick_calibration(self):
+    def _on_calib_timeout(self):
+        # Tidak menerima balasan ESP32 (atau gagal tulis): kembalikan UI.
         self._js_calib_sampling = False
         self._calib_timer.stop()
         self._cal_stick_btn.setText("CALIBRATE STICKS")
         self._cal_stick_btn.setEnabled(True)
+        if not self._js_calibrated:
+            self._stick_banner.show_err(
+                "NO REPLY FROM REMOTE \u2013 check serial link, try again."
+            )
 
-        samples = self._js_calib_samples
-        if len(samples) < 5:
-            self._stick_banner.show_err("FAILED \u2013 not enough data. Try again.")
-            return
-
-        n = len(samples)
-        cr = sum(s[0] for s in samples) // n
-        ct = sum(s[1] for s in samples) // n
-        cy = sum(s[2] for s in samples) // n
-        cp = sum(s[3] for s in samples) // n
-        self._js_calib_center = (cr, ct, cy, cp)
+    def _on_cal_ok(self, cr, ct, cy, cp, n_samples=None):
+        # Balasan dari ESP32: sampling selesai & center sudah di-update di ESP32.
+        self._js_calib_sampling = False
+        self._calib_timer.stop()
         self._js_calibrated = True
-
-        self._stick_banner.show_ok(
-            f"CALIBRATED  \u2022  Center R={cr}  T={ct}  Y={cy}  P={cp}  "
-            f"\u2022  {n} samples"
-        )
+        self._js_calib_center_display = (cr, ct, cy, cp)
+        self._cal_stick_btn.setText("CALIBRATE STICKS")
+        self._cal_stick_btn.setEnabled(True)
         self._reset_stick_btn.setVisible(True)
+        tag = f"  \u2022  {n_samples} samples" if n_samples else ""
+        self._stick_banner.show_ok(
+            f"CALIBRATED  \u2022  Center R={cr}  T={ct}  Y={cy}  P={cp}{tag}"
+        )
 
     def _reset_stick_calibration(self):
-        self._js_calib_center = None
-        self._js_calib_samples = []
-        self._js_calibrated = False
+        # RESET: ESP32 re-sample center (sama dengan kalibrasi ulang). Karena
+        # kalibrasi sekarang terpusat di ESP32, "reset" = kalibrasi ulang.
         self._stick_banner.show_warn(
-            "STICK CALIBRATION CLEARED \u2013 showing RAW joystick data."
+            "RE-CALIBRATING \u2013 hold sticks centered, single sample."
         )
-        self._reset_stick_btn.setVisible(False)
+        self._start_stick_calibration()
 
     # ────────── ports / serial ──────────
 
@@ -2098,13 +2107,10 @@ class MainWindow(QMainWindow):
         self._info_bar.update_press(self._press)
 
     def _push_rc_values(self):
+        # ESP32 sudah mengirim nilai 0-255 yang sudah terkalibrasi penuh
+        # (netral = 128). Terapkan langsung tanpa offset tambahan (tidak ada
+        # double-offsetting lagi).
         r, t, y, p = self._js_raw
-        if self._js_calib_center:
-            cr, ct, cy_, cp = self._js_calib_center
-            r = max(0, min(255, 128 + (r - cr)))
-            t = max(0, min(255, 128 + (t - ct)))
-            y = max(0, min(255, 128 + (y - cy_)))
-            p = max(0, min(255, 128 + (p - cp)))
 
         # Left stick: X = YAW, Y = THROTTLE
         # Right stick: X = ROLL, Y = PITCH
@@ -2141,8 +2147,6 @@ class MainWindow(QMainWindow):
         if m:
             r, t, y, p = [int(v) for v in m.groups()]
             self._js_raw = (r, t, y, p)
-            if self._js_calib_sampling:
-                self._js_calib_samples.append((r, t, y, p))
             self._push_rc_values()
             return
 
@@ -2151,6 +2155,12 @@ class MainWindow(QMainWindow):
             roll, pitch, u_roll, u_pitch, u_yaw = [float(v) for v in m.groups()]
             if hasattr(self, "_smc_plot"):
                 self._smc_plot.add_sample(roll, pitch, u_roll, u_pitch, u_yaw)
+            return
+
+        m = CAL_OK_RE.search(text)
+        if m and self._js_calib_sampling:
+            cr, ct, cy, cp = [int(v) for v in m.groups()]
+            self._on_cal_ok(cr, ct, cy, cp, n_samples=None)
             return
 
 
