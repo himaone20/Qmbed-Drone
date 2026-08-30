@@ -8,6 +8,13 @@
  *  - Komunikasi 2 Arah LoRa RA-02 (SPI2: PB12-15, PB0, PB1 @ 433MHz)
  *  - Kontrol 4 ESC Motor: PB6 (M1), PB7 (M2), PB8 (M3), PB9 (M4)
  *  - Indikator LED PC4 (Arming blink 1Hz, Armed solid ON, Disarm OFF)
+ *
+ * ORIENTASI IMU BMI160: dipasang dengan X_sensor = DEPAN drone,
+ * Y_sensor = KIRI, Z_sensor = ATAS (right-handed). Di TaskSensors,
+ * sumbu di-remap ke body frame standar (Y_body = kanan -> negasi Y):
+ *   ax_body =  ax_sensor  (depan)   |   gx_body =  gx_sensor  (roll rate)
+ *   ay_body = -ay_sensor  (kanan)   |   gy_body = -gy_sensor  (pitch rate)
+ *   az_body =  az_sensor  (atas)    |   gz_body =  gz_sensor  (yaw rate, tdk diubah)
  * ==========================================================================
  */
 
@@ -502,14 +509,16 @@ void TaskSensors(void *pvParameters)
       int16_t ax, ay, az, gx, gy, gz;
       if (bmi160_read(&ax, &ay, &az, &gx, &gy, &gz)) {
         // BMI160: +/- 2G range -> 16384 LSB/g
-        float raw_ax = (ax / 16384.0f) * 9.80665f;
-        float raw_ay = (ay / 16384.0f) * 9.80665f;
-        float raw_az = (az / 16384.0f) * 9.80665f;
+        // IMU dipasang X_sensor = DEPAN, Y_sensor = KIRI, Z_sensor = ATAS.
+        // Remap ke body frame standar (Y_body = kanan -> negasi aksis Y):
+        float raw_ax = ( ax / 16384.0f) * 9.80665f;  // body depan   <- sensor X (depan)
+        float raw_ay = (-ay / 16384.0f) * 9.80665f;  // body kanan   <- sensor Y (kiri, dinegasi)
+        float raw_az = ( az / 16384.0f) * 9.80665f;  // body atas    <- sensor Z
 
         // BMI160: +/- 2000 dps range -> 16.4 LSB/dps
-        float raw_gx = (gx / 16.4f) - gyro_bias_gx;
-        float raw_gy = (gy / 16.4f) - gyro_bias_gy;
-        float raw_gz = (gz / 16.4f) - gyro_bias_gz;
+        float raw_gx = ( gx / 16.4f) - gyro_bias_gx;  // body roll rate  <- sensor X
+        float raw_gy = (-gy / 16.4f) - gyro_bias_gy;  // body pitch rate <- sensor Y (kiri, dinegasi)
+        float raw_gz = ( gz / 16.4f) - gyro_bias_gz;  // yaw rate tidak diubah
 
         // Deadband filter: hilangkan noise mikro saat diam (< 0.12 dps)
         if (fabsf(raw_gx) < 0.12f) raw_gx = 0.0f;
@@ -760,8 +769,10 @@ void setup()
     }
     if (valid_samples > 50) {
       // BMI160 +/- 2000 dps -> 16.4 LSB/dps
+      // Bias zero offset: body_gy (pitch rate) memakai -gy (Y=kiri dinegasi),
+      // sehingga bias untuk aksis Y harus dinegasikan agar raw_gy = 0 saat diam.
       gyro_bias_gx = (float)sum_gx / valid_samples / 16.4f;
-      gyro_bias_gy = (float)sum_gy / valid_samples / 16.4f;
+      gyro_bias_gy = -(float)sum_gy / valid_samples / 16.4f;
       gyro_bias_gz = (float)sum_gz / valid_samples / 16.4f;
     }
     Serial.println("OK");

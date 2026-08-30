@@ -1413,6 +1413,414 @@ class StatusBanner(QLabel):
         self.show()
 
 
+# ───────────────────── Bench Test (Props-Off) Widgets ─────────────────────
+
+class BenchMotorMixWidget(QWidget):
+    """Diagram Quad-X tampak atas interaktif + visualisasi koreksi tenaga
+    (thrust delta) tiap motor secara relatif. Bar hijau naik = motor menambah
+    daya, bar merah turun = motor mengurangi daya. Formula mixer sinkron
+    dengan writeSmcMotorMix() di main.ino."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(380, 360)
+        self.roll = self.pitch = self.yaw = 0.0
+        self.ur = self.up = self.uy = 0.0
+        self.throttle = 0.0
+        self.armed = False
+        self.mix = {"M1": 0.0, "M2": 0.0, "M3": 0.0, "M4": 0.0}
+        self._mix_smooth = {"M1": 0.0, "M2": 0.0, "M3": 0.0, "M4": 0.0}
+        self._prop_angle = 0.0
+
+        # Posisi relatif 4 motor Quad-X (tampak atas: +X kanan, +Y bawah)
+        self._motors_meta = {
+            "M1": {"pos": "FL", "pin": "PB6", "cw": True,  "dx": -1.0, "dy": -1.0, "bar_side": -1},
+            "M2": {"pos": "FR", "pin": "PB7", "cw": False, "dx":  1.0, "dy": -1.0, "bar_side":  1},
+            "M3": {"pos": "BR", "pin": "PB8", "cw": True,  "dx":  1.0, "dy":  1.0, "bar_side":  1},
+            "M4": {"pos": "BL", "pin": "PB9", "cw": False, "dx": -1.0, "dy":  1.0, "bar_side": -1},
+        }
+
+    def set_data(self, roll, pitch, yaw, ur, up, uy, throttle, armed):
+        self.roll, self.pitch, self.yaw = roll, pitch, yaw
+        self.ur, self.up, self.uy = ur, up, uy
+        self.throttle = throttle
+        self.armed = armed
+        # Mixer Quad-X (sinkron dengan writeSmcMotorMix di main.ino)
+        self.mix = {
+            "M1":  ur + up + uy,   # FL CW
+            "M2": -ur + up - uy,   # FR CCW
+            "M3": -ur - up + uy,   # BR CW
+            "M4":  ur - up - uy,   # BL CCW
+        }
+
+    def animate(self):
+        # Smooth easing untuk gerakan bar koreksi & rotasi baling-baling
+        ease = 0.22
+        for k in ("M1", "M2", "M3", "M4"):
+            target = self.mix.get(k, 0.0)
+            self._mix_smooth[k] += (target - self._mix_smooth[k]) * ease
+        self._prop_angle = (self._prop_angle + 12.0) % 360.0
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+
+        # ── Kartu Utama ──
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD))
+        p.drawRoundedRect(rect, 14, 14)
+
+        # ── Zona 1: Header (36 px) ──
+        header_rect = QRectF(rect.left() + 16, rect.top() + 10, rect.width() - 32, 26)
+        p.setPen(COL_TEXT)
+        p.setFont(qfont(FONT_UI, 10, QFont.Bold, letter_spacing=0.8))
+        p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter, "QUAD-X MOTOR MIXING")
+
+        # Subtitle / badge mode kanan
+        state_txt = "ARMED" if self.armed else "DISARMED"
+        bg_col = QColor("#DCFCE7") if self.armed else QColor("#F1F5F9")
+        fg_col = QColor("#166534") if self.armed else QColor("#64748B")
+        bf = qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.2)
+        p.setFont(bf)
+        bw = QFontMetricsF(bf).horizontalAdvance(state_txt) + 16
+        pill_rect = QRectF(header_rect.right() - bw, header_rect.center().y() - 10, bw, 20)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(bg_col))
+        p.drawRoundedRect(pill_rect, 10, 10)
+        p.setPen(fg_col)
+        p.drawText(pill_rect, Qt.AlignCenter, state_txt)
+
+        # ── Zona 3 (Disediakan dahulu): Telemetri Kapsul Bawah (42 px) ──
+        bottom_h = 40.0
+        bottom_top = rect.bottom() - 12 - bottom_h
+        telemetry_items = [
+            ("THR", f"{self.throttle:.0f} us", COL_TEXT),
+            ("uROLL", f"{self.ur:+.1f}", COL_OK if self.ur > 0 else (COL_ERR if self.ur < 0 else COL_TEXT)),
+            ("uPITCH", f"{self.up:+.1f}", COL_OK if self.up < 0 else (COL_ERR if self.up > 0 else COL_TEXT)),
+            ("uYAW", f"{self.uy:+.1f}", COL_WARN if abs(self.uy) > 1 else COL_TEXT),
+        ]
+        num_items = len(telemetry_items)
+        gap = 8.0
+        total_w = rect.width() - 32
+        item_w = (total_w - (num_items - 1) * gap) / num_items
+
+        for idx, (label, val_str, col) in enumerate(telemetry_items):
+            ix = rect.left() + 16 + idx * (item_w + gap)
+            item_rect = QRectF(ix, bottom_top, item_w, bottom_h)
+            p.setPen(QPen(COL_BORDER, 1))
+            p.setBrush(QBrush(COL_CARD_ALT))
+            p.drawRoundedRect(item_rect, 7, 7)
+
+            p.setPen(COL_MUTED)
+            p.setFont(qfont(FONT_UI, 6, QFont.Bold, letter_spacing=1.0))
+            p.drawText(QRectF(item_rect.left(), item_rect.top() + 4, item_rect.width(), 12),
+                       Qt.AlignCenter, label)
+
+            p.setPen(col)
+            p.setFont(qfont(FONT_MONO, 8, QFont.Bold))
+            p.drawText(QRectF(item_rect.left(), item_rect.top() + 18, item_rect.width(), 16),
+                       Qt.AlignCenter, val_str)
+
+        # ── Zona 2: Area Visual Drone 2D (Antara Header dan Footer) ──
+        panel = QRectF(rect.left() + 14, header_rect.bottom() + 6,
+                       rect.width() - 28, bottom_top - header_rect.bottom() - 12)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD_ALT))
+        p.drawRoundedRect(panel, 10, 10)
+
+        cx = panel.center().x()
+        cy = panel.center().y()
+
+        # Penanda Arah Depan (FRONT ▲)
+        fwd_box = QRectF(cx - 36, panel.top() + 6, 72, 18)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(COL_ACCENT_XLT))
+        p.drawRoundedRect(fwd_box, 9, 9)
+        p.setPen(COL_ACCENT_DK)
+        p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.2))
+        p.drawText(fwd_box, Qt.AlignCenter, "\u25B2  FRONT")
+
+        # ── Geometri Quad-X proporsional (Safe bounds agar baling-baling tidak keluar frame) ──
+        half_w = panel.width() * 0.5 - 18
+        half_h = panel.height() * 0.5 - 22
+        max_arm_w = (half_w - 30) / 1.42
+        max_arm_h = (half_h - 26) / 1.35
+        arm_d = max(28.0, min(max_arm_w, max_arm_h, 72.0))
+
+        arm_dx = arm_d * 1.05
+        arm_dy = arm_d * 0.85
+        prop_r = arm_d * 0.38
+        motor_r = max(9.0, prop_r * 0.42)
+        body_r = arm_d * 0.32
+
+        # 1. Lengan Karbon X (Arm)
+        p.setPen(QPen(QColor("#334155"), 6, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx - arm_dx, cy - arm_dy), QPointF(cx + arm_dx, cy + arm_dy))
+        p.drawLine(QPointF(cx + arm_dx, cy - arm_dy), QPointF(cx - arm_dx, cy + arm_dy))
+
+        p.setPen(QPen(QColor("#64748B"), 2.5, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx - arm_dx, cy - arm_dy), QPointF(cx + arm_dx, cy + arm_dy))
+        p.drawLine(QPointF(cx + arm_dx, cy - arm_dy), QPointF(cx - arm_dx, cy + arm_dy))
+
+        # 2. Bodi Pusat Drone (Fuselage / FC Hub)
+        body_rect = QRectF(cx - body_r, cy - body_r, body_r * 2, body_r * 2)
+        body_grad = QLinearGradient(body_rect.topLeft(), body_rect.bottomRight())
+        body_grad.setColorAt(0.0, QColor("#1E293B"))
+        body_grad.setColorAt(1.0, QColor("#0F172A"))
+        p.setPen(QPen(COL_BORDER, 1.2))
+        p.setBrush(QBrush(body_grad))
+        p.drawRoundedRect(body_rect, 7, 7)
+
+        # LED status FC di tengah
+        led_col = COL_OK if self.armed else COL_ACCENT
+        led_grad = QRadialGradient(cx, cy, body_r * 0.32)
+        led_grad.setColorAt(0.0, QColor("#FFFFFF"))
+        led_grad.setColorAt(0.5, led_col)
+        led_grad.setColorAt(1.0, QColor(led_col.red(), led_col.green(), led_col.blue(), 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(led_grad))
+        p.drawEllipse(QPointF(cx, cy), body_r * 0.32, body_r * 0.32)
+
+        # Label sudut roll/pitch mini di bodi
+        p.setPen(QColor("#E2E8F0"))
+        p.setFont(qfont(FONT_MONO, 6, QFont.Bold))
+        p.drawText(QRectF(cx - body_r, cy + body_r * 0.22, body_r * 2, 10),
+                   Qt.AlignCenter, f"{self.roll:+.0f}\u00B0/{self.pitch:+.0f}\u00B0")
+
+        # 3. Empat Rumah Motor & Indikator Koreksi Tenaga (Thrust Delta Bar)
+        max_delta = max([abs(v) for v in self.mix.values()] or [1.0])
+        max_delta = max(max_delta, 10.0)  # Skala visual minimal 10 unit
+
+        for name, meta in self._motors_meta.items():
+            mx = cx + meta["dx"] * arm_dx
+            my = cy + meta["dy"] * arm_dy
+            cw = meta["cw"]
+            val_raw = self.mix[name]
+            val_smooth = self._mix_smooth[name]
+
+            # Baling-baling berputar (Propeller translucent disc)
+            p.save()
+            p.translate(mx, my)
+
+            disc_col = QColor(COL_ACCENT) if cw else QColor(COL_ACCENT_LT)
+            p_grad = QRadialGradient(0, 0, prop_r)
+            p_grad.setColorAt(0.0, QColor(disc_col.red(), disc_col.green(), disc_col.blue(), 55))
+            p_grad.setColorAt(0.7, QColor(disc_col.red(), disc_col.green(), disc_col.blue(), 20))
+            p_grad.setColorAt(1.0, QColor(disc_col.red(), disc_col.green(), disc_col.blue(), 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(p_grad))
+            p.drawEllipse(QPointF(0, 0), prop_r, prop_r)
+
+            # Garis bilah baling-baling berputar
+            dir_mult = 1.0 if cw else -1.0
+            p.rotate(self._prop_angle * dir_mult)
+            p.setPen(QPen(QColor(disc_col.red(), disc_col.green(), disc_col.blue(), 130), 1.4, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(-prop_r * 0.85, 0), QPointF(prop_r * 0.85, 0))
+            p.drawLine(QPointF(0, -prop_r * 0.85), QPointF(0, prop_r * 0.85))
+            p.restore()
+
+            # Rumah Motor (Motor Hub)
+            m_grad = QRadialGradient(mx - 1.5, my - 1.5, motor_r * 1.2)
+            m_grad.setColorAt(0.0, QColor("#FFFFFF"))
+            m_grad.setColorAt(0.4, QColor("#CBD5E1"))
+            m_grad.setColorAt(1.0, QColor("#475569"))
+            p.setPen(QPen(COL_TEXT, 1.0))
+            p.setBrush(QBrush(m_grad))
+            p.drawEllipse(QPointF(mx, my), motor_r, motor_r)
+
+            # Label Motor (M1, M2, M3, M4)
+            p.setPen(COL_TEXT)
+            p.setFont(qfont(FONT_UI, 6, QFont.Bold))
+            p.drawText(QRectF(mx - motor_r, my - motor_r, motor_r * 2, motor_r * 2),
+                       Qt.AlignCenter, name)
+
+            # Badge pin & posisi di bawah/atas motor
+            meta_y = my + motor_r + 2 if meta["dy"] > 0 else my - motor_r - 13
+            meta_rect = QRectF(mx - 30, meta_y, 60, 11)
+            p.setPen(COL_SUBTEXT)
+            p.setFont(qfont(FONT_UI, 5, QFont.DemiBold))
+            p.drawText(meta_rect, Qt.AlignCenter, f"{meta['pos']} · {meta['pin']}")
+
+            # Badge CW / CCW
+            rot_str = "CW \u21B7" if cw else "CCW \u21B6"
+            rot_y = meta_y + 9 if meta["dy"] > 0 else meta_y - 9
+            p.setPen(COL_ACCENT_DK if cw else COL_WARN)
+            p.setFont(qfont(FONT_UI, 5, QFont.Bold))
+            p.drawText(QRectF(mx - 30, rot_y, 60, 10), Qt.AlignCenter, rot_str)
+
+            # ── Bar Koreksi Tenaga (Thrust Delta Bar) ──
+            bar_w = 6.0
+            bar_h_max = prop_r * 0.75
+            bar_x = mx + meta["bar_side"] * (prop_r + 3)
+            if meta["bar_side"] < 0:
+                bar_x -= bar_w
+            bar_y_center = my
+
+            # Slot Background
+            slot_rect = QRectF(bar_x, bar_y_center - bar_h_max, bar_w, bar_h_max * 2)
+            p.setPen(QPen(COL_BORDER, 1))
+            p.setBrush(QBrush(QColor("#FFFFFF")))
+            p.drawRoundedRect(slot_rect, 2, 2)
+
+            # Garis Nol Tengah
+            p.setPen(QPen(COL_DIVIDER, 1))
+            p.drawLine(int(bar_x), int(bar_y_center), int(bar_x + bar_w), int(bar_y_center))
+
+            # Isi Bar (+Δ hijau ke atas, -Δ merah ke bawah)
+            frac = max(-1.0, min(1.0, val_smooth / max_delta))
+            if frac >= 0:
+                fill_h = frac * bar_h_max
+                fill_rect = QRectF(bar_x + 1, bar_y_center - fill_h, bar_w - 2, fill_h)
+                fill_col = COL_OK
+            else:
+                fill_h = abs(frac) * bar_h_max
+                fill_rect = QRectF(bar_x + 1, bar_y_center, bar_w - 2, fill_h)
+                fill_col = COL_ERR
+
+            if fill_h > 0.5:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(fill_col))
+                p.drawRoundedRect(fill_rect, 1.5, 1.5)
+
+            # Angka nilai delta
+            p.setPen(COL_OK if val_raw > 0 else (COL_ERR if val_raw < 0 else COL_MUTED))
+            p.setFont(qfont(FONT_MONO, 5, QFont.Bold))
+            val_rect = QRectF(bar_x - 12, bar_y_center - bar_h_max - 10, bar_w + 24, 9)
+            p.drawText(val_rect, Qt.AlignCenter, f"{val_raw:+.0f}")
+
+        p.end()
+
+
+class BenchCheckCard(QFrame):
+    """Kartu status verifikasi satu sumbu kontrol (props-off).
+    Menggunakan struktur Qt Layout dinamis sehingga teks membungkus (word-wrap) rapi,
+    badge status tampil jelas, dan kapsul telemetri tidak pernah saling menindih."""
+    def __init__(self, step_no: str, title: str, instruction: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BenchCheckCard")
+        self._step_no = step_no
+        self._title = title
+        self._instruction = instruction
+        self._status = "IDLE"
+
+        self.setStyleSheet(f"""
+            #BenchCheckCard {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 12px;
+            }}
+        """)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(5)
+
+        # ── Row 1: Header (Step + Title kiri, Badge kanan) ──
+        h_row = QHBoxLayout()
+        h_row.setContentsMargins(0, 0, 0, 0)
+
+        self._title_lbl = QLabel(f"{step_no}  \u00B7  {title.upper()}")
+        self._title_lbl.setFont(qfont(FONT_UI, 9, QFont.Bold, letter_spacing=1.0))
+        self._title_lbl.setStyleSheet(f"color: {COL_TEXT.name()};")
+        h_row.addWidget(self._title_lbl)
+
+        h_row.addStretch()
+
+        self._badge = QLabel("IDLE")
+        self._badge.setFixedHeight(22)
+        self._badge.setAlignment(Qt.AlignCenter)
+        self._badge.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.2))
+        self._badge.setStyleSheet("""
+            background: #F1F5F9; color: #64748B;
+            border-radius: 11px; padding: 0 12px;
+        """)
+        h_row.addWidget(self._badge)
+        lay.addLayout(h_row)
+
+        # ── Row 2: Instruction label ──
+        self._inst_lbl = QLabel(instruction)
+        self._inst_lbl.setFont(qfont(FONT_UI, 8, QFont.Normal))
+        self._inst_lbl.setStyleSheet(f"color: {COL_SUBTEXT.name()};")
+        self._inst_lbl.setWordWrap(True)
+        lay.addWidget(self._inst_lbl)
+
+        # ── Row 3: Readout Capsule ──
+        self._readout_frame = QFrame()
+        self._readout_frame.setStyleSheet(f"""
+            background: {COL_CARD_ALT.name()};
+            border: 1px solid {COL_BORDER.name()};
+            border-radius: 6px;
+        """)
+        rf_lay = QHBoxLayout(self._readout_frame)
+        rf_lay.setContentsMargins(10, 4, 10, 4)
+
+        self._readout_lbl = QLabel("MENUNGGU GERAKAN...")
+        self._readout_lbl.setFont(qfont(FONT_MONO, 8, QFont.Bold))
+        self._readout_lbl.setStyleSheet(f"color: {COL_TEXT.name()};")
+        rf_lay.addWidget(self._readout_lbl)
+        lay.addWidget(self._readout_frame)
+
+        # ── Row 4: Diagnostic Message ──
+        self._diag_lbl = QLabel("Drone level / siap diuji.")
+        self._diag_lbl.setFont(qfont(FONT_UI, 8, QFont.DemiBold))
+        self._diag_lbl.setStyleSheet(f"color: {COL_MUTED.name()};")
+        self._diag_lbl.setWordWrap(True)
+        lay.addWidget(self._diag_lbl)
+
+    def set_status(self, status: str, detail: str, val_text: str = ""):
+        self._status = status
+        self._diag_lbl.setText(detail)
+        if val_text:
+            self._readout_lbl.setText(val_text)
+
+        if status == "PASS":
+            self._badge.setText("PASS \u2713")
+            self._badge.setStyleSheet("""
+                background: #DCFCE7; color: #166534;
+                border: 1px solid #BBF7D0;
+                border-radius: 11px; padding: 0 12px;
+            """)
+            self._diag_lbl.setStyleSheet("color: #16A34A; font-weight: 600;")
+            self.setStyleSheet(f"""
+                #BenchCheckCard {{
+                    background: {COL_CARD.name()};
+                    border: 1.5px solid #86EFAC;
+                    border-radius: 12px;
+                }}
+            """)
+        elif status == "DANGER":
+            self._badge.setText("DANGER \u2717")
+            self._badge.setStyleSheet("""
+                background: #FEE2E2; color: #991B1B;
+                border: 1px solid #FECACA;
+                border-radius: 11px; padding: 0 12px;
+            """)
+            self._diag_lbl.setStyleSheet("color: #DC2626; font-weight: 600;")
+            self.setStyleSheet(f"""
+                #BenchCheckCard {{
+                    background: {COL_CARD.name()};
+                    border: 1.5px solid #FCA5A5;
+                    border-radius: 12px;
+                }}
+            """)
+        else:
+            self._badge.setText("IDLE")
+            self._badge.setStyleSheet("""
+                background: #F1F5F9; color: #64748B;
+                border: 1px solid #E2E8F0;
+                border-radius: 11px; padding: 0 12px;
+            """)
+            self._diag_lbl.setStyleSheet(f"color: {COL_SUBTEXT.name()};")
+            self.setStyleSheet(f"""
+                #BenchCheckCard {{
+                    background: {COL_CARD.name()};
+                    border: 1px solid {COL_BORDER.name()};
+                    border-radius: 12px;
+                }}
+            """)
+
+
 # ───────────────────── Main Window ─────────────────────
 
 class MainWindow(QMainWindow):
@@ -1441,6 +1849,11 @@ class MainWindow(QMainWindow):
         self._js_calib_center_display = None  # (cr,ct,cy,cp) ADC untuk banner
         self._js_calib_sampling = False       # menunggu balasan dari ESP32
         self._armed = False
+
+        # ── bench-test live state (SMC + IMU) ──
+        self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0)  # (roll, pitch, uRoll, uPitch, uYaw)
+        self._bench_imu = (0.0, 0.0, 0.0)           # (gx, gy, gz) deg/s
+        self._bench_alt_press = (0.0, 0.0)          # (alt, press)
 
         # ── central ──
         central = QWidget()
@@ -1471,6 +1884,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._build_attitude_tab(), "ATTITUDE")
         self._tabs.addTab(self._build_rc_tab(), "RC CONTROL")
         self._tabs.addTab(self._build_smc_tab(), "SMC TUNING")
+        self._tabs.addTab(self._build_bench_tab(), "BENCH TEST")
         body_lay.addWidget(self._tabs, stretch=1)
 
         # ── timers ──
@@ -1736,46 +2150,50 @@ class MainWindow(QMainWindow):
             """)
 
     def _apply_arm_style(self, armed: bool):
-        if armed:
-            self._arm_btn.setText("DISARM")
-            self._arm_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #DC2626; color: white;
-                    border: 1px solid #B91C1C;
-                    border-radius: 6px;
-                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                    letter-spacing: 2px;
-                    padding: 0 16px;
-                }}
-                QPushButton:hover {{
-                    background: #B91C1C;
-                }}
-                QPushButton:disabled {{
-                    background: {COL_MUTED.name()};
-                    color: white;
-                    border-color: {COL_BORDER.name()};
-                }}
-            """)
-        else:
-            self._arm_btn.setText("ARM")
-            self._arm_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #FEF3C7; color: #B45309;
-                    border: 1px solid #FCD34D;
-                    border-radius: 6px;
-                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                    letter-spacing: 2px;
-                    padding: 0 16px;
-                }}
-                QPushButton:hover {{
-                    background: #FDE68A; color: #92400E;
-                }}
-                QPushButton:disabled {{
-                    background: {COL_CARD_ALT.name()};
-                    color: {COL_MUTED.name()};
-                    border-color: {COL_BORDER.name()};
-                }}
-            """)
+        targets = [getattr(self, "_arm_btn", None), getattr(self, "_bench_arm_btn", None)]
+        for btn in targets:
+            if btn is None:
+                continue
+            if armed:
+                btn.setText("DISARM")
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #DC2626; color: white;
+                        border: 1px solid #B91C1C;
+                        border-radius: 6px;
+                        font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                        letter-spacing: 2px;
+                        padding: 0 14px;
+                    }}
+                    QPushButton:hover {{
+                        background: #B91C1C;
+                    }}
+                    QPushButton:disabled {{
+                        background: {COL_MUTED.name()};
+                        color: white;
+                        border-color: {COL_BORDER.name()};
+                    }}
+                """)
+            else:
+                btn.setText("ARM")
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #FEF3C7; color: #B45309;
+                        border: 1px solid #FCD34D;
+                        border-radius: 6px;
+                        font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
+                        letter-spacing: 2px;
+                        padding: 0 14px;
+                    }}
+                    QPushButton:hover {{
+                        background: #FDE68A; color: #92400E;
+                    }}
+                    QPushButton:disabled {{
+                        background: {COL_CARD_ALT.name()};
+                        color: {COL_MUTED.name()};
+                        border-color: {COL_BORDER.name()};
+                    }}
+                """)
 
     def _toggle_arm(self):
         self._armed = not self._armed
@@ -1927,6 +2345,206 @@ class MainWindow(QMainWindow):
         root.addWidget(guide, 1)
         return page
 
+    # ────────── Bench Test (Props-Off) tab ──────────
+
+    def _build_bench_tab(self):
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(10)
+
+        # ── White & Sky Blue Warning Banner ──
+        warn = QFrame()
+        warn.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #F0F9FF, stop:1 #E0F2FE);
+                border: 1.5px solid #7DD3FC;
+                border-radius: 10px;
+            }
+        """)
+        wl = QHBoxLayout(warn)
+        wl.setContentsMargins(14, 8, 14, 8)
+        wl.setSpacing(12)
+
+        icon_lbl = QLabel("⚠️")
+        icon_lbl.setFont(qfont(FONT_UI, 12))
+        wl.addWidget(icon_lbl)
+
+        wtxt = QLabel("<b style='color:#0369A1; font-size:10px; letter-spacing:0.8px;'>PROPS-OFF BENCH TEST ONLY :</b> "
+                      "<span style='color:#0F172A; font-size:10px; font-weight:500;'>Copot SEMUA propeller sebelum pengujian. "
+                      "Naikkan throttle remote sedikit di atas idle (~1220 us / 20%) agar koreksi SMC aktif, "
+                      "lalu gerakkan/miringkan drone dengan tangan untuk memverifikasi arah respon motor.</span>")
+        wtxt.setWordWrap(True)
+        wl.addWidget(wtxt, stretch=1)
+
+        self._bench_arm_btn = QPushButton("ARM")
+        self._bench_arm_btn.setFixedHeight(30)
+        self._bench_arm_btn.setMinimumWidth(110)
+        self._bench_arm_btn.setCursor(Qt.PointingHandCursor)
+        self._apply_arm_style(False)
+        self._bench_arm_btn.setEnabled(False)
+        self._bench_arm_btn.clicked.connect(self._toggle_arm)
+        wl.addWidget(self._bench_arm_btn)
+
+        lay.addWidget(warn)
+
+        # ── Main Content: 2 Columns (Quad-X Diagram + Check Cards) ──
+        row = QHBoxLayout()
+        row.setSpacing(12)
+
+        # Kolom Kiri: Diagram Quad-X Motor Mix
+        self._bench_mix = BenchMotorMixWidget()
+        add_shadow(self._bench_mix, blur=18, dy=2, alpha=20)
+        row.addWidget(self._bench_mix, 5)
+
+        # Kolom Kanan: 3 Kartu Verifikasi Sumbu
+        check_col = QVBoxLayout()
+        check_col.setSpacing(8)
+
+        self._check_roll = BenchCheckCard(
+            "STEP 1", "ROLL RESPONSE",
+            "Miringkan drone ke KANAN (Roll > +5\u00B0) \u2014 motor KIRI (M1, M4) harus bertambah tenaga dan motor KANAN (M2, M3) berkurang.")
+        self._check_pitch = BenchCheckCard(
+            "STEP 2", "PITCH RESPONSE",
+            "Miringkan drone nose-UP (Pitch > +5\u00B0) \u2014 motor DEPAN (M1, M2) harus berkurang tenaga dan motor BELAKANG (M3, M4) bertambah.")
+        self._check_yaw = BenchCheckCard(
+            "STEP 3", "YAW DAMPING",
+            "Putar drone berputar ke KANAN (GZ > +10\u00B0/s) \u2014 SMC harus meredam rotasi (uYaw bernilai negatif).")
+
+        for c in (self._check_roll, self._check_pitch, self._check_yaw):
+            add_shadow(c, blur=14, dy=1, alpha=16)
+            check_col.addWidget(c)
+
+        row.addLayout(check_col, 6)
+        lay.addLayout(row, stretch=1)
+
+        # ── Checklist bottom progress bar ──
+        self._bench_steps = []
+        steps = QHBoxLayout()
+        steps.setSpacing(8)
+        for txt in ("1. LEVEL BASELINE",
+                    "2. ROLL RESPONSE",
+                    "3. PITCH RESPONSE",
+                    "4. YAW DAMPING"):
+            chk = QPushButton("\u25CB  " + txt)
+            chk.setEnabled(False)
+            chk.setFixedHeight(28)
+            chk.setStyleSheet(f"""
+                QPushButton {{
+                    background:{COL_CARD.name()}; color:{COL_SUBTEXT.name()};
+                    border:1px solid {COL_BORDER.name()}; border-radius:7px;
+                    font: bold 8px Inter, sans-serif; letter-spacing:1.0px;
+                    padding: 0 8px;
+                }}
+            """)
+            steps.addWidget(chk, stretch=1)
+            self._bench_steps.append(chk)
+        lay.addLayout(steps)
+
+        return page
+
+    def _update_bench(self):
+        # Gunakan roll/pitch ONBOARD drone (dari paket SMC) karena itulah yang
+        # benar-benar dipakai controller, bukan filter ulang di GUI.
+        roll = self._bench_smc[0]
+        pitch = self._bench_smc[1]
+        ur, up, uy = self._bench_smc[2], self._bench_smc[3], self._bench_smc[4]
+        gz = self._bench_imu[2]
+
+        # Konversi throttle stik mentah (0-255) ke PWM us (1000-2000 us)
+        t_raw = self._js_raw[1] if len(self._js_raw) > 1 else 0
+        throttle = 1000.0 + (t_raw / 255.0) * 1000.0 if self._armed else 1000.0
+
+        self._bench_mix.set_data(roll, pitch, self._orient.yaw,
+                                 ur, up, uy, throttle, self._armed)
+
+        # ── Roll check ──
+        if abs(roll) < 3.0:
+            self._check_roll.set_status("IDLE",
+                "Drone level. Miringkan drone ke kanan atau kiri untuk menguji.",
+                f"ROLL {roll:+.1f}\u00B0   \u00B7   uROLL {ur:+.1f}")
+        else:
+            # roll>0 (kanan) => koreksi harus positive (naikkan kiri): ur>0
+            if (roll > 0 and ur > 0) or (roll < 0 and ur < 0):
+                self._check_roll.set_status("PASS",
+                    "Koreksi BENAR: Motor sisi yang turun dinaikkan untuk melawan kemiringan.",
+                    f"ROLL {roll:+.1f}\u00B0   \u00B7   uROLL {ur:+.1f}")
+            else:
+                self._check_roll.set_status("DANGER",
+                    "Koreksi TERBALIK: Motor justru memperparah kemiringan! Tanda uRoll/mixer salah.",
+                    f"ROLL {roll:+.1f}\u00B0   \u00B7   uROLL {ur:+.1f}")
+
+        # ── Pitch check ──
+        if abs(pitch) < 3.0:
+            self._check_pitch.set_status("IDLE",
+                "Drone level. Miringkan drone depan naik atau turun untuk menguji.",
+                f"PITCH {pitch:+.1f}\u00B0   \u00B7   uPITCH {up:+.1f}")
+        else:
+            # pitch>0 (nose-up) => koreksi harus negative (turunkan depan): up<0
+            if (pitch > 0 and up < 0) or (pitch < 0 and up > 0):
+                self._check_pitch.set_status("PASS",
+                    "Koreksi BENAR: Depan yang terangkat dikoreksi turun kembali level.",
+                    f"PITCH {pitch:+.1f}\u00B0   \u00B7   uPITCH {up:+.1f}")
+            else:
+                self._check_pitch.set_status("DANGER",
+                    "Koreksi TERBALIK: Depan yang terangkat malah dinaikkan! Tanda uPitch salah.",
+                    f"PITCH {pitch:+.1f}\u00B0   \u00B7   uPITCH {up:+.1f}")
+
+        # ── Yaw check ──
+        if abs(gz) < 8.0:
+            self._check_yaw.set_status("IDLE",
+                "Drone diam. Putar drone berputar ke kanan atau kiri untuk menguji.",
+                f"GZ {gz:+.1f}\u00B0/s   \u00B7   uYAW {uy:+.1f}")
+        else:
+            # rotasi kanan (gz>0) => damping berarti uy<0
+            if (gz > 0 and uy < 0) or (gz < 0 and uy > 0):
+                self._check_yaw.set_status("PASS",
+                    "Koreksi BENAR: SMC meredam laju putaran yaw secara aktif.",
+                    f"GZ {gz:+.1f}\u00B0/s   \u00B7   uYAW {uy:+.1f}")
+            else:
+                self._check_yaw.set_status("DANGER",
+                    "Koreksi TERBALIK: SMC justru mempercepat rotasi yaw! Tanda uYaw salah.",
+                    f"GZ {gz:+.1f}\u00B0/s   \u00B7   uYAW {uy:+.1f}")
+
+        # ── checklist auto-update ──
+        steps = self._bench_steps
+        if len(steps) >= 4:
+            level = abs(roll) < 2.5 and abs(pitch) < 2.5 and abs(gz) < 2.5
+            self._style_bench_step(steps[0], level)
+            roll_ok = self._check_roll._status == "PASS"
+            pitch_ok = self._check_pitch._status == "PASS"
+            yaw_ok = self._check_yaw._status == "PASS"
+            self._style_bench_step(steps[1], roll_ok)
+            self._style_bench_step(steps[2], pitch_ok)
+            self._style_bench_step(steps[3], yaw_ok)
+
+    def _style_bench_step(self, btn, ok):
+        idx = self._bench_steps.index(btn)
+        base = ["1. LEVEL BASELINE", "2. ROLL RESPONSE",
+                "3. PITCH RESPONSE", "4. YAW DAMPING"][idx]
+        if ok:
+            btn.setText("\u2713  " + base)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background:{COL_OK.name()}; color:white;
+                    border:none; border-radius:7px;
+                    font: bold 8px Inter, sans-serif; letter-spacing:1.0px;
+                    padding: 0 8px;
+                }}
+            """)
+        else:
+            btn.setText("\u25CB  " + base)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background:{COL_CARD.name()}; color:{COL_SUBTEXT.name()};
+                    border:1px solid {COL_BORDER.name()}; border-radius:7px;
+                    font: bold 8px Inter, sans-serif; letter-spacing:1.0px;
+                    padding: 0 8px;
+                }}
+            """)
+
     def _apply_smc_parameters(self):
         if not self._serial or not self._serial.is_open:
             self._hint.setText("Connect to remote before applying SMC parameters.")
@@ -1949,6 +2567,9 @@ class MainWindow(QMainWindow):
         self._horizon.update()
         self._joy_left.animate()
         self._joy_right.animate()
+        if hasattr(self, "_bench_mix"):
+            self._bench_mix.animate()
+            self._update_bench()
 
     # ────────── IMU calibration ──────────
 
@@ -2054,6 +2675,10 @@ class MainWindow(QMainWindow):
             self._horizon.set_connected(False)
             self._cal_stick_btn.setEnabled(False)
             self._arm_btn.setEnabled(False)
+            if hasattr(self, "_bench_arm_btn"):
+                self._bench_arm_btn.setEnabled(False)
+                self._bench_arm_btn.setText("ARM")
+                self._apply_arm_style(False)
             self._hint.setText("Disconnected")
             return
         if not HAS_SERIAL:
@@ -2072,6 +2697,8 @@ class MainWindow(QMainWindow):
             self._horizon.set_connected(True)
             self._cal_stick_btn.setEnabled(True)
             self._arm_btn.setEnabled(True)
+            if hasattr(self, "_bench_arm_btn"):
+                self._bench_arm_btn.setEnabled(True)
             self._hint.setText(f"Streaming from {port}")
         except Exception as e:
             self._hint.setText(f"Error: {e}")
@@ -2125,6 +2752,7 @@ class MainWindow(QMainWindow):
             ax, ay, az = [float(v) for v in m.groups()[:3]]
             gx, gy, gz = [float(v) for v in m.groups()[3:]]
             self._orient.update(ax, ay, az, gx, gy, gz)
+            self._bench_imu = (gx, gy, gz)
             self._info_bar.note_sample()
             self._push_att_metrics()
             return
@@ -2153,6 +2781,7 @@ class MainWindow(QMainWindow):
         m = SMC_RE.search(text)
         if m:
             roll, pitch, u_roll, u_pitch, u_yaw = [float(v) for v in m.groups()]
+            self._bench_smc = (roll, pitch, u_roll, u_pitch, u_yaw)
             if hasattr(self, "_smc_plot"):
                 self._smc_plot.add_sample(roll, pitch, u_roll, u_pitch, u_yaw)
             return

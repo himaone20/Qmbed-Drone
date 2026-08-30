@@ -72,15 +72,15 @@
 #define TASK_CONTROL_STACK_SIZE  384    // Stack size (words)
 
 /* ── Sliding Mode Controller (initial values, tune via GUI) ───────────── */
-#define SMC_K1_DEFAULT           5.0f
-#define SMC_K2_DEFAULT           2.0f
+#define SMC_K1_DEFAULT           2.5f   // Props-off/test aman. Tune naik setelah hover stabil.
+#define SMC_K2_DEFAULT           1.0f   // Reaching law lebih halus, kurangi chattering.
 #define SMC_EPS_DEFAULT          8.0f
 #define SMC_IX_DEFAULT           0.0030f // Estimasi awal quad 450-class (kg m^2)
 #define SMC_IY_DEFAULT           0.0030f // Estimasi awal quad 450-class (kg m^2)
 #define SMC_IZ_DEFAULT           0.0050f // Estimasi awal quad 450-class (kg m^2)
 #define SMC_ARM_LENGTH_DEFAULT   0.225f  // Jarak pusat ke motor, meter
 #define SMC_FORCE_TO_PWM_DEFAULT 30.0f
-#define SMC_DELTA_MAX_DEFAULT    180.0f // Batas koreksi PWM per motor, us
+#define SMC_DELTA_MAX_DEFAULT    80.0f   // Batas koreksi PWM per motor kecil utk cegah flip mendadak
 #define SMC_CF_ALPHA             0.98f  // Complementary filter roll/pitch
 #define SMC_BENCH_DEBUG          1      // Cetak data SMC untuk props-off bench test
 
