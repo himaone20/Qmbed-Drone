@@ -56,6 +56,9 @@ SMC_RE = re.compile(
     r"\[SMC\]\s*ROLL:([-\d.]+)\s*PITCH:([-\d.]+)"
     r"\s*UR:([-\d.]+)\s*UP:([-\d.]+)\s*UY:([-\d.]+)"
 )
+BAT_RE = re.compile(
+    r"\[BAT\]\s*V:([-\d.]+)"
+)
 CAL_OK_RE = re.compile(
     r"\[CAL\]\s*OK\s*CR=(\d+)\s*CT=(\d+)\s*CY=(\d+)\s*CP=(\d+)"
 )
@@ -1154,9 +1157,15 @@ class SecondaryInfoBar(QFrame):
                 border-radius: 10px;
             }}
         """)
+        self.vbat = 11.1
         self.press = 0.0
         self.rate = 0.0
         self._last_sample_ts = 0.0
+
+    def update_vbat(self, vbat):
+        if vbat > 3.0:
+            self.vbat = vbat
+        self.update()
 
     def update_press(self, press):
         self.press = press
@@ -1178,9 +1187,11 @@ class SecondaryInfoBar(QFrame):
         p.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(self.rect())
 
+        vbat_col = COL_OK if self.vbat >= 10.5 else (COL_WARN if self.vbat >= 9.9 else COL_ERR)
         cols = [
-            ("PRESSURE",  f"{self.press:.1f} hPa", COL_ACCENT_2),
-            ("DATA RATE", f"{self.rate:.0f} Hz",   COL_OK),
+            ("BATTERY (3S)", f"{self.vbat:.2f} V", vbat_col),
+            ("PRESSURE",     f"{self.press:.1f} hPa", COL_ACCENT_2),
+            ("DATA RATE",    f"{self.rate:.0f} Hz",   COL_OK),
         ]
         col_w = rect.width() / len(cols)
         for i, (lbl, val, col) in enumerate(cols):
@@ -1324,7 +1335,147 @@ class RCReadoutCard(QFrame):
             center_x = bar_rect.left() + bar_rect.width() * 0.5
             p.setPen(QPen(COL_SUBTEXT, 1.4))
             p.drawLine(QPointF(center_x, bar_rect.top() - 2),
-                      QPointF(center_x, bar_rect.bottom() + 2))
+                       QPointF(center_x, bar_rect.bottom() + 2))
+
+        p.end()
+
+
+# ───────────────────── Motor RPM Telemetry Card ─────────────────────
+
+class MotorRpmCard(QFrame):
+    """Strip telemetri & estimasi RPM 4 Motor Quad-X di Tab Attitude.
+    Menampilkan header dengan status ARM/DISARM, serta 4 kolom motor (M1 FL, M2 FR, M3 BR, M4 BL)
+    dengan nilai RPM real-time, PWM microseconds, persentase daya, dan progress bar dinamis."""
+
+    MOTORS = [
+        ("M1", "FL \u00B7 CW",  COL_ACCENT),      # PB6
+        ("M2", "FR \u00B7 CCW", COL_ACCENT_LT),   # PB7
+        ("M3", "BR \u00B7 CW",  COL_ACCENT_DK),   # PB8
+        ("M4", "BL \u00B7 CCW", COL_OK),          # PB9
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("MotorRpmCard")
+        self.setFixedHeight(108)
+        self.setStyleSheet(f"""
+            #MotorRpmCard {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 10px;
+            }}
+        """)
+        add_shadow(self, blur=14, dy=1, alpha=18)
+        self.armed = False
+        self.vbat = 11.1
+        self.pwm = [1000, 1000, 1000, 1000]
+        self.rpm = [0, 0, 0, 0]
+
+    def set_data(self, ur, up, uy, throttle_pwm, armed, vbat=11.1):
+        self.armed = armed
+        self.vbat = vbat if vbat > 3.0 else 11.1
+        base_pwm = throttle_pwm if armed else 1000.0
+
+        if armed:
+            m1 = max(1000.0, min(2000.0, base_pwm + ur + up + uy))
+            m2 = max(1000.0, min(2000.0, base_pwm - ur + up - uy))
+            m3 = max(1000.0, min(2000.0, base_pwm - ur - up + uy))
+            m4 = max(1000.0, min(2000.0, base_pwm + ur - up - uy))
+        else:
+            m1 = m2 = m3 = m4 = 1000.0
+
+        self.pwm = [int(m1), int(m2), int(m3), int(m4)]
+        # A2212 1400KV * VBat * 0.80 loaded prop efficiency
+        max_rpm = 1400.0 * self.vbat * 0.80
+        self.rpm = [
+            int(((p - 1000.0) / 1000.0) * max_rpm) if armed and p > 1020 else 0
+            for p in self.pwm
+        ]
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect())
+
+        # ── Header Row ──
+        header_rect = QRectF(rect.left() + 16, rect.top() + 8, rect.width() - 32, 18)
+        p.setPen(COL_SUBTEXT)
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.6))
+        p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                   f"4-MOTOR REALTIME RPM \u00B7 A2212 1400KV (3S {self.vbat:.2f}V)")
+
+        badge_txt = "ARMED" if self.armed else "DISARMED"
+        badge_bg = COL_OK if self.armed else COL_MUTED
+        badge_font = qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.6)
+        badge_w = QFontMetricsF(badge_font).horizontalAdvance(badge_txt) + 20
+        badge_rect = QRectF(header_rect.right() - badge_w, header_rect.top() - 1, badge_w, 18)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(badge_bg))
+        p.drawRoundedRect(badge_rect, 9, 9)
+        p.setPen(QColor("#FFFFFF"))
+        p.setFont(badge_font)
+        p.drawText(badge_rect, Qt.AlignCenter, badge_txt)
+
+        # Hairline separator
+        sep_y = header_rect.bottom() + 8
+        p.setPen(QPen(COL_BORDER, 1))
+        p.drawLine(QPointF(rect.left() + 16, sep_y), QPointF(rect.right() - 16, sep_y))
+
+        # ── 4 Motor Columns ──
+        grid = QRectF(rect.left() + 16, sep_y + 8,
+                      rect.width() - 32, rect.bottom() - (sep_y + 8) - 10)
+        col_w = grid.width() / 4.0
+
+        for i, ((code, name, col), pwm_val, rpm_val) in enumerate(zip(self.MOTORS, self.pwm, self.rpm)):
+            cx0 = grid.left() + i * col_w
+            col_rect = QRectF(cx0, grid.top(), col_w - 10, grid.height())
+
+            if i > 0:
+                p.setPen(QPen(COL_BORDER, 1))
+                p.drawLine(QPointF(cx0 - 5, grid.top()), QPointF(cx0 - 5, grid.bottom()))
+
+            # Motor Name: Colored dot + "M1 · FL (CW)"
+            name_rect = QRectF(col_rect.left(), col_rect.top(), col_rect.width(), 16)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(col))
+            p.drawEllipse(QPointF(name_rect.left() + 3, name_rect.center().y()), 3, 3)
+            p.setPen(COL_SUBTEXT)
+            p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.2))
+            p.drawText(name_rect.adjusted(11, 0, 0, 0),
+                       Qt.AlignLeft | Qt.AlignVCenter, f"{code} \u00B7 {name}")
+
+            # Main RPM Value + PWM subtext
+            value_rect = QRectF(col_rect.left(), name_rect.bottom() + 2, col_rect.width(), 22)
+            p.setPen(COL_TEXT if self.armed and rpm_val > 0 else COL_MUTED)
+            p.setFont(qfont(FONT_MONO, 14, QFont.Bold))
+            rpm_str = f"{rpm_val:,} RPM" if self.armed else "0 RPM"
+            p.drawText(value_rect, Qt.AlignLeft | Qt.AlignVCenter, rpm_str)
+
+            # Sub-info: PWM us + %
+            pct = int(((pwm_val - 1000) / 1000.0) * 100) if self.armed else 0
+            pct_str = f"{pwm_val} \u00B5s ({pct}%)"
+            sub_font = qfont(FONT_UI, 7, QFont.DemiBold)
+            p.setFont(sub_font)
+            sub_w = QFontMetricsF(sub_font).horizontalAdvance(pct_str)
+            sub_rect = QRectF(col_rect.right() - sub_w, value_rect.top() + 4, sub_w, 14)
+            p.setPen(COL_SUBTEXT)
+            p.drawText(sub_rect, Qt.AlignRight | Qt.AlignVCenter, pct_str)
+
+            # Bar RPM / Output (0 - 100%)
+            bar_rect = QRectF(col_rect.left(), value_rect.bottom() + 4, col_rect.width(), 6)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(COL_CARD_ALT))
+            p.drawRoundedRect(bar_rect, 3, 3)
+
+            frac = max(0.0, min(1.0, (pwm_val - 1000) / 1000.0)) if self.armed else 0.0
+            if frac > 0:
+                fill_w = bar_rect.width() * frac
+                fill_col = COL_WARN if frac > 0.85 else QColor(col)
+                p.setBrush(QBrush(fill_col))
+                p.drawRoundedRect(QRectF(bar_rect.left(), bar_rect.top(),
+                                         max(4.0, fill_w), bar_rect.height()), 3, 3)
 
         p.end()
 
@@ -1786,6 +1937,7 @@ class MainWindow(QMainWindow):
         self._alt_offset = 0.0
         self._alt_smooth = 0.0
         self._press = 0.0
+        self._vbat = 11.1
         self._first_alt = True
 
         # ── joystick state ──
@@ -1796,6 +1948,10 @@ class MainWindow(QMainWindow):
         self._js_calib_center_display = None  # (cr,ct,cy,cp) ADC untuk banner
         self._js_calib_sampling = False       # menunggu balasan dari ESP32
         self._armed = False
+
+        # ── throttle integrator state (spring-centered stick) ──
+        self._throttle_smoothed = 1200.0
+        self._throttle_last_ms = time.monotonic() * 1000.0
 
         # ── bench-test live state (SMC + IMU) ──
         self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0)  # (roll, pitch, uRoll, uPitch, uYaw)
@@ -2415,9 +2571,32 @@ class MainWindow(QMainWindow):
                 return
 
         if self._armed:
+            self._throttle_smoothed = 1200.0
+            self._throttle_last_ms = time.monotonic() * 1000.0
             self.set_hint("Drone ARMING / ARMED (Motors Live)", level="warn")
         else:
+            self._throttle_smoothed = 1000.0
             self.set_hint("Drone DISARMED (Safe)", level="ok")
+
+    def _update_gui_throttle(self):
+        now_ms = time.monotonic() * 1000.0
+        dt_s = (now_ms - self._throttle_last_ms) / 1000.0
+        self._throttle_last_ms = now_ms
+
+        if not self._armed:
+            self._throttle_smoothed = 1000.0
+            return self._throttle_smoothed
+
+        t_raw = self._js_raw[1] if len(self._js_raw) > 1 else 128
+        throttle_delta = t_raw - 128
+
+        if abs(throttle_delta) <= 4:
+            throttle_delta = 0
+
+        stick_norm = (throttle_delta / 127.0) if throttle_delta >= 0 else (throttle_delta / 128.0)
+        self._throttle_smoothed += stick_norm * 150.0 * dt_s
+        self._throttle_smoothed = max(1000.0, min(2000.0, self._throttle_smoothed))
+        return self._throttle_smoothed
 
     # ────────── tabs ──────────
 
@@ -2451,6 +2630,9 @@ class MainWindow(QMainWindow):
 
         self._info_bar = SecondaryInfoBar()
         lay.addWidget(self._info_bar)
+
+        self._motor_rpm_card = MotorRpmCard()
+        lay.addWidget(self._motor_rpm_card)
 
         return page
 
@@ -2607,7 +2789,7 @@ class MainWindow(QMainWindow):
 
         self._check_roll = BenchCheckCard(
             "STEP 1", "ROLL RESPONSE",
-            "Miringkan drone ke KANAN (Roll > +5\u00B0) \u2014 motor KIRI (M1, M4) harus bertambah tenaga dan motor KANAN (M2, M3) berkurang.")
+            "Miringkan drone ke KANAN (Roll > +5\u00B0) \u2014 motor KANAN (M2, M3) harus bertambah tenaga dan motor KIRI (M1, M4) berkurang (uRoll bernilai negatif).")
         self._check_pitch = BenchCheckCard(
             "STEP 2", "PITCH RESPONSE",
             "Miringkan drone nose-UP (Pitch > +5\u00B0) \u2014 motor DEPAN (M1, M2) harus berkurang tenaga dan motor BELAKANG (M3, M4) bertambah.")
@@ -2655,9 +2837,8 @@ class MainWindow(QMainWindow):
         ur, up, uy = self._bench_smc[2], self._bench_smc[3], self._bench_smc[4]
         gz = self._bench_imu[2]
 
-        # Konversi throttle stik mentah (0-255) ke PWM us (1000-2000 us)
-        t_raw = self._js_raw[1] if len(self._js_raw) > 1 else 0
-        throttle = 1000.0 + (t_raw / 255.0) * 1000.0 if self._armed else 1000.0
+        # Ramping throttle dari stik berpegas
+        throttle = self._update_gui_throttle()
 
         self._bench_mix.set_data(roll, pitch, self._orient.yaw,
                                  ur, up, uy, throttle, self._armed)
@@ -2668,8 +2849,8 @@ class MainWindow(QMainWindow):
                 "Drone level. Miringkan drone ke kanan atau kiri untuk menguji.",
                 f"ROLL {roll:+.1f}\u00B0   \u00B7   uROLL {ur:+.1f}")
         else:
-            # roll>0 (kanan) => koreksi harus positive (naikkan kiri): ur>0
-            if (roll > 0 and ur > 0) or (roll < 0 and ur < 0):
+            # roll>0 (kanan) => koreksi harus negatif (naikkan kanan M2,M3 / turunkan kiri M1,M4): ur<0
+            if (roll > 0 and ur < 0) or (roll < 0 and ur > 0):
                 self._check_roll.set_status("PASS",
                     "Koreksi BENAR: Motor sisi yang turun dinaikkan untuk melawan kemiringan.",
                     f"ROLL {roll:+.1f}\u00B0   \u00B7   uROLL {ur:+.1f}")
@@ -2934,6 +3115,12 @@ class MainWindow(QMainWindow):
         self._alt_tape.set_altitude(self._alt_smooth)
         self._horizon.set_altitude(self._alt_smooth)
         self._info_bar.update_press(self._press)
+        self._info_bar.update_vbat(self._vbat)
+
+        throttle_pwm = self._update_gui_throttle()
+        ur, up, uy = self._bench_smc[2], self._bench_smc[3], self._bench_smc[4]
+        if hasattr(self, "_motor_rpm_card"):
+            self._motor_rpm_card.set_data(ur, up, uy, throttle_pwm, self._armed, vbat=self._vbat)
 
     def _push_rc_values(self):
         # ESP32 sudah mengirim nilai 0-255 yang sudah terkalibrasi penuh
@@ -2968,8 +3155,12 @@ class MainWindow(QMainWindow):
                 self._alt_smooth = 0.0
                 self._first_alt = False
             corrected = alt - self._alt_offset
+            if corrected < 0.0:
+                corrected = 0.0
             # Digital IIR Low-Pass Filter: y[k] = 0.80 * y[k-1] + 0.20 * x[k]
             self._alt_smooth = 0.80 * self._alt_smooth + 0.20 * corrected
+            if self._alt_smooth < 0.0:
+                self._alt_smooth = 0.0
             self._push_att_metrics()
             return
 
@@ -2978,6 +3169,7 @@ class MainWindow(QMainWindow):
             r, t, y, p = [int(v) for v in m.groups()]
             self._js_raw = (r, t, y, p)
             self._push_rc_values()
+            self._push_att_metrics()
             return
 
         m = SMC_RE.search(text)
@@ -2986,6 +3178,13 @@ class MainWindow(QMainWindow):
             self._bench_smc = (roll, pitch, u_roll, u_pitch, u_yaw)
             if hasattr(self, "_smc_plot"):
                 self._smc_plot.add_sample(roll, pitch, u_roll, u_pitch, u_yaw)
+            self._push_att_metrics()
+            return
+
+        m = BAT_RE.search(text)
+        if m:
+            self._vbat = float(m.group(1))
+            self._push_att_metrics()
             return
 
         m = CAL_OK_RE.search(text)

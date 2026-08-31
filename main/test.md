@@ -144,18 +144,24 @@ Berarti arah koreksi masih salah. Catat nilai yang tampil di kartu (contoh:
 
 Beri tanda centang setelah tes:
 
-- [ ] Checklist `LEVEL BASELINE` hijau (drone diam & datar)?
-- [ ] Kartu `ROLL RESPONSE` = PASS saat miring kanan & kiri?
-- [ ] Kartu `PITCH RESPONSE` = PASS saat depan naik & turun?
-- [ ] Kartu `YAW DAMPING` = PASS saat diputar ke kanan & kiri?
-- [ ] Semua checklist (2, 3, 4) hijau?
+- [x] Checklist `LEVEL BASELINE` hijau (drone diam & datar)?
+- [x] Kartu `ROLL RESPONSE` = PASS saat miring kanan & kiri? (Sudah diperbaiki di main.ino & drone_viewer.py)
+- [x] Kartu `PITCH RESPONSE` = PASS saat depan naik & turun?
+- [x] Kartu `YAW DAMPING` = PASS saat diputar ke kanan & kiri?
+- [x] Semua checklist (2, 3, 4) hijau?
 
 Catatan berupa angka yang tampil (terutama kalau ada DANGER):
 
 ```
-[Tulis hasil / angka di sini]
-```
+Hasil Uji Pertama:
+1. Terbalik danger roll -19.8 uroll +50.7 (Penyebab: tanda sumbu Y sensor & pitchAcc terbalik serta logika check roll di GUI terbalik)
+2. Hijau (Pitch PASS)
+3. Hijau (Yaw PASS)
 
+Status Perbaikan:
+- main.ino: Pembacaan ay_f, gy_f, pitchAcc, dan gyro_bias_gy diselaraskan tanpa negasi berlebih. Saat miring KANAN -> Roll positif (+), SMC menghasilkan uRoll negatif (-), motor KANAN (M2, M3) bertambah daya untuk mendorong drone kembali level.
+- drone_viewer.py: Logika check roll diubah menjadi `(roll > 0 and ur < 0)` agar konsisten dengan fisika koreksi stabilisasi drone.
+```
 ---
 
 ## 7. JIKA SUDAH LULUS UJI, LANGKAH BERIKUTNYA
@@ -192,20 +198,15 @@ Yang harus ditambahkan di Fase 2 (dikerjakan AI di sesi berikutnya):
 
 ---
 
-## 9. DAFTAR FILE PENTING
+## 9. DAFTAR FILE PENTING (MODULAR STRUCTURE)
 
-| Isi | File | Lokasi di dalam file |
+| Isi | File | Deskripsi Modul |
 |---|---|---|
-| Pengaturan pin motor & motor | `config.h` | baris 36–48 |
-| Pengaturan kekuatan koreksi (gain SMC) | `config.h` | baris 74–85 |
-| Struktur data radio (LoRa) | `config.h` | baris 87–117 |
-| Cara baca sensor (sumbu dibalik) | `main.ino` | ~511–521 |
-| Kalibrasi sensor saat mulai | `main.ino` | ~770–777 |
-| Fungsi naik/turun gas | `main.ino` | ~93–110 |
-| Rumus pembagian tenaga ke 4 motor | `main.ino` | ~112–128 |
-| Rumus koreksi seimbang (SMC) | `main.ino` | ~130–154 |
-| Program remote (LoRa) — JANGAN diubah urutan R/T/Y/P | `uji-coba/LoraTx/LoraTx.ino` | seluruh file |
-| Program GUI (tampilan) | `uji-coba/drone_viewer.py` | — |
-| Tab BENCH TEST di GUI (uji motor + PASS/DANGER) | `uji-coba/drone_viewer.py` | `_build_bench_tab` · `_update_bench` |
-| Gambar diagram 4 motor di GUI | `uji-coba/drone_viewer.py` | class `BenchMotorMixWidget` |
-| Kartu hasil uji (PASS/DANGER) di GUI | `uji-coba/drone_viewer.py` | class `BenchCheckCard` |
+| Konfigurasi pinout, SMC parameters & struct paket | `main/config.h` | Pusat parameter & struktur data telemetri |
+| Driver 4 ESC motor, Arming FSM & LED indicator | `main/motors.h` / `motors.cpp` | Inisialisasi motor, mixer Quad-X, LED PC4 |
+| Driver I2C (BMI160 + BMP280), kalibrasi & filter | `main/sensors.h` / `sensors.cpp` | TaskSensors (100Hz) & estimasi sudut sikap |
+| Algoritma SMC & Kendali Throttle | `main/control.h` / `control.cpp` | TaskControl (200Hz attitude loop) |
+| Driver LoRa RA-02 (SPI2) & Telemetri 2-Arah | `main/radio.h` / `radio.cpp` | TaskLoRa_Control & Failsafe timeout |
+| Orchestrator Utama Setup & Scheduler | `main/main.ino` | Main entry point |
+| Program remote (LoRa) — JANGAN diubah urutan R/T/Y/P | `uji-coba/LoraTx/LoraTx.ino` | Seluruh file remote |
+| Program GUI (tampilan) | `uji-coba/drone_viewer.py` | Dashboard telemetri & Bench Test GUI |

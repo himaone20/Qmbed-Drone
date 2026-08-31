@@ -26,12 +26,22 @@
 #define LORA_SIGNAL_BANDWIDTH 125E3
 #define LORA_CODING_RATE      5
 
-/* ── I2C Bus (Sensor BMI160 + BMP280) ────────────────────────────────── */
+/* ── I2C Bus (Sensor BMI160 + BMP180) ────────────────────────────────── */
 #define I2C_SCL_PIN           PB10
 #define I2C_SDA_PIN           PB3
 #define I2C_CLOCK_SPEED       400000
 #define BMI160_ADDR           0x68
-#define BMP280_ADDR           0x76
+#define BMP180_ADDR           0x77
+#define BMP280_ADDR           0x77  // Alias untuk kompatibilitas
+
+/* ── ADC Voltage Sensor (Baterai 3S) ─────────────────────────────────── */
+#define VBAT_PIN              PA0
+#define VBAT_ADC_REF          3.3f
+#define VBAT_ADC_RES          4095.0f  // 12-bit ADC
+#define VBAT_R1               100000.0f
+#define VBAT_R2               20000.0f
+#define VBAT_DIV_RATIO        ((VBAT_R1 + VBAT_R2) / VBAT_R2) // 6.0f
+#define VBAT_CAL_FACTOR       1.0f
 
 /* ── ESC 4 Motor (Quad-X) ────────────────────────────────────────────── */
 /* Arah putaran nyata (dikonfirmasi user): M1 FL CW, M2 FR CCW,
@@ -46,6 +56,13 @@
 #define ESC_ARM_SPIN_US       1200   // 20% throttle saat ARMED (1000 + 1000*0.20)
 #define ARMING_DURATION_MS    5000   // Waktu tunggu arming (5 detik)
 #define LINK_TIMEOUT_MS       1000   // Failsafe timeout jika LoRa hilang > 1s
+
+/* ── State Machine ESC ───────────────────────────────────────────────── */
+enum EscState {
+  ESC_DISARMED,
+  ESC_ARMING,
+  ESC_ARMED
+};
 
 /* ── Manual Quad-X Mixer (tanpa PID / self-level) ────────────────────── */
 #define MIX_ROLL_GAIN_US      150.0f // Koreksi maksimum roll pada defleksi stick penuh
@@ -84,6 +101,14 @@
 #define SMC_CF_ALPHA             0.98f  // Complementary filter roll/pitch
 #define SMC_BENCH_DEBUG          1      // Cetak data SMC untuk props-off bench test
 
+struct SmcParams {
+  float k1;
+  float k2;
+  float eps;
+  float forceToPwm;
+  float deltaMaxPwm;
+};
+
 /* ── Protokol Paket Biner LoRa ───────────────────────────────────────── */
 #define UPLINK_MAGIC          0xA5
 #define DOWNLINK_MAGIC        0x5A
@@ -104,6 +129,7 @@ struct DownlinkPacket {
   int16_t  alt;          // meter  x100
   int16_t  roll, pitch;  // derajat x100, complementary filter onboard
   int16_t  uRoll, uPitch, uYaw; // koreksi SMC PWM x100
+  uint16_t vbat;         // Volts x100 (contoh: 1110 = 11.10V)
 };
 
 struct ConfigPacket {
@@ -125,8 +151,10 @@ struct SensorData {
   float roll;            // derajat, complementary filter onboard
   float pitch;           // derajat, complementary filter onboard
   float yawRate;         // deg/s, untuk yaw-rate damping
+  float vbat;            // Volt (baterai real-time)
   bool  bmiOK;
   bool  bmpOK;
+  bool  vbatOK;
 };
 
 #endif // CONFIG_H

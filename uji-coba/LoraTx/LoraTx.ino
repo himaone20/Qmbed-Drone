@@ -84,6 +84,7 @@ struct DownlinkPacket {
   int16_t  alt;          // meter  x100
   int16_t  roll, pitch;  // derajat x100, complementary filter onboard
   int16_t  uRoll, uPitch, uYaw; // koreksi SMC PWM x100
+  uint16_t vbat;         // Volts x100 (contoh: 1110 = 11.10V)
 };
 
 struct ConfigPacket {
@@ -764,15 +765,18 @@ void loop()
   while (!gotReply && (millis() - waitStart < REPLY_TIMEOUT_MS))
   {
     int packetSize = LoRa.parsePacket();
-    if (packetSize == sizeof(DownlinkPacket))
+    if (packetSize >= 27)
     {
-      uint8_t buf[sizeof(DownlinkPacket)];
-      for (uint8_t i = 0; i < sizeof(DownlinkPacket) && LoRa.available(); i++) {
+      uint8_t buf[32];
+      memset(buf, 0, sizeof(buf));
+      int readLen = min(packetSize, (int)sizeof(buf));
+      for (int i = 0; i < readLen && LoRa.available(); i++) {
         buf[i] = (uint8_t)LoRa.read();
       }
 
       DownlinkPacket down;
-      memcpy(&down, buf, sizeof(DownlinkPacket));
+      memset(&down, 0, sizeof(DownlinkPacket));
+      memcpy(&down, buf, min((int)sizeof(DownlinkPacket), readLen));
 
       if (down.magic == DOWNLINK_MAGIC)
       {
@@ -794,6 +798,9 @@ void loop()
 
         Serial.print("[BMP] P:"); Serial.print(press, 2);
         Serial.print(" A:");      Serial.println(alt, 2);
+
+        float vbat = down.vbat / 100.0f;
+        Serial.print("[BAT] V:"); Serial.println(vbat, 2);
 
         Serial.print("[SMC] ROLL:");  Serial.print(down.roll / 100.0f, 2);
         Serial.print(" PITCH:");     Serial.print(down.pitch / 100.0f, 2);
