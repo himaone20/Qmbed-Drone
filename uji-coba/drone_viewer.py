@@ -22,15 +22,17 @@ import re
 import math
 import time
 from collections import deque
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QPoint
 from PySide6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QFontMetricsF,
-    QRadialGradient, QLinearGradient, QPolygonF, QPainterPath
+    QRadialGradient, QLinearGradient, QPolygonF, QPainterPath,
+    QAction, QPixmap, QIcon
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QFrame, QTabWidget,
-    QGraphicsDropShadowEffect, QFormLayout, QDoubleSpinBox
+    QLabel, QComboBox, QPushButton, QFrame,
+    QGraphicsDropShadowEffect, QFormLayout, QDoubleSpinBox,
+    QStackedWidget, QMenu
 )
 
 try:
@@ -720,18 +722,17 @@ class AltitudeTapeWidget(QWidget):
 # ───────────────────── Joystick Widget ─────────────────────
 
 class JoystickWidget(QWidget):
-    """Kartu joystick dengan 4 zona terpisah secara eksplisit sehingga tidak
-    ada teks yang saling tumpang tindih:
-      1) Header  : judul (kiri) + badge mode (kanan)
-      2) Top     : label sumbu-Y, terpusat di atas pad
-      3) Pad     : lingkaran gimbal, dengan kolom khusus di kanan untuk label sumbu-X
-      4) Footer  : dua pill readout nilai X/Y
+    """Kartu gimbal joystick RC (Mode 2) dengan geometri presisi:
+      1) Header: Judul stik (kiri) + Subtitle sumbu + Mode badge (kanan)
+      2) Pad: Piringan gimbal simetris di tengah dengan penanda arah sumbu
+         (▲/▼/◄/►) yang elegan, anti-tabrakan dengan box footer
+      3) Footer: Dua pill readout telemetri (sumbu vertikal & horizontal)
     """
 
     def __init__(self, title="STICK", mode="MODE 2",
                  vx_label="X", vy_label="Y", parent=None):
         super().__init__(parent)
-        self.setMinimumSize(260, 300)
+        self.setMinimumSize(260, 290)
         self._target_x = 0.5
         self._target_y = 0.5
         self._x = 0.5
@@ -766,188 +767,205 @@ class JoystickWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
 
-        # card
         rect = self.rect().adjusted(0, 0, -1, -1)
         p.setPen(QPen(COL_BORDER, 1))
         p.setBrush(QBrush(COL_CARD))
         p.drawRoundedRect(rect, 12, 12)
 
-        # ── Zone 1: header row (title left, mode badge right) ──
-        header_h = 30.0
-        header_rect = QRectF(rect.left() + 14, rect.top() + 8,
-                             rect.width() - 28, header_h)
+        # ── Zone 1: Header Row ──
+        header_top = rect.top() + 10
+        header_h = 32.0
+        header_rect = QRectF(rect.left() + 16, header_top,
+                             rect.width() - 32, header_h)
+
+        # Title & Subtitle
         p.setPen(COL_TEXT)
         p.setFont(qfont(FONT_UI, 10, QFont.Bold, letter_spacing=0.8))
-        p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter,
-                   self._title.upper())
+        p.drawText(QRectF(header_rect.left(), header_rect.top(),
+                          header_rect.width() - 80, 16),
+                   Qt.AlignLeft | Qt.AlignVCenter, self._title.upper())
 
+        p.setPen(COL_SUBTEXT)
+        p.setFont(qfont(FONT_UI, 7, QFont.DemiBold, letter_spacing=1.0))
+        p.drawText(QRectF(header_rect.left(), header_rect.top() + 16,
+                          header_rect.width() - 80, 14),
+                   Qt.AlignLeft | Qt.AlignVCenter,
+                   f"{self._vy_label} \u00B7 {self._vx_label}")
+
+        # Mode Badge
         badge_font = qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.2)
         p.setFont(badge_font)
         badge_txt = self._mode.upper()
-        badge_w = QFontMetricsF(badge_font).horizontalAdvance(badge_txt) + 18
+        badge_w = QFontMetricsF(badge_font).horizontalAdvance(badge_txt) + 16
         badge_rect = QRectF(header_rect.right() - badge_w,
-                            header_rect.center().y() - 9, badge_w, 18)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(COL_ACCENT_XLT))
-        p.drawRoundedRect(badge_rect, 9, 9)
-        p.setPen(COL_ACCENT_DK)
+                            header_rect.top() + 4, badge_w, 20)
+        p.setPen(QPen(QColor("#BAE6FD"), 1))
+        p.setBrush(QBrush(QColor("#E0F2FE")))
+        p.drawRoundedRect(badge_rect, 10, 10)
+        p.setPen(QColor("#0369A1"))
         p.drawText(badge_rect, Qt.AlignCenter, badge_txt)
 
-        # ── Zone 2: axis-Y label strip, directly under header ──
-        ylabel_rect = QRectF(rect.left(), header_rect.bottom() + 2,
-                             rect.width(), 16)
-        p.setPen(COL_SUBTEXT)
-        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.6))
-        p.drawText(ylabel_rect, Qt.AlignCenter, self._vy_label.upper())
-
-        # ── Zone 4 (reserved first): footer readout pills ──
+        # ── Zone 3: Footer Readout Pills (Reserved Bottom) ──
         footer_h = 34.0
-        footer_top = rect.bottom() - 10 - footer_h
+        footer_top = rect.bottom() - 12 - footer_h
+        val_x = int(self._x * 255)
+        val_y = int((1.0 - self._y) * 255)
+        pill_gap = 10.0
+        pill_w = (rect.width() - 32 - pill_gap) / 2.0
+        pill_left = QRectF(rect.left() + 16, footer_top, pill_w, footer_h)
+        pill_right = QRectF(pill_left.right() + pill_gap, footer_top, pill_w, footer_h)
 
-        # geometry for the pad (between y-label strip and footer),
-        # with a fixed right gutter reserved for the axis-X label so the
-        # label can never overlap the circular pad.
-        gutter = 46.0
-        pad_top = ylabel_rect.bottom() + 4
-        pad_bottom = footer_top - 8
-        pad_left = rect.left() + 14
-        pad_right = rect.right() - gutter
-        cx = (pad_left + pad_right) / 2
-        cy = (pad_top + pad_bottom) / 2
-        radius = min(pad_right - pad_left, pad_bottom - pad_top) * 0.5 - 4
+        # ── Zone 2: Gimbal Pad Geometry (Between Header and Footer) ──
+        pad_top = header_top + header_h + 12
+        pad_bottom = footer_top - 16
+        pad_h = pad_bottom - pad_top
+        pad_w = rect.width() - 32
 
-        # outer subtle halo
-        halo = QRadialGradient(cx, cy, radius * 1.18)
+        cx = rect.center().x()
+        cy = (pad_top + pad_bottom) / 2.0
+
+        # Radius proporsional dengan batas aman (tidak akan pernah menabrak header/footer)
+        radius = min(pad_w * 0.38, pad_h * 0.38)
+        radius = max(36.0, min(80.0, radius))
+
+        # ── Axis Indicators Around the Circle (HUD Style) ──
+        p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.0))
+        p.setPen(COL_SUBTEXT)
+
+        # Top Axis Label (e.g. ▲ THROTTLE / ▲ PITCH)
+        top_lbl = f"\u25B2  {self._vy_label.upper()}"
+        p.drawText(QRectF(cx - 80, cy - radius - 16, 160, 14),
+                   Qt.AlignCenter, top_lbl)
+
+        # Bottom Axis Label (e.g. ▼ MIN)
+        p.setPen(COL_MUTED)
+        p.drawText(QRectF(cx - 50, cy + radius + 3, 100, 14),
+                   Qt.AlignCenter, "\u25BC  MIN")
+
+        # Left / Right Axis Ticks (◄ / ►)
+        p.drawText(QRectF(cx - radius - 18, cy - 7, 14, 14),
+                   Qt.AlignCenter, "\u25C4")
+        p.drawText(QRectF(cx + radius + 4, cy - 7, 14, 14),
+                   Qt.AlignCenter, "\u25BA")
+
+        # ── Gimbal Outer Halo ──
+        halo = QRadialGradient(cx, cy, radius * 1.08)
         halo.setColorAt(0.0, QColor(COL_ACCENT_XLT.red(), COL_ACCENT_XLT.green(),
                                     COL_ACCENT_XLT.blue(), 0))
         halo.setColorAt(0.85, QColor(COL_ACCENT_XLT.red(), COL_ACCENT_XLT.green(),
                                      COL_ACCENT_XLT.blue(), 0))
         halo.setColorAt(1.0, QColor(COL_ACCENT_2.red(), COL_ACCENT_2.green(),
-                                    COL_ACCENT_2.blue(), 40))
+                                    COL_ACCENT_2.blue(), 35))
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(halo))
-        p.drawEllipse(QPointF(cx, cy), radius * 1.18, radius * 1.18)
+        p.drawEllipse(QPointF(cx, cy), radius * 1.08, radius * 1.08)
 
-        # outer disc (light gradient)
-        disc = QRadialGradient(cx - radius*0.2, cy - radius*0.2, radius * 1.4)
+        # ── Gimbal Disc ──
+        disc = QRadialGradient(cx, cy - radius * 0.2, radius * 1.3)
         disc.setColorAt(0.0, QColor("#FFFFFF"))
-        disc.setColorAt(0.8, COL_CARD_ALT)
-        disc.setColorAt(1.0, QColor("#E2E8F0"))
-        p.setPen(QPen(COL_BORDER, 1.5))
+        disc.setColorAt(0.75, QColor("#F8FAFC"))
+        disc.setColorAt(1.0, QColor("#F1F5F9"))
+        p.setPen(QPen(QColor("#CBD5E1"), 1.5))
         p.setBrush(QBrush(disc))
         p.drawEllipse(QPointF(cx, cy), radius, radius)
 
-        # inner reference rings
+        # ── Concentric Reference Rings (33%, 66%) ──
         for frac in (0.33, 0.66):
-            p.setPen(QPen(COL_BORDER, 1, Qt.DotLine))
+            p.setPen(QPen(QColor("#E2E8F0"), 1, Qt.DotLine))
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(QPointF(cx, cy), radius * frac, radius * frac)
 
-        # crosshair
-        p.setPen(QPen(COL_DIVIDER, 1))
+        # ── Crosshair ──
+        p.setPen(QPen(QColor("#E2E8F0"), 1))
         p.drawLine(int(cx - radius), int(cy), int(cx + radius), int(cy))
         p.drawLine(int(cx), int(cy - radius), int(cx), int(cy + radius))
 
-        # deadzone circle
-        dead_r = radius * 0.07
-        dead_col = QColor(COL_ERR)
-        dead_col.setAlpha(140)
-        p.setPen(QPen(dead_col, 1.2, Qt.DashLine))
-        fill_col = QColor(COL_ERR)
-        fill_col.setAlpha(25)
-        p.setBrush(QBrush(fill_col))
+        # ── Center Deadzone (Subtle sky blue) ──
+        dead_r = radius * 0.08
+        p.setPen(QPen(QColor("#BAE6FD"), 1))
+        p.setBrush(QBrush(QColor(186, 230, 253, 60)))
         p.drawEllipse(QPointF(cx, cy), dead_r, dead_r)
 
-        # trail
+        # ── Motion Trail ──
         n_trail = len(self._trail_points)
         for i, (tx, ty) in enumerate(self._trail_points):
-            t_alpha = int(30 + 100 * (i / max(n_trail, 1)))
+            t_alpha = int(25 + 90 * (i / max(n_trail, 1)))
             tx_px = cx + (tx - 0.5) * 2 * radius
             ty_px = cy + (ty - 0.5) * 2 * radius
-            trail_r = 2.5 + 2.2 * (i / max(n_trail, 1))
+            trail_r = 2.0 + 2.0 * (i / max(n_trail, 1))
             tc = QColor(COL_ACCENT_LT)
             tc.setAlpha(t_alpha)
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(tc))
             p.drawEllipse(QPointF(tx_px, ty_px), trail_r, trail_r)
 
-        # knob position
-        sx = cx + (self._x - 0.5) * 2 * radius
-        sy = cy + (self._y - 0.5) * 2 * radius
+        # ── Stick Knob Coordinates ──
+        # Batasi posisi knob agar tidak keluar dari piringan
+        dx = (self._x - 0.5) * 2 * radius
+        dy = (self._y - 0.5) * 2 * radius
+        dist = math.sqrt(dx * dx + dy * dy)
+        max_dist = radius - 3.0
+        if dist > max_dist and dist > 0:
+            scale = max_dist / dist
+            dx *= scale
+            dy *= scale
+        sx = cx + dx
+        sy = cy + dy
 
-        # connector line center → knob
-        p.setPen(QPen(COL_ACCENT, 2.0, Qt.SolidLine))
-        p.drawLine(int(cx), int(cy), int(sx), int(sy))
+        # ── Connector Line: Center → Knob ──
+        p.setPen(QPen(COL_ACCENT, 2.0, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx, cy), QPointF(sx, sy))
 
-        # knob glow
-        knob = radius * 0.16
-        for scale, alpha in ((2.8, 22), (2.0, 40), (1.5, 70)):
-            gc = QColor(COL_ACCENT_2)
-            gc.setAlpha(alpha)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(gc))
-            p.drawEllipse(QPointF(sx, sy), knob * scale, knob * scale)
-
-        # knob body
-        knob_grad = QRadialGradient(sx - knob * 0.3, sy - knob * 0.35, knob * 1.4)
-        knob_grad.setColorAt(0.0, QColor("#FFFFFF"))
-        knob_grad.setColorAt(0.5, COL_ACCENT_XLT)
-        knob_grad.setColorAt(1.0, COL_ACCENT)
-        p.setPen(QPen(COL_ACCENT_DK, 1.4))
-        p.setBrush(QBrush(knob_grad))
-        p.drawEllipse(QPointF(sx, sy), knob, knob)
-
-        # specular
-        spec = QRadialGradient(sx - knob * 0.3, sy - knob * 0.35, knob * 0.55)
-        spec.setColorAt(0.0, QColor(255, 255, 255, 200))
-        spec.setColorAt(1.0, QColor(255, 255, 255, 0))
+        # ── Knob Ambient Glow ──
+        knob_r = max(7.5, radius * 0.13)
+        glow_col = QColor(COL_ACCENT)
+        glow_col.setAlpha(30)
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(spec))
-        p.drawEllipse(QPointF(sx - knob * 0.2, sy - knob * 0.25),
-                      knob * 0.45, knob * 0.35)
+        p.setBrush(QBrush(glow_col))
+        p.drawEllipse(QPointF(sx, sy), knob_r * 2.0, knob_r * 2.0)
 
-        # ── axis-X label: dedicated vertical gutter to the right of the pad,
-        # rotated so it never collides with the pad or the readout pills ──
-        p.save()
-        gutter_rect = QRectF(pad_right + 6, pad_top, gutter - 6, pad_bottom - pad_top)
-        p.translate(gutter_rect.center())
-        p.rotate(90)
-        rotated_rect = QRectF(-gutter_rect.height()/2, -gutter_rect.width()/2,
-                              gutter_rect.height(), gutter_rect.width())
-        p.setPen(COL_SUBTEXT)
-        p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.6))
-        p.drawText(rotated_rect, Qt.AlignCenter, self._vx_label.upper())
-        p.restore()
+        # ── Knob Main Body ──
+        knob_grad = QRadialGradient(sx - knob_r * 0.3, sy - knob_r * 0.35, knob_r * 1.3)
+        knob_grad.setColorAt(0.0, QColor("#60A5FA"))
+        knob_grad.setColorAt(0.5, COL_ACCENT)
+        knob_grad.setColorAt(1.0, COL_ACCENT_DK)
+        p.setPen(QPen(QColor("#FFFFFF"), 1.5))
+        p.setBrush(QBrush(knob_grad))
+        p.drawEllipse(QPointF(sx, sy), knob_r, knob_r)
 
-        # ── Zone 4: footer readout — two separate pills, never overlapping ──
-        val_x = int(self._x * 255)
-        val_y = int((1.0 - self._y) * 255)
-        pill_gap = 8.0
-        pill_w = (rect.width() - 28 - pill_gap) / 2.0
-        pill_left = QRectF(rect.left() + 14, footer_top, pill_w, footer_h)
-        pill_right = QRectF(pill_left.right() + pill_gap, footer_top, pill_w, footer_h)
+        # ── Knob Center Pip (Precision Dot) ──
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor("#FFFFFF")))
+        p.drawEllipse(QPointF(sx, sy), 2.2, 2.2)
 
-        for pill, lbl, val, col in (
-            (pill_left, self._vy_label, val_y, COL_ACCENT),
+        # ── Zone 3: Footer Readout Pills Drawing ──
+        pill_defs = [
+            (pill_left,  self._vy_label, val_y, COL_ACCENT),
             (pill_right, self._vx_label, val_x, COL_ACCENT_DK),
-        ):
-            p.setPen(QPen(COL_BORDER, 1))
-            p.setBrush(QBrush(COL_CARD_ALT))
-            p.drawRoundedRect(pill, 7, 7)
+        ]
 
+        for pill, lbl, val, col in pill_defs:
+            p.setPen(QPen(QColor("#E2E8F0"), 1))
+            p.setBrush(QBrush(QColor("#F8FAFC")))
+            p.drawRoundedRect(pill, 8, 8)
+
+            # Indicator Dot
             dot_x = pill.left() + 12
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(col))
-            p.drawEllipse(QPointF(dot_x, pill.top() + 10), 3, 3)
+            p.drawEllipse(QPointF(dot_x, pill.center().y()), 3.5, 3.5)
+
+            # Axis Name Label
             p.setPen(COL_SUBTEXT)
-            p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.2))
-            p.drawText(QRectF(dot_x + 8, pill.top() + 2, pill.width() - 20, 12),
+            p.setFont(qfont(FONT_UI, 7.5, QFont.Bold, letter_spacing=1.0))
+            p.drawText(QRectF(dot_x + 8, pill.top() + 4, pill.width() - 55, pill.height() - 8),
                        Qt.AlignLeft | Qt.AlignVCenter, lbl.upper())
 
+            # Numerical Value
             p.setPen(COL_TEXT)
             p.setFont(qfont(FONT_MONO, 13, QFont.Bold))
-            p.drawText(QRectF(pill.left() + 8, pill.top() + 13, pill.width() - 16, 18),
-                       Qt.AlignLeft | Qt.AlignVCenter, f"{val:>3}")
+            p.drawText(QRectF(pill.right() - 48, pill.top() + 4, 40, pill.height() - 8),
+                       Qt.AlignRight | Qt.AlignVCenter, f"{val:>3}")
 
         p.end()
 
@@ -1120,77 +1138,6 @@ class MetricCard(QFrame):
                    Qt.AlignLeft | Qt.AlignVCenter, self._unit.upper())
 
         p.end()
-
-
-# ───────────────────── Header Bar ─────────────────────
-
-class HeaderBar(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(64)
-        self.setStyleSheet(f"background:{COL_CARD.name()};")
-        add_shadow(self, blur=16, dy=2, alpha=22)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(22, 10, 22, 10)
-        lay.setSpacing(14)
-
-        # square brand mark
-        self._logo = QLabel("Q")
-        self._logo.setFixedSize(36, 36)
-        self._logo.setAlignment(Qt.AlignCenter)
-        self._logo.setStyleSheet(
-            f"background:{COL_ACCENT.name()};"
-            f"color:white;"
-            f"border-radius:10px;"
-            f"font-family:{CSS_TITLE};"
-            f"font-weight:800;"
-            f"font-size:18px;"
-            f"letter-spacing:0px;"
-        )
-        lay.addWidget(self._logo)
-
-        # wordmark "QMBED"
-        self._title = QLabel("QMBED")
-        self._title.setStyleSheet(
-            f"color:{COL_TEXT.name()};"
-            f"font-family:{CSS_TITLE};"
-            f"font-weight:800;"
-            f"font-size:22px;"
-            f"letter-spacing:8px;"
-            f"padding-left:2px;"
-        )
-        lay.addWidget(self._title)
-
-        lay.addStretch()
-
-        self._status = QLabel("\u25CF  DISCONNECTED")
-        self._status.setStyleSheet(
-            "color:#B91C1C; background:#FEE2E2;"
-            f"font-family:{CSS_UI}; font-weight:700; font-size:10px;"
-            "letter-spacing:2px;"
-            "padding:7px 14px; border-radius:14px;"
-        )
-        lay.addWidget(self._status)
-
-    def set_status(self, connected, port=None):
-        if connected:
-            txt = f"\u25CF  CONNECTED  {port or ''}".strip()
-            self._status.setStyleSheet(
-                "color:#15803D; background:#DCFCE7;"
-                f"font-family:{CSS_UI}; font-weight:700; font-size:10px;"
-                "letter-spacing:2px;"
-                "padding:7px 14px; border-radius:14px;"
-            )
-        else:
-            txt = "\u25CF  DISCONNECTED"
-            self._status.setStyleSheet(
-                "color:#B91C1C; background:#FEE2E2;"
-                f"font-family:{CSS_UI}; font-weight:700; font-size:10px;"
-                "letter-spacing:2px;"
-                "padding:7px 14px; border-radius:14px;"
-            )
-        self._status.setText(txt)
 
 
 # ───────────────────── Secondary Info Bar ─────────────────────
@@ -1865,27 +1812,23 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         # ── header ──
-        self._header = HeaderBar()
+        self._header = self._build_header()
         root.addWidget(self._header)
 
         # ── body ──
         body = QWidget()
         body_lay = QVBoxLayout(body)
-        body_lay.setContentsMargins(16, 14, 16, 14)
-        body_lay.setSpacing(12)
+        body_lay.setContentsMargins(16, 12, 16, 12)
+        body_lay.setSpacing(10)
         root.addWidget(body, stretch=1)
 
-        # toolbar
-        body_lay.addWidget(self._build_toolbar())
-
-        # tabs
-        self._tabs = QTabWidget()
-        self._style_tabs(self._tabs)
-        self._tabs.addTab(self._build_attitude_tab(), "ATTITUDE")
-        self._tabs.addTab(self._build_rc_tab(), "RC CONTROL")
-        self._tabs.addTab(self._build_smc_tab(), "SMC TUNING")
-        self._tabs.addTab(self._build_bench_tab(), "BENCH TEST")
-        body_lay.addWidget(self._tabs, stretch=1)
+        # ── Main Stacked Content Views (Bebas Tab Bar, Full Clean View!) ──
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_attitude_tab())  # 0
+        self._stack.addWidget(self._build_rc_tab())        # 1
+        self._stack.addWidget(self._build_smc_tab())       # 2
+        self._stack.addWidget(self._build_bench_tab())     # 3
+        body_lay.addWidget(self._stack, stretch=1)
 
         # ── timers ──
         self._serial_timer = QTimer(self)
@@ -1902,102 +1845,266 @@ class MainWindow(QMainWindow):
 
         self._refresh_ports()
 
-    # ────────── styling helpers ──────────
+    # ────────── navigation helpers ──────────
 
-    def _style_tabs(self, tabs: QTabWidget):
-        tabs.setDocumentMode(True)
-        tabs.tabBar().setExpanding(False)
-        tabs.setStyleSheet(f"""
-            QTabWidget::pane {{
-                border: none;
-                background: transparent;
-                top: -1px;
-            }}
-            QTabBar {{
-                background: transparent;
-                qproperty-drawBase: 0;
-            }}
-            QTabBar::tab {{
-                background: {COL_CARD_ALT.name()};
-                color: {COL_SUBTEXT.name()};
-                border: 1px solid {COL_BORDER.name()};
-                border-radius: 8px;
-                padding: 8px 22px;
-                margin-right: 6px;
-                margin-bottom: 6px;
-                font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                letter-spacing: 2px;
-                min-width: 110px;
-            }}
-            QTabBar::tab:selected {{
-                background: {COL_ACCENT.name()};
-                color: white;
-                border: 1px solid {COL_ACCENT_DK.name()};
-            }}
-            QTabBar::tab:hover:!selected {{
-                background: {COL_ACCENT_XLT.name()};
-                color: {COL_ACCENT_DK.name()};
-                border-color: {COL_ACCENT_LT.name()};
-            }}
-        """)
+    def _create_nav_icon(self, icon_type: str, size: int = 20) -> QIcon:
+        """Buat ikon vektor kustom bertema Sky Blue & White secara matematis via QPainter."""
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.Antialiasing)
 
-    # ────────── toolbar ──────────
+        center = size / 2.0
+        r = size * 0.44
 
-    def _build_toolbar(self):
-        tb = QFrame()
-        tb.setObjectName("Toolbar")
-        tb.setFixedHeight(54)
-        tb.setStyleSheet(f"""
-            #Toolbar {{
+        if icon_type == "ATTITUDE":
+            # ── Artificial Horizon / Gyro Icon ──
+            p.setPen(QPen(COL_ACCENT_DK, 1.4))
+            p.setBrush(QBrush(QColor("#E0F2FE")))
+            p.drawEllipse(QPointF(center, center), r, r)
+
+            ground_path = QPainterPath()
+            ground_path.moveTo(center - r, center)
+            ground_path.arcTo(center - r, center - r, 2 * r, 2 * r, 180, 180)
+            ground_path.closeSubpath()
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor("#F1F5F9")))
+            p.drawPath(ground_path)
+
+            p.setPen(QPen(COL_ACCENT_DK, 1.4))
+            p.drawLine(QPointF(center - r, center), QPointF(center + r, center))
+
+            p.setPen(QPen(COL_ACCENT, 1.6))
+            p.drawLine(QPointF(center - 3.5, center), QPointF(center + 3.5, center))
+            p.drawLine(QPointF(center, center - 2.5), QPointF(center, center + 2.5))
+
+        elif icon_type == "CONTROL":
+            # ── Gimbal Stick / Crosshair Icon ──
+            p.setPen(QPen(QColor("#CBD5E1"), 1.2))
+            p.setBrush(QBrush(QColor("#F0F9FF")))
+            p.drawEllipse(QPointF(center, center), r, r)
+
+            p.setPen(QPen(QColor("#BAE6FD"), 1))
+            p.drawLine(QPointF(center - r + 2, center), QPointF(center + r - 2, center))
+            p.drawLine(QPointF(center, center - r + 2), QPointF(center, center + r - 2))
+
+            knob_x = center + 2.2
+            knob_y = center - 2.2
+            knob_r = 3.2
+            p.setPen(QPen(QColor("#FFFFFF"), 1.0))
+            p.setBrush(QBrush(COL_ACCENT))
+            p.drawEllipse(QPointF(knob_x, knob_y), knob_r, knob_r)
+
+        elif icon_type == "SMC":
+            # ── Sliding Mode / Tuning Response Wave Icon ──
+            rect_box = QRectF(center - r, center - r, 2 * r, 2 * r)
+            p.setPen(QPen(QColor("#E2E8F0"), 1))
+            p.setBrush(QBrush(QColor("#F8FAFC")))
+            p.drawRoundedRect(rect_box, 4, 4)
+
+            p.setPen(QPen(QColor("#CBD5E1"), 1, Qt.DotLine))
+            p.drawLine(QPointF(rect_box.left() + 2, center), QPointF(rect_box.right() - 2, center))
+
+            path = QPainterPath()
+            path.moveTo(rect_box.left() + 2, center + r * 0.65)
+            path.cubicTo(
+                rect_box.left() + r * 0.6, center - r * 0.75,
+                rect_box.left() + r * 1.3, center + r * 0.35,
+                rect_box.right() - 2, center
+            )
+            p.setPen(QPen(COL_ACCENT, 1.6, Qt.SolidLine, Qt.RoundCap))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+
+        elif icon_type == "BENCH":
+            # ── Quad-X Drone Motor Frame Icon ──
+            d = r * 0.68
+            p.setPen(QPen(QColor("#64748B"), 1.4, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(center - d, center - d), QPointF(center + d, center + d))
+            p.drawLine(QPointF(center - d, center + d), QPointF(center + d, center - d))
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(COL_ACCENT_DK))
+            p.drawEllipse(QPointF(center, center), 2.2, 2.2)
+
+            motor_r = 2.2
+            for mx, my in [(-d, -d), (d, -d), (-d, d), (d, d)]:
+                p.setPen(QPen(QColor("#FFFFFF"), 0.8))
+                p.setBrush(QBrush(COL_ACCENT))
+                p.drawEllipse(QPointF(center + mx, center + my), motor_r, motor_r)
+
+        p.end()
+        return QIcon(pixmap)
+
+    def _show_nav_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
                 background: {COL_CARD.name()};
                 border: 1px solid {COL_BORDER.name()};
-                border-radius: 10px;
+                border-radius: 8px;
+                padding: 6px;
+            }}
+            QMenu::item {{
+                background: transparent;
+                color: {COL_TEXT.name()};
+                padding: 8px 18px 8px 12px;
+                border-radius: 5px;
+                font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                letter-spacing: 1.2px;
+            }}
+            QMenu::item:selected {{
+                background: {COL_ACCENT_XLT.name()};
+                color: {COL_ACCENT_DK.name()};
             }}
         """)
-        add_shadow(tb, blur=14, dy=2, alpha=18)
 
-        lay = QHBoxLayout(tb)
-        lay.setContentsMargins(14, 8, 14, 8)
+        views = [
+            ("ATTITUDE", 0, "ATTITUDE", self._create_nav_icon("ATTITUDE")),
+            ("CONTROL", 1, "CONTROL", self._create_nav_icon("CONTROL")),
+            ("SMC TUNING", 2, "SMC TUNING", self._create_nav_icon("SMC")),
+            ("BENCH TEST", 3, "BENCH TEST", self._create_nav_icon("BENCH")),
+        ]
+        for title, idx, short_name, icon in views:
+            action = QAction(icon, f"  {title}", self)
+            action.triggered.connect(lambda checked=False, i=idx, name=short_name: self._switch_page(i, name))
+            menu.addAction(action)
+
+        menu.exec(self._nav_btn.mapToGlobal(QPoint(self._nav_btn.width() - 160, self._nav_btn.height() + 4)))
+
+    def _switch_page(self, index: int, label_text: str):
+        if hasattr(self, "_stack"):
+            self._stack.setCurrentIndex(index)
+        if hasattr(self, "_nav_btn"):
+            self._nav_btn.setText(f"\u2630  {label_text}  \u25BE")
+
+    # ────────── unified header ──────────
+
+    def _build_header(self):
+        header = QFrame()
+        header.setObjectName("UnifiedHeader")
+        header.setFixedHeight(56)
+        header.setStyleSheet(f"""
+            #UnifiedHeader {{
+                background: {COL_CARD.name()};
+                border-bottom: 1px solid {COL_BORDER.name()};
+            }}
+        """)
+        add_shadow(header, blur=18, dy=2, alpha=20)
+
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(18, 0, 18, 0)
         lay.setSpacing(10)
 
-        lbl = QLabel("SERIAL PORT")
-        lbl.setStyleSheet(
-            f"color:{COL_SUBTEXT.name()};"
-            f"font-family:{CSS_UI};"
-            f"font-weight:700; font-size:9px; letter-spacing:3px;"
-        )
-        lay.addWidget(lbl)
+        # ── Brand (Left) ──
+        self._logo = QLabel("Q")
+        self._logo.setFixedSize(30, 30)
+        self._logo.setAlignment(Qt.AlignCenter)
+        self._logo.setStyleSheet(f"""
+            background: {COL_ACCENT.name()};
+            color: white;
+            border-radius: 7px;
+            font-family: {CSS_TITLE};
+            font-weight: 800;
+            font-size: 15px;
+        """)
+        lay.addWidget(self._logo, 0, Qt.AlignVCenter)
+
+        self._title = QLabel("QMBED")
+        self._title.setStyleSheet(f"""
+            color: {COL_TEXT.name()};
+            font-family: {CSS_TITLE};
+            font-weight: 800;
+            font-size: 15px;
+            letter-spacing: 2px;
+        """)
+        lay.addWidget(self._title, 0, Qt.AlignVCenter)
+
+        gcs_badge = QLabel("GCS")
+        gcs_badge.setStyleSheet("""
+            color: #0369A1;
+            background: #E0F2FE;
+            border: 1px solid #BAE6FD;
+            border-radius: 4px;
+            padding: 1px 6px;
+            font-weight: 800;
+            font-size: 8px;
+            letter-spacing: 1px;
+        """)
+        lay.addWidget(gcs_badge, 0, Qt.AlignVCenter)
+
+        # Divider 1
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.VLine)
+        sep1.setStyleSheet(f"color: {COL_BORDER.name()};")
+        sep1.setFixedHeight(22)
+        lay.addWidget(sep1, 0, Qt.AlignVCenter)
+
+        # ── Serial Connection Controls ──
+        port_lbl = QLabel("PORT")
+        port_lbl.setStyleSheet(f"""
+            color: {COL_SUBTEXT.name()};
+            font-family: {CSS_UI};
+            font-weight: 700;
+            font-size: 8.5px;
+            letter-spacing: 1.2px;
+        """)
+        lay.addWidget(port_lbl, 0, Qt.AlignVCenter)
 
         self._port_cb = QComboBox()
-        self._port_cb.setMinimumWidth(160)
-        self._port_cb.setFixedHeight(32)
+        self._port_cb.setMinimumWidth(125)
+        self._port_cb.setFixedHeight(30)
         self._port_cb.setStyleSheet(f"""
             QComboBox {{
                 background: {COL_CARD_ALT.name()};
                 color: {COL_TEXT.name()};
                 border: 1px solid {COL_BORDER.name()};
                 border-radius: 6px;
-                padding: 4px 10px;
+                padding-left: 8px;
+                padding-right: 24px;
+                padding-top: 0px;
+                padding-bottom: 0px;
                 font-family: {CSS_MONO};
                 font-size: 11px;
+                font-weight: 600;
             }}
-            QComboBox:hover {{ border-color: {COL_ACCENT.name()}; }}
-            QComboBox::drop-down {{ border: none; width: 22px; }}
+            QComboBox:hover {{
+                border-color: {COL_ACCENT.name()};
+                background: {COL_CARD.name()};
+            }}
+            QComboBox:focus {{ border-color: {COL_ACCENT.name()}; }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 18px;
+                border: none;
+                margin-right: 4px;
+            }}
+            QComboBox::down-arrow {{
+                width: 0px;
+                height: 0px;
+                border-left: 3.5px solid transparent;
+                border-right: 3.5px solid transparent;
+                border-top: 4.5px solid #64748B;
+            }}
             QComboBox QAbstractItemView {{
                 background: {COL_CARD.name()};
                 color: {COL_TEXT.name()};
                 border: 1px solid {COL_BORDER.name()};
+                border-radius: 6px;
+                padding: 4px;
                 selection-background-color: {COL_ACCENT_XLT.name()};
                 selection-color: {COL_TEXT.name()};
                 outline: none;
                 font-family: {CSS_MONO};
+                font-size: 11px;
             }}
         """)
-        lay.addWidget(self._port_cb)
+        lay.addWidget(self._port_cb, 0, Qt.AlignVCenter)
 
         self._refresh_btn = QPushButton("\u21BB")
-        self._refresh_btn.setFixedSize(32, 32)
-        self._refresh_btn.setToolTip("Refresh ports")
+        self._refresh_btn.setFixedSize(30, 30)
+        self._refresh_btn.setToolTip("Refresh COM ports")
         self._refresh_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {COL_CARD_ALT.name()};
@@ -2006,7 +2113,7 @@ class MainWindow(QMainWindow):
                 border-radius: 6px;
                 font-family: {CSS_UI};
                 font-weight: 700;
-                font-size: 14px;
+                font-size: 13px;
             }}
             QPushButton:hover {{
                 background: {COL_ACCENT_XLT.name()};
@@ -2014,68 +2121,161 @@ class MainWindow(QMainWindow):
             }}
         """)
         self._refresh_btn.clicked.connect(self._refresh_ports)
-        lay.addWidget(self._refresh_btn)
+        lay.addWidget(self._refresh_btn, 0, Qt.AlignVCenter)
 
         self._connect_btn = QPushButton("CONNECT")
-        self._connect_btn.setFixedHeight(32)
+        self._connect_btn.setFixedHeight(30)
         self._connect_btn.setCursor(Qt.PointingHandCursor)
         self._apply_connect_style(False)
         self._connect_btn.clicked.connect(self._toggle_serial)
-        lay.addWidget(self._connect_btn)
+        lay.addWidget(self._connect_btn, 0, Qt.AlignVCenter)
 
-        # separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.VLine)
-        sep.setStyleSheet(f"color:{COL_BORDER.name()};")
-        sep.setFixedHeight(28)
-        lay.addWidget(sep)
+        # Divider 2
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.VLine)
+        sep2.setStyleSheet(f"color: {COL_BORDER.name()};")
+        sep2.setFixedHeight(22)
+        lay.addWidget(sep2, 0, Qt.AlignVCenter)
 
-        self._cal_imu_btn = self._make_secondary_btn("CALIBRATE IMU",
+        # ── Action Buttons ──
+        self._cal_imu_btn = self._make_secondary_btn("CAL IMU",
                                                     tooltip="Zero roll/pitch/yaw filter.")
         self._cal_imu_btn.clicked.connect(self._calibrate_imu)
-        lay.addWidget(self._cal_imu_btn)
+        lay.addWidget(self._cal_imu_btn, 0, Qt.AlignVCenter)
 
         self._cal_stick_btn = self._make_secondary_btn(
-            "CALIBRATE STICKS",
+            "CAL STICKS",
             tooltip="Hold sticks centered; sample and set center as origin."
         )
         self._cal_stick_btn.setEnabled(False)
         self._cal_stick_btn.clicked.connect(self._start_stick_calibration)
-        lay.addWidget(self._cal_stick_btn)
+        lay.addWidget(self._cal_stick_btn, 0, Qt.AlignVCenter)
 
         self._arm_btn = QPushButton("ARM")
-        self._arm_btn.setFixedHeight(32)
+        self._arm_btn.setFixedHeight(30)
         self._arm_btn.setCursor(Qt.PointingHandCursor)
         self._arm_btn.setToolTip("Arm / Disarm drone motors.")
         self._arm_btn.setEnabled(False)
         self._apply_arm_style(False)
         self._arm_btn.clicked.connect(self._toggle_arm)
-        lay.addWidget(self._arm_btn)
+        lay.addWidget(self._arm_btn, 0, Qt.AlignVCenter)
 
         self._reset_stick_btn = self._make_secondary_btn(
-            "RESET STICK CAL",
+            "RESET CAL",
             variant="danger",
             tooltip="Discard stick calibration center."
         )
         self._reset_stick_btn.setVisible(False)
         self._reset_stick_btn.clicked.connect(self._reset_stick_calibration)
-        lay.addWidget(self._reset_stick_btn)
+        lay.addWidget(self._reset_stick_btn, 0, Qt.AlignVCenter)
 
-        lay.addStretch()
+        lay.addStretch(1)
 
-        self._hint = QLabel("Awaiting connection")
-        self._hint.setStyleSheet(
-            f"color:{COL_MUTED.name()};"
-            f"font-family:{CSS_UI};"
-            f"font-size:10px; font-style:italic;"
+        # ── Telemetry Message & Link Status ──
+        self._msg = QLabel("\u2139  Awaiting connection")
+        self._msg.setFixedHeight(26)
+        self._msg.setMaximumWidth(300)
+        self._msg.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._msg.setStyleSheet(
+            f"color:#475569; background:#F1F5F9; border:1px solid #E2E8F0;"
+            f"border-radius:13px; padding:0 12px;"
+            f"font-family:{CSS_UI}; font-weight:600; font-size:9.5px;"
         )
-        lay.addWidget(self._hint)
+        lay.addWidget(self._msg, 0, Qt.AlignVCenter)
 
-        return tb
+        self._status = QLabel("\u25CF  DISCONNECTED")
+        self._status.setFixedHeight(26)
+        self._status.setAlignment(Qt.AlignCenter)
+        self._status.setStyleSheet(
+            "color:#B91C1C; background:#FEE2E2; border:1px solid #FECACA;"
+            f"font-family:{CSS_UI}; font-weight:700; font-size:9.5px;"
+            "letter-spacing:1.5px;"
+            "padding:0 12px; border-radius:13px;"
+        )
+        lay.addWidget(self._status, 0, Qt.AlignVCenter)
+
+        # Divider 3
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.VLine)
+        sep3.setStyleSheet(f"color: {COL_BORDER.name()};")
+        sep3.setFixedHeight(22)
+        lay.addWidget(sep3, 0, Qt.AlignVCenter)
+
+        # ── Hamburger Navigation Button (Far Right) ──
+        self._nav_btn = QPushButton("\u2630  ATTITUDE  \u25BE")
+        self._nav_btn.setFixedHeight(30)
+        self._nav_btn.setCursor(Qt.PointingHandCursor)
+        self._nav_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COL_CARD_ALT.name()};
+                color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 6px;
+                font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                letter-spacing: 1px;
+                padding: 0 12px;
+            }}
+            QPushButton:hover {{
+                background: {COL_ACCENT_XLT.name()};
+                border-color: {COL_ACCENT.name()};
+                color: {COL_ACCENT_DK.name()};
+            }}
+        """)
+        self._nav_btn.clicked.connect(self._show_nav_menu)
+        lay.addWidget(self._nav_btn, 0, Qt.AlignVCenter)
+
+        return header
+
+    def set_hint(self, text, level="info"):
+        """Perbarui status pesan di header bar. Level: info / ok / warn / err."""
+        self.set_message(text, level=level)
+
+    def set_message(self, text, level="info"):
+        """Tampilkan pesan status/aktivitas di pill header."""
+        if not hasattr(self, "_msg"):
+            return
+        markers = {"info": "\u2139", "ok": "\u2713", "warn": "\u26A0", "err": "\u2717"}
+        mark = markers.get(level, "\u2139")
+        colors = {
+            "info": ("#475569", "#F1F5F9", "#E2E8F0"),
+            "ok":   ("#166534", "#DCFCE7", "#BBF7D0"),
+            "warn": ("#92400E", "#FEF3C7", "#FCD34D"),
+            "err":  ("#991B1B", "#FEE2E2", "#FCA5A5"),
+        }
+        fg, bg, bd = colors.get(level, colors["info"])
+        if len(text) > 42:
+            text = text[:40] + "\u2026"
+        self._msg.setText(f"{mark}  {text}")
+        self._msg.setStyleSheet(
+            f"color:{fg}; background:{bg}; border:1px solid {bd};"
+            f"border-radius:13px; padding:0 12px;"
+            f"font-family:{CSS_UI}; font-weight:600; font-size:9.5px;"
+        )
+
+    def set_status(self, connected, port=None):
+        if not hasattr(self, "_status"):
+            return
+        if connected:
+            txt = f"\u25CF  CONNECTED  {port or ''}".strip()
+            self._status.setStyleSheet(
+                "color:#15803D; background:#DCFCE7; border:1px solid #BBF7D0;"
+                f"font-family:{CSS_UI}; font-weight:700; font-size:9.5px;"
+                "letter-spacing:1.5px;"
+                "padding:0 12px; border-radius:13px;"
+            )
+        else:
+            txt = "\u25CF  DISCONNECTED"
+            self._status.setStyleSheet(
+                "color:#B91C1C; background:#FEE2E2; border:1px solid #FECACA;"
+                f"font-family:{CSS_UI}; font-weight:700; font-size:9.5px;"
+                "letter-spacing:1.5px;"
+                "padding:0 12px; border-radius:13px;"
+            )
+        self._status.setText(txt)
 
     def _make_secondary_btn(self, text, variant="default", tooltip=""):
         btn = QPushButton(text)
-        btn.setFixedHeight(32)
+        btn.setFixedHeight(30)
         btn.setCursor(Qt.PointingHandCursor)
         if tooltip:
             btn.setToolTip(tooltip)
@@ -2086,9 +2286,9 @@ class MainWindow(QMainWindow):
                     color: #B91C1C;
                     border: 1px solid #FCA5A5;
                     border-radius: 6px;
-                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                    letter-spacing:2px;
-                    padding: 0 14px;
+                    font: bold 9.5px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                    letter-spacing: 1.2px;
+                    padding: 0 10px;
                 }}
                 QPushButton:hover {{
                     background: #FEE2E2;
@@ -2104,14 +2304,15 @@ class MainWindow(QMainWindow):
                 QPushButton {{
                     background: {COL_CARD.name()};
                     color: {COL_ACCENT.name()};
-                    border: 1px solid {COL_ACCENT.name()};
+                    border: 1px solid {COL_ACCENT_LT.name()};
                     border-radius: 6px;
-                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                    letter-spacing:2px;
-                    padding: 0 14px;
+                    font: bold 9.5px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                    letter-spacing: 1.2px;
+                    padding: 0 10px;
                 }}
                 QPushButton:hover {{
                     background: {COL_ACCENT_XLT.name()};
+                    border-color: {COL_ACCENT.name()};
                 }}
                 QPushButton:disabled {{
                     background: {COL_CARD_ALT.name()};
@@ -2122,31 +2323,40 @@ class MainWindow(QMainWindow):
         return btn
 
     def _apply_connect_style(self, connected):
+        if not hasattr(self, "_connect_btn"):
+            return
         if connected:
             self._connect_btn.setText("DISCONNECT")
             self._connect_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: #FEE2E2; color: #B91C1C;
-                    border: 1px solid #FCA5A5;
+                    background: #DCFCE7;
+                    color: #15803D;
+                    border: 1px solid #86EFAC;
                     border-radius: 6px;
-                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                    letter-spacing:2px;
-                    padding: 0 16px;
+                    font: bold 9.5px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                    letter-spacing: 1.2px;
+                    padding: 0 12px;
                 }}
-                QPushButton:hover {{ background: #FCA5A5; color:#7F1D1D; }}
+                QPushButton:hover {{
+                    background: #BBF7D0;
+                    border-color: #4ADE80;
+                }}
             """)
         else:
             self._connect_btn.setText("CONNECT")
             self._connect_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: {COL_ACCENT.name()}; color: white;
-                    border: none; border-radius: 6px;
-                    font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                    letter-spacing:2px;
-                    padding: 0 16px;
+                    background: {COL_ACCENT.name()};
+                    color: white;
+                    border: 1px solid {COL_ACCENT_DK.name()};
+                    border-radius: 6px;
+                    font: bold 9.5px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                    letter-spacing: 1.2px;
+                    padding: 0 12px;
                 }}
-                QPushButton:hover {{ background: {COL_ACCENT_DK.name()}; }}
-                QPushButton:disabled {{ background: {COL_MUTED.name()}; color:white; }}
+                QPushButton:hover {{
+                    background: {COL_ACCENT_DK.name()};
+                }}
             """)
 
     def _apply_arm_style(self, armed: bool):
@@ -2156,37 +2366,34 @@ class MainWindow(QMainWindow):
                 continue
             if armed:
                 btn.setText("DISARM")
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: #DC2626; color: white;
-                        border: 1px solid #B91C1C;
-                        border-radius: 6px;
-                        font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                        letter-spacing: 2px;
-                        padding: 0 14px;
-                    }}
-                    QPushButton:hover {{
-                        background: #B91C1C;
-                    }}
-                    QPushButton:disabled {{
-                        background: {COL_MUTED.name()};
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background: #EF4444;
                         color: white;
-                        border-color: {COL_BORDER.name()};
-                    }}
+                        border: 1px solid #DC2626;
+                        border-radius: 6px;
+                        font: bold 9.5px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                        letter-spacing: 1.2px;
+                        padding: 0 12px;
+                    }
+                    QPushButton:hover {
+                        background: #DC2626;
+                    }
                 """)
             else:
                 btn.setText("ARM")
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background: #FEF3C7; color: #B45309;
-                        border: 1px solid #FCD34D;
+                        background: {COL_CARD.name()};
+                        color: #DC2626;
+                        border: 1.5px solid #EF4444;
                         border-radius: 6px;
-                        font: bold 10px Inter, 'Segoe UI Variable', 'Segoe UI', 'SF Pro Display', system-ui, sans-serif;
-                        letter-spacing: 2px;
-                        padding: 0 14px;
+                        font: bold 9.5px Inter, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+                        letter-spacing: 1.2px;
+                        padding: 0 12px;
                     }}
                     QPushButton:hover {{
-                        background: #FDE68A; color: #92400E;
+                        background: #FEE2E2;
                     }}
                     QPushButton:disabled {{
                         background: {COL_CARD_ALT.name()};
@@ -2204,13 +2411,13 @@ class MainWindow(QMainWindow):
                 self._serial.write(cmd)
                 self._serial.flush()
             except Exception as e:
-                self._hint.setText(f"Serial write error: {e}")
+                self.set_hint(f"Serial write error: {e}", level="err")
                 return
 
         if self._armed:
-            self._hint.setText("Drone ARMING / ARMED (Motors Live)")
+            self.set_hint("Drone ARMING / ARMED (Motors Live)", level="warn")
         else:
-            self._hint.setText("Drone DISARMED (Safe)")
+            self.set_hint("Drone DISARMED (Safe)", level="ok")
 
     # ────────── tabs ──────────
 
@@ -2356,21 +2563,16 @@ class MainWindow(QMainWindow):
 
         # ── White & Sky Blue Warning Banner ──
         warn = QFrame()
-        warn.setStyleSheet("""
-            QFrame {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #F0F9FF, stop:1 #E0F2FE);
-                border: 1.5px solid #7DD3FC;
-                border-radius: 10px;
-            }
-        """)
+        warn.setStyleSheet("background: transparent; border: none;")
         wl = QHBoxLayout(warn)
         wl.setContentsMargins(14, 8, 14, 8)
         wl.setSpacing(12)
 
         icon_lbl = QLabel("⚠️")
         icon_lbl.setFont(qfont(FONT_UI, 12))
-        wl.addWidget(icon_lbl)
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setFixedWidth(28)
+        wl.addWidget(icon_lbl, 0, Qt.AlignVCenter)
 
         wtxt = QLabel("<b style='color:#0369A1; font-size:10px; letter-spacing:0.8px;'>PROPS-OFF BENCH TEST ONLY :</b> "
                       "<span style='color:#0F172A; font-size:10px; font-weight:500;'>Copot SEMUA propeller sebelum pengujian. "
@@ -2547,7 +2749,7 @@ class MainWindow(QMainWindow):
 
     def _apply_smc_parameters(self):
         if not self._serial or not self._serial.is_open:
-            self._hint.setText("Connect to remote before applying SMC parameters.")
+            self.set_hint("Connect to remote before applying SMC parameters.", level="warn")
             return
         values = self._smc_inputs
         command = "SMC {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}\n".format(
@@ -2557,9 +2759,9 @@ class MainWindow(QMainWindow):
         try:
             self._serial.write(command.encode("ascii"))
             self._serial.flush()
-            self._hint.setText("SMC parameters sent to remote and drone.")
+            self.set_hint("SMC parameters sent to remote and drone.", level="ok")
         except Exception as e:
-            self._hint.setText(f"SMC parameter write error: {e}")
+            self.set_hint(f"SMC parameter write error: {e}", level="err")
 
     # ────────── lifecycle ──────────
 
@@ -2585,7 +2787,7 @@ class MainWindow(QMainWindow):
         self._card_pitch.set_value(0)
         self._card_yaw.set_value(0)
         self._card_alt.set_value(0)
-        self._hint.setText("IMU calibrated \u2713")
+        self.set_hint("IMU calibrated \u2713", level="ok")
 
     # ────────── Stick calibration ──────────
     # ESP32 melakukan semua sampling & penyimpanan center. GUI hanya:
@@ -2607,7 +2809,7 @@ class MainWindow(QMainWindow):
             self._serial.write(b"CAL SAMPLE\n")
             self._serial.flush()
         except Exception as e:
-            self._hint.setText(f"Gagal kirim kalibrasi ke remote: {e}")
+            self.set_hint(f"Gagal kirim kalibrasi ke remote: {e}", level="err")
             self._on_calib_timeout()
             return
         self._calib_timer.start()
@@ -2671,7 +2873,7 @@ class MainWindow(QMainWindow):
             self._armed = False
             self._apply_arm_style(False)
             self._apply_connect_style(False)
-            self._header.set_status(False)
+            self.set_status(False)
             self._horizon.set_connected(False)
             self._cal_stick_btn.setEnabled(False)
             self._arm_btn.setEnabled(False)
@@ -2679,30 +2881,30 @@ class MainWindow(QMainWindow):
                 self._bench_arm_btn.setEnabled(False)
                 self._bench_arm_btn.setText("ARM")
                 self._apply_arm_style(False)
-            self._hint.setText("Disconnected")
+            self.set_hint("Disconnected", level="info")
             return
         if not HAS_SERIAL:
-            self._hint.setText("pyserial not installed")
+            self.set_hint("pyserial not installed", level="err")
             return
         port = self._port_cb.currentText()
         if not port or port.startswith("("):
-            self._hint.setText("Select a valid port")
+            self.set_hint("Select a valid port", level="warn")
             return
         try:
             self._serial = serial.Serial(port, 115200, timeout=0.02)
             self._buf = b""
             self._first_alt = True
             self._apply_connect_style(True)
-            self._header.set_status(True, port)
+            self.set_status(True, port)
             self._horizon.set_connected(True)
             self._cal_stick_btn.setEnabled(True)
             self._arm_btn.setEnabled(True)
             if hasattr(self, "_bench_arm_btn"):
                 self._bench_arm_btn.setEnabled(True)
-            self._hint.setText(f"Streaming from {port}")
+            self.set_hint(f"Streaming from {port}", level="ok")
         except Exception as e:
-            self._hint.setText(f"Error: {e}")
-            self._header.set_status(False)
+            self.set_hint(f"Error: {e}", level="err")
+            self.set_status(False)
 
     def _read_serial(self):
         if not self._serial or not self._serial.is_open:
