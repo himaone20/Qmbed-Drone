@@ -1,22 +1,3 @@
-
-"""
-Drone Telemetry Viewer - PySide6
-Dashboard telemetry drone bergaya Ground Control Station (GCS) profesional
-dengan tema Sky Blue & White.
-
-Data diterima dari SATU koneksi serial USB ke Remote (ESP32 + LoRa RA-02).
-Remote bertindak sebagai hub: mengirim joystick ke drone via LoRa sekaligus
-meneruskan telemetri balasan drone (IMU + altitude) ke laptop. Suhu (BMP280)
-tidak dipakai sama sekali pada proyek ini.
-  - [IMU] AX:.. AY:.. AZ:.. GX:.. GY:.. GZ:..    (BMI160 di drone)
-  - [BMP] P:..  A:..                             (BMP280 di drone, tanpa suhu)
-  - [TX]  R:..  T:..  Y:..  P:..                 (joystick remote ESP32)
-
-Tab :
-  - ATTITUDE   : artificial horizon + drone 3D + altitude tape + metric cards
-  - RC CONTROL : dual joystick (Mode 2) + readout raw/calibrated + calibrate
-"""
-
 import sys
 import os
 import json
