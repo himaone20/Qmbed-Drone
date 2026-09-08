@@ -83,13 +83,20 @@ struct DownlinkPacket {
   uint16_t press;        // hPa    x10
   int16_t  alt;          // meter  x100
   int16_t  roll, pitch;  // derajat x100, complementary filter onboard
-  int16_t  uRoll, uPitch, uYaw; // koreksi SMC PWM x100
+  int16_t  uRoll, uPitch, uYaw; // koreksi kontrol PWM x100 (PID output)
   uint16_t vbat;         // Volts x100 (contoh: 1110 = 11.10V)
-};
+  uint8_t  flags;        // bit0=gyroCalibValid, bit1=bmiOK, bit2=bmpOK,
+                         // bit3=vbatOK, bit4-5=battStage, bit6-7=failsafeStage
+};  // total 28 bytes
 
 struct ConfigPacket {
-  uint8_t magic;
-  float k1, k2, eps, forceToPwm, deltaMaxPwm;
+  uint8_t magic;         // harus == CONFIG_MAGIC (0xC3)
+  float angleKp, angleKi, angleKd;
+  float rateKp, rateKi, rateKd;
+  float yawKp, yawKi, yawKd;
+  float maxAngle;
+  float maxYawRate;
+  float maxDeltaPwm;
 };
 #pragma pack(pop)
 
@@ -123,8 +130,6 @@ float filt[N_CH];
 
 bool loraOK = false;
 bool armedState = false;
-bool smcConfigPending = false;
-ConfigPacket pendingSmcConfig;
 
 /* ----------------------- Kalibrasi stick (dipicu GUI) --------------------- */
 // Kalibrasi dilakukan SEPENUHNYA di ESP32 pada ADC raw (0-4095), sehingga
@@ -205,16 +210,13 @@ int throttleToCmd(int value) {
 }
 
 // Baca semua channel: invert -> filter EMA -> normalisasi.
-// Hasil disimpan di cmd[]: ROLL, THROTTLE, YAW, PITCH (masing-masing 0..255)
+// Joystick bertipe pegas (self-centering): semua channel menggunakan centerAxisToCmd
+// agar posisi netral (lepas stik) selalu tepat 128 dengan deadzone.
 void processJoystick(int cmd[N_CH]) {
   for (int ch = 0; ch < N_CH; ch++) {
     int v = applyInvert(ch, readRaw(ch));
     filt[ch] += JOYSTICK_FILTER_ALPHA * (v - filt[ch]);
-    if (ch == 1) { // LEFT_Y = THROTTLE
-      cmd[ch] = throttleToCmd((int)filt[ch]);
-    } else {
-      cmd[ch] = centerAxisToCmd(ch, (int)filt[ch]);
-    }
+    cmd[ch] = centerAxisToCmd(ch, (int)filt[ch]);
   }
 }
 
@@ -696,33 +698,26 @@ void loop()
       } else {
         Serial.println("[CAL] Format: CAL SAMPLE or CAL RESET");
       }
-    } else if (input.startsWith("SMC ")) {
-      float k1, k2, eps, forceToPwm, deltaMaxPwm;
-      int parsed = sscanf(input.c_str(), "SMC %f %f %f %f %f",
-                          &k1, &k2, &eps, &forceToPwm, &deltaMaxPwm);
-      if (parsed == 5 && k1 > 0.0f && k2 > 0.0f && eps > 0.1f &&
-          forceToPwm > 0.0f && deltaMaxPwm > 0.0f) {
-        pendingSmcConfig.magic = CONFIG_MAGIC;
-        pendingSmcConfig.k1 = k1;
-        pendingSmcConfig.k2 = k2;
-        pendingSmcConfig.eps = eps;
-        pendingSmcConfig.forceToPwm = forceToPwm;
-        pendingSmcConfig.deltaMaxPwm = deltaMaxPwm;
-        smcConfigPending = true;
-        Serial.println("[SMC] Parameter diterima, dikirim ke drone.");
+    } else if (input.startsWith("PID ")) {
+      String payload = input.substring(4);
+      payload.trim();
+      ConfigPacket cfg;
+      cfg.magic = CONFIG_MAGIC;
+      int count = sscanf(payload.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f",
+                         &cfg.angleKp, &cfg.angleKi, &cfg.angleKd,
+                         &cfg.rateKp, &cfg.rateKi, &cfg.rateKd,
+                         &cfg.yawKp, &cfg.yawKi, &cfg.yawKd,
+                         &cfg.maxAngle, &cfg.maxYawRate, &cfg.maxDeltaPwm);
+      if (count == 12) {
+        LoRa.beginPacket();
+        LoRa.write((uint8_t *)&cfg, sizeof(ConfigPacket));
+        LoRa.endPacket();
+        LoRa.receive();
+        Serial.println("[PID] OK CONFIG SENT TO DRONE");
       } else {
-        Serial.println("[SMC] Format: SMC k1 k2 eps forceToPwm deltaMaxPwm");
+        Serial.println("[PID] ERR FORMAT INVALID (need 12 float values)");
       }
     }
-  }
-
-  if (smcConfigPending) {
-    LoRa.beginPacket();
-    LoRa.write((uint8_t *)&pendingSmcConfig, sizeof(ConfigPacket));
-    LoRa.endPacket();
-    smcConfigPending = false;
-    LoRa.receive();
-    delay(20);
   }
 
   /* ---------- [1] Baca Joystick (kalibrasi terpusat di ESP32) ---------- */
@@ -765,7 +760,7 @@ void loop()
   while (!gotReply && (millis() - waitStart < REPLY_TIMEOUT_MS))
   {
     int packetSize = LoRa.parsePacket();
-    if (packetSize >= 27)
+    if (packetSize >= 28)
     {
       uint8_t buf[32];
       memset(buf, 0, sizeof(buf));
@@ -807,6 +802,18 @@ void loop()
         Serial.print(" UR:");        Serial.print(down.uRoll / 100.0f, 2);
         Serial.print(" UP:");        Serial.print(down.uPitch / 100.0f, 2);
         Serial.print(" UY:");        Serial.println(down.uYaw / 100.0f, 2);
+
+        // Decode & print status flags dari drone
+        //   G  = gyroCalibValid (1=OK, 0=FAIL)
+        //   B  = bmiOK, P = bmpOK, V = vbatOK
+        //   BS = battStage (0=OK 1=WARN 2=LIMIT 3=CRITICAL)
+        //   FS = failsafeStage (0=OK 2=DESCENT 3=LAND)
+        Serial.print("[FLAGS] G:"); Serial.print((down.flags & 0x01) ? 1 : 0);
+        Serial.print(" B:");  Serial.print((down.flags & 0x02) ? 1 : 0);
+        Serial.print(" P:");  Serial.print((down.flags & 0x04) ? 1 : 0);
+        Serial.print(" V:");  Serial.print((down.flags & 0x08) ? 1 : 0);
+        Serial.print(" BS:"); Serial.print((down.flags >> 4) & 0x03);
+        Serial.print(" FS:"); Serial.println((down.flags >> 6) & 0x03);
       }
     }
     else if (packetSize > 0)

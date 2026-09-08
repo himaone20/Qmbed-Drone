@@ -81,7 +81,7 @@ sampai baling-balingnya rusak.
 
 **Yang sudah diperbaiki**:
 1. Membetulkan cara baca sumbu sensor (sumbu Y dibalik dulu tadi).
-2. Menurunkan kekuatan koreksi (gain SMC) supaya waktu tes pertama tidak
+2. Menurunkan kekuatan koreksi (gain PID) supaya waktu tes pertama tidak
    berbahaya — drone tidak akan miring keras walaupun masih ada salah tanda.
    - K1: 5.0 → 2.5 (koreksi lebih lembut)
    - K2: 2.0 → 1.0 (lebih halus, tidak bergetar)
@@ -114,7 +114,7 @@ sampai baling-balingnya rusak.
 2. Tekan tombol **"CALIBRATE IMU"** di toolbar (buat buang nilai awal sensor).
 3. Tekan tombol **ARM** di tab BENCH TEST. Tunggu ±5 detik (waktu arming).
 4. Naikkan sedikit gas (throttle) di remote supaya lewat batas ~1220 us — ini
-   biar sistem koreksi (SMC) mulai bekerja. Angka koreksi akan mulai terlihat.
+   biar sistem koreksi (PID) mulai bekerja. Angka koreksi akan mulai terlihat.
 5. Sekarang pegang drone dengan tangan, lalu lakukan gerakan berikut satu per satu
    sambil lihat kartu status di GUI:
 
@@ -159,8 +159,13 @@ Hasil Uji Pertama:
 3. Hijau (Yaw PASS)
 
 Status Perbaikan:
-- main.ino: Pembacaan ay_f, gy_f, pitchAcc, dan gyro_bias_gy diselaraskan tanpa negasi berlebih. Saat miring KANAN -> Roll positif (+), SMC menghasilkan uRoll negatif (-), motor KANAN (M2, M3) bertambah daya untuk mendorong drone kembali level.
+- main.ino / sensors.cpp: Pembacaan ay_f, gy_f, pitchAcc, dan gyro_bias_gy diselaraskan tanpa negasi berlebih. Saat miring KANAN -> Roll positif (+), PID menghasilkan uRoll negatif (-), motor KANAN (M2, M3) bertambah daya untuk mendorong drone kembali level.
 - drone_viewer.py: Logika check roll diubah menjadi `(roll > 0 and ur < 0)` agar konsisten dengan fisika koreksi stabilisasi drone.
+- motors.cpp & drone_viewer.py: Motor mixing Quad-X disinkronkan dengan arah putar nyata (M1 CW, M2 CCW, M3 CW, M4 CCW). Koreksi Yaw (uYaw < 0 saat putar kanan/gz > 0) menaikkan motor CW (M1, M3 dengan formula -uYaw) dan menurunkan motor CCW (M2, M4 dengan formula +uYaw) untuk menghasilkan torsi reaksi berlawanan (CCW damping).
+  * M1 (FL CW):  basePwm + uRoll + uPitch - uYaw
+  * M2 (FR CCW): basePwm - uRoll + uPitch + uYaw
+  * M3 (BR CW):  basePwm - uRoll - uPitch - uYaw
+  * M4 (BL CCW): basePwm + uRoll - uPitch + uYaw
 ```
 ---
 
@@ -176,37 +181,71 @@ Kalau uji di atas lulus (semua hijau), coba test **hover** singkat:
 
 ---
 
-## 8. RENCANA BERIKUTNYA (FASE 2) — BELUM DIKERJAKAN
+## 8. IMPLEMENTASI KENDALI CASCADE PID (HOVER, ROLL, PITCH & YAW)
 
-Saat ini pilot hanya bisa menaikkan/menurunkan gas. Belum bisa menggerakkan
-drone ke kiri/kanan, maju/mundur, atau memutar lewat stik.
+Drone telah dilengkapi sistem kendali **Cascade (Dual-Loop) PID** (sesuai referensi UGM):
 
-Yang harus ditambahkan di Fase 2 (dikerjakan AI di sesi berikutnya):
-1. Mengubah nilai joystick (0–255) menjadi perintah gerak (misal: stik miring
-   kanan → drone miring kanan, dibatasi maksimal ±20°).
-2. Mengubah rumus koreksi supaya targetnya bukan selalu "datar", melainkan
-   mengikuti kemiringan dari stik.
-3. Sudah ada beberapa angka bantuan di kode (`MIX_ROLL_GAIN_US`, dll.) yang
-   belum dipakai.
+```
+[Stik Pilot R/P] ──> [Outer Loop: Angle PID] ──> [Desired Angular Rate]
+                                                        │
+[Sensor IMU (Roll/Pitch)] ──────────────────────────────┘
+                                                        │
+                                                        ▼
+[Sensor Gyro (Gx/Gy/Gz)] ────────────────────────> [Inner Loop: Rate PID] ──> [PWM Delta uRoll/uPitch/uYaw]
+                                                        │
+[Stik Pilot Yaw Rate] ──────────────────────────────────┘
+                                                        │
+                                                        ▼
+                                             [Quad-X Motor Mixer] ──> [4 ESC Motor M1-M4]
+```
 
-### Pilihan cara terbang (nanti ditanya ke pengguna)
-- **Mode "Self-Level" (ramah pemula)**: stik di tengah = drone datar. Stik
-  miring = drone miring sebesar sudut tertentu. Aman, tidak gampang terbalik.
-- **Mode "Acro" (untuk yang sudah mahir)**: stik mengatur kecepatan putaran,
-  drone tidak otomatis datar. Lebih lincah tapi susah terbangnya.
-- Bisa juga dua-duanya dengan tombol pindah mode.
+### Karakteristik Manuver Terbang:
+1. **Hover (Auto-Level)**:
+   - Saat stik Roll & Pitch di posisi tengah netral (128), target sudut drone = $0.0^\circ$.
+   - Drone aktif menyeimbangkan diri dan melawan hembusan angin/gangguan luar.
+2. **Roll (Miring Kanan / Kiri)**:
+   - Menggerakkan stik Roll akan mengarahkan kemiringan drone hingga maks $\pm 25.0^\circ$.
+   - Saat stik dilepas kembali ke tengah, drone otomatis kembali datar.
+3. **Pitch (Nose Up / Nose Down / Maju-Mundur)**:
+   - Stik Pitch didorong maju $\rightarrow$ Nose Down (maju ke depan).
+   - Stik Pitch ditarik mundur $\rightarrow$ Nose Up (mundur ke belakang).
+   - Saat stik dilepas, drone otomatis kembali datar.
+4. **Yawing (Putaran Heading / Arah Hadap)**:
+   - Stik Yaw mengatur laju perputaran drone hingga maks $\pm 150.0^\circ/\text{s}$.
+   - Saat stik dilepas, loop rate yaw aktif meredam dan menahan arah hadap (anti-spin).
+5. **Throttle (Daya Angkat)**:
+   - Stik Throttle pegas: netral (128) = Idle 20% (1200 us).
+   - Didorong ke atas (128 $\rightarrow$ 255) menaikkan throttle secara mulus (1200 s.d. 2000 us).
+   - Proteksi keselamatan: Integrator PID di-reset otomatis saat di tanah/idle untuk mencegah sentakan motor.
 
 ---
 
-## 9. DAFTAR FILE PENTING (MODULAR STRUCTURE)
+## 9. CARA TUNING PARAMETER PID LEWAT GUI (`drone_viewer.py`)
+
+1. Buka GUI: `python drone_viewer.py`
+2. Klik tombol menu navigasi di pojok kanan atas, lalu pilih **`PID TUNING`**.
+3. Parameter yang dapat diatur:
+   - **Outer Loop (Angle Kp, Ki, Kd)**: Mengatur ketegasan pemulihan sudut level (Roll & Pitch).
+   - **Inner Loop (Rate Kp, Ki, Kd)**: Mengatur respons kestabilan gyro dan peredaman osilasi cepat (Roll & Pitch).
+   - **Batasan ESC PWM**:
+     - *Min ESC (Stop / Disarm)*: Default `1000 µs` (PWM 0% / Cut-off)
+     - *Idle / Arm Spin (20%)*: Default `1200 µs` (Idle spin saat Armed)
+     - *Max ESC PWM (100%)*: Default `1300 µs` (PWM Maksimum daya motor)
+   - **Limits**: Sudut maksimum (*Max Angle*) dan batas delta koreksi PWM motor (*Max Delta PWM*).
+4. Klik **`APPLY PID PARAMETERS`** untuk mengirim konfigurasi secara nirkabel ke Remote & Drone via LoRa.
+5. Amati kurva respon pada grafik real-time di sebelah kanan form.
+
+---
+
+## 10. DAFTAR FILE PENTING (MODULAR STRUCTURE)
 
 | Isi | File | Deskripsi Modul |
 |---|---|---|
-| Konfigurasi pinout, SMC parameters & struct paket | `main/config.h` | Pusat parameter & struktur data telemetri |
+| Konfigurasi pinout, PID parameters & struct paket | `main/config.h` | Pusat parameter & struktur data telemetri |
 | Driver 4 ESC motor, Arming FSM & LED indicator | `main/motors.h` / `motors.cpp` | Inisialisasi motor, mixer Quad-X, LED PC4 |
 | Driver I2C (BMI160 + BMP280), kalibrasi & filter | `main/sensors.h` / `sensors.cpp` | TaskSensors (100Hz) & estimasi sudut sikap |
-| Algoritma SMC & Kendali Throttle | `main/control.h` / `control.cpp` | TaskControl (200Hz attitude loop) |
+| Algoritma Cascade PID & Kendali Throttle | `main/control.h` / `control.cpp` | TaskControl (200Hz attitude loop) |
 | Driver LoRa RA-02 (SPI2) & Telemetri 2-Arah | `main/radio.h` / `radio.cpp` | TaskLoRa_Control & Failsafe timeout |
 | Orchestrator Utama Setup & Scheduler | `main/main.ino` | Main entry point |
 | Program remote (LoRa) — JANGAN diubah urutan R/T/Y/P | `uji-coba/LoraTx/LoraTx.ino` | Seluruh file remote |
-| Program GUI (tampilan) | `uji-coba/drone_viewer.py` | Dashboard telemetri & Bench Test GUI |
+| Program GUI (tampilan) | `uji-coba/drone_viewer.py` | Dashboard telemetri, Bench Test & PID Tuning GUI |

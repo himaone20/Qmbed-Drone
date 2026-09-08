@@ -12,8 +12,13 @@
 #include <STM32FreeRTOS.h>
 #include "config.h"
 #include "sensors.h"
-#include "motors.h"
-#include "control.h"
+
+// Variabel penerimaan perintah terakhir dari remote
+extern float   gTargetRollDeg;
+extern float   gTargetPitchDeg;
+extern float   gTargetYawRateDps;
+extern uint16_t gTargetThrottlePwm;
+extern bool    gArmedCmd;
 
 bool radio_init();
 void TaskLoRa_Control(void *pvParameters);

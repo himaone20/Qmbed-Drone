@@ -1,5 +1,5 @@
 /* ==========================================================================
- * SENSORS.H — Management I2C Sensor BMI160, BMP180 + Kalman, ADC VBat & TaskSensors
+ * SENSORS.H — Management I2C Sensor BMI160, BMP180 (Median+EMA+Slew), ADC VBat & TaskSensors
  * ==========================================================================
  */
 
@@ -18,6 +18,8 @@ extern SemaphoreHandle_t sensorMutex;
 
 bool sensors_init();
 float readVBat();
+bool sensors_step_imu(SensorData &outData);
+void sensors_poll_telemetry();
 void TaskSensors(void *pvParameters);
 
 #endif // SENSORS_H

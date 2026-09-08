@@ -18,6 +18,8 @@ Tab :
 """
 
 import sys
+import os
+import json
 import re
 import math
 import time
@@ -31,8 +33,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QFrame,
-    QGraphicsDropShadowEffect, QFormLayout, QDoubleSpinBox,
-    QStackedWidget, QMenu
+    QGraphicsDropShadowEffect,
+    QStackedWidget, QMenu, QFormLayout, QDoubleSpinBox, QScrollArea
 )
 
 try:
@@ -50,7 +52,7 @@ BMP_RE = re.compile(
     r"\[BMP\]\s*P:([-\d.]+)\s*A:([-\d.]+)"
 )
 TX_RE = re.compile(
-    r"\[TX\]\s*R:(\d+)\s*T:(\d+)\s*Y:(\d+)\s*P:(\d+)"
+    r"\[TX\]\s*R:([-+\d.]+)(?:deg)?\s*T:(\d+)(?:us)?\s*Y:([-+\d.]+)(?:dps)?\s*P:([-+\d.]+)(?:deg)?(?:\s*ARM:(\d+))?"
 )
 SMC_RE = re.compile(
     r"\[SMC\]\s*ROLL:([-\d.]+)\s*PITCH:([-\d.]+)"
@@ -62,6 +64,14 @@ BAT_RE = re.compile(
 CAL_OK_RE = re.compile(
     r"\[CAL\]\s*OK\s*CR=(\d+)\s*CT=(\d+)\s*CY=(\d+)\s*CP=(\d+)"
 )
+PID_OK_RE = re.compile(
+    r"\[PID\]\s*OK"
+)
+FLAGS_RE = re.compile(
+    r"\[FLAGS\]\s*G:(\d)\s*B:(\d)\s*P:(\d)\s*V:(\d)\s*BS:(\d)\s*FS:(\d)"
+)
+
+PID_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pid_config.json")
 
 # ─────────────── Palette : Sky Blue & White ───────────────
 COL_BG          = QColor("#F5F9FF")   # window bg
@@ -151,6 +161,11 @@ class OrientationFilter:
         now = time.monotonic()
         if self._last_time is not None:
             self.dt = now - self._last_time
+            # Data gap > 1 detik dianggap koneksi terputus / drone restart.
+            # Reset filter agar tidak drift dari state lama yang basi.
+            if self.dt > 1.0:
+                self._first_run = True
+                self.yaw = 0.0
         self._last_time = now
         if self.dt <= 0 or self.dt > 0.5:
             self.dt = 0.12
@@ -221,6 +236,9 @@ class HorizonDroneWidget(QWidget):
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
+        self.target_roll = 0.0
+        self.target_pitch = 0.0
+        self._has_target = False
         self.altitude = 0.0
         self._prop_angle = 0.0
         self._connected = False
@@ -229,6 +247,11 @@ class HorizonDroneWidget(QWidget):
         self.roll = roll
         self.pitch = pitch
         self.yaw = yaw
+
+    def set_target_orientation(self, target_roll, target_pitch):
+        self.target_roll = target_roll
+        self.target_pitch = target_pitch
+        self._has_target = True
 
     def set_altitude(self, alt):
         self.altitude = alt
@@ -394,6 +417,7 @@ class HorizonDroneWidget(QWidget):
             p.setPen(QPen(QColor(255, 255, 255, 220), 1.4))
             p.drawLine(int(x1), int(y1), int(x2), int(y2))
 
+        # Actual Roll Pointer
         p.save()
         p.rotate(self.roll)
         pointer = QPolygonF([
@@ -405,6 +429,20 @@ class HorizonDroneWidget(QWidget):
         p.setBrush(QBrush(COL_ACCENT))
         p.drawPolygon(pointer)
         p.restore()
+
+        # Target Roll Pointer from Pilot Remote (Amber Cue)
+        if self._has_target and abs(self.target_roll) > 0.3:
+            p.save()
+            p.rotate(self.target_roll)
+            tgt_pointer = QPolygonF([
+                QPointF(0, -arc_r + 3),
+                QPointF(-4, -arc_r + 12),
+                QPointF(4, -arc_r + 12),
+            ])
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor("#F59E0B"))) # Amber target marker
+            p.drawPolygon(tgt_pointer)
+            p.restore()
 
         p.setBrush(QBrush(QColor(255, 255, 255, 230)))
         p.setPen(QPen(COL_ACCENT_DK, 1))
@@ -973,107 +1011,247 @@ class JoystickWidget(QWidget):
         p.end()
 
 
-# ───────────────────── SMC Tuning Plot ─────────────────────
+# ───────────────────── PID Realtime Plot Widget ─────────────────────
 
-class SmcPlotWidget(QWidget):
-    """Scrolling attitude and SMC-output traces from the flight controller."""
+class PidPlotWidget(QWidget):
+    """Visualisasi kurva respon real-time PID presisi tinggi:
+    1) Subplot 1: Roll Setpoint vs Actual Roll (dengan selisih galat/error)
+    2) Subplot 2: Pitch Setpoint vs Actual Pitch (dengan selisih galat/error)
+    3) Subplot 3: Output Koreksi PWM (uRoll, uPitch, uYaw)
+    Lengkap dengan grid skala sumbu Y, grid waktu sumbu X, dan badge nilai digital live."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(440, 390)
-        self._samples = deque(maxlen=180)
-        self._roll = self._pitch = 0.0
-        self._ur = self._up = self._uy = 0.0
+        self.setMinimumSize(480, 480)
+        self._samples = deque(maxlen=250)
+        self._cur_target_roll = 0.0
+        self._cur_actual_roll = 0.0
+        self._cur_target_pitch = 0.0
+        self._cur_actual_pitch = 0.0
+        self._cur_u_roll = 0.0
+        self._cur_u_pitch = 0.0
+        self._cur_u_yaw = 0.0
 
-    def add_sample(self, roll, pitch, u_roll, u_pitch, u_yaw):
-        self._roll, self._pitch = roll, pitch
-        self._ur, self._up, self._uy = u_roll, u_pitch, u_yaw
-        self._samples.append((time.monotonic(), roll, pitch, u_roll, u_pitch, u_yaw))
+    def add_sample(self, target_roll, actual_roll, target_pitch, actual_pitch, u_roll, u_pitch, u_yaw):
+        self._cur_target_roll = target_roll
+        self._cur_actual_roll = actual_roll
+        self._cur_target_pitch = target_pitch
+        self._cur_actual_pitch = actual_pitch
+        self._cur_u_roll = u_roll
+        self._cur_u_pitch = u_pitch
+        self._cur_u_yaw = u_yaw
+        self._samples.append((
+            time.monotonic(),
+            target_roll, actual_roll,
+            target_pitch, actual_pitch,
+            u_roll, u_pitch, u_yaw
+        ))
         self.update()
 
-    def _status(self):
-        if len(self._samples) < 20:
-            return "WAITING FOR DATA", COL_MUTED
-        recent = list(self._samples)[-20:]
-        early = list(self._samples)[-40:-20]
-        recent_amp = max(max(abs(s[1]), abs(s[2])) for s in recent)
-        if not early:
-            return "MONITORING", COL_WARN
-        early_amp = max(max(abs(s[1]), abs(s[2])) for s in early)
-        if recent_amp > max(4.0, early_amp * 1.35):
-            return "DIVERGING - CHECK SIGNS", COL_ERR
-        if recent_amp < max(1.0, early_amp * 0.70):
-            return "STABLE / DAMPING", COL_OK
-        return "OSCILLATING / HOLD", COL_WARN
+    def _draw_subplot_grid(self, p, plot_rect, y_ticks, y_scale, y_unit):
+        # Background canvas
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(QColor("#F8FAFC")))
+        p.drawRoundedRect(plot_rect, 6, 6)
 
-    def _draw_trace(self, p, rect, values, color, scale):
+        p.save()
+        p.setClipRect(plot_rect)
+
+        # Horizontal Gridlines & Zero Line
+        cy = plot_rect.center().y()
+        h_half = plot_rect.height() * 0.44
+
+        for val in y_ticks:
+            y_pos = cy - (val / y_scale) * h_half
+            if val == 0:
+                # Zero Line: solid & prominent
+                p.setPen(QPen(QColor("#64748B"), 1.2))
+                p.drawLine(QPointF(plot_rect.left(), y_pos), QPointF(plot_rect.right(), y_pos))
+            else:
+                # Gridlines: subtle dotted
+                p.setPen(QPen(QColor("#CBD5E1"), 1, Qt.DotLine))
+                p.drawLine(QPointF(plot_rect.left(), y_pos), QPointF(plot_rect.right(), y_pos))
+
+        # Vertical Time Gridlines (every 1.0 second over 5s window)
+        now = time.monotonic()
+        time_span = 5.0
+        for sec in range(1, int(time_span) + 1):
+            x_frac = 1.0 - (sec / time_span)
+            x_pos = plot_rect.left() + x_frac * plot_rect.width()
+            p.setPen(QPen(QColor("#E2E8F0"), 1, Qt.DashLine))
+            p.drawLine(QPointF(x_pos, plot_rect.top()), QPointF(x_pos, plot_rect.bottom()))
+
+        p.restore()
+
+        # Y-Axis Labels (Left of plot_rect)
+        p.setFont(qfont(FONT_MONO, 7, QFont.Bold))
+        for val in y_ticks:
+            y_pos = cy - (val / y_scale) * h_half
+            val_str = f"{val:+d}{y_unit}" if val != 0 else f"0{y_unit}"
+            label_rect = QRectF(plot_rect.left() - 44, y_pos - 7, 40, 14)
+            p.setPen(COL_TEXT if val == 0 else COL_SUBTEXT)
+            p.drawText(label_rect, Qt.AlignRight | Qt.AlignVCenter, val_str)
+
+        # X-Axis Time Labels (Bottom of plot_rect)
+        p.setFont(qfont(FONT_UI, 6.5, QFont.DemiBold))
+        p.setPen(COL_MUTED)
+        for sec in range(0, int(time_span) + 1):
+            x_frac = 1.0 - (sec / time_span)
+            x_pos = plot_rect.left() + x_frac * plot_rect.width()
+            txt = "NOW" if sec == 0 else f"-{sec}s"
+            t_rect = QRectF(x_pos - 18, plot_rect.bottom() + 3, 36, 12)
+            p.drawText(t_rect, Qt.AlignCenter, txt)
+
+    def _draw_series(self, p, plot_rect, idx, color, width, y_scale, style=Qt.SolidLine):
         if len(self._samples) < 2:
             return
-        start = self._samples[0][0]
-        end = self._samples[-1][0]
-        span = max(1.0, end - start)
+        now = time.monotonic()
+        time_span = 5.0
+        t_start = now - time_span
+
+        cy = plot_rect.center().y()
+        h_half = plot_rect.height() * 0.44
+
         points = []
-        for sample, value in zip(self._samples, values):
-            x = rect.left() + (sample[0] - start) / span * rect.width()
-            y = rect.center().y() - (value / scale) * (rect.height() * 0.42)
+        for s in self._samples:
+            t = s[0]
+            if t < t_start - 0.2:
+                continue
+            val = s[idx]
+            x_frac = max(0.0, min(1.0, (t - t_start) / time_span))
+            x = plot_rect.left() + x_frac * plot_rect.width()
+            y = cy - (val / y_scale) * h_half
+            y = max(plot_rect.top() + 2, min(plot_rect.bottom() - 2, y))
             points.append(QPointF(x, y))
-        p.setPen(QPen(color, 1.8))
+
+        if len(points) < 2:
+            return
+
+        p.save()
+        p.setClipRect(plot_rect)
+        p.setPen(QPen(color, width, style, Qt.RoundCap, Qt.RoundJoin))
         for i in range(1, len(points)):
             p.drawLine(points[i - 1], points[i])
+        p.restore()
+
+    def _draw_badges(self, p, right_x, top_y, badges):
+        """Draw small legend pills aligned to the right."""
+        cur_right = right_x
+        p.setFont(qfont(FONT_MONO, 7, QFont.Bold))
+        for text, col, is_dashed in reversed(badges):
+            fm = QFontMetricsF(p.font())
+            tw = fm.horizontalAdvance(text)
+            pill_w = tw + 18
+            pill_h = 16
+            cur_right -= pill_w
+            pill_rect = QRectF(cur_right, top_y, pill_w, pill_h)
+
+            p.setPen(QPen(col, 1))
+            p.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 18)))
+            p.drawRoundedRect(pill_rect, 4, 4)
+
+            # Indicator line/dash
+            p.setPen(QPen(col, 1.8, Qt.DashLine if is_dashed else Qt.SolidLine))
+            p.drawLine(QPointF(pill_rect.left() + 4, pill_rect.center().y()),
+                       QPointF(pill_rect.left() + 12, pill_rect.center().y()))
+
+            p.setPen(col)
+            p.drawText(QRectF(pill_rect.left() + 15, pill_rect.top(), tw + 2, pill_h),
+                       Qt.AlignLeft | Qt.AlignVCenter, text)
+            cur_right -= 6
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        rect = QRectF(self.rect().adjusted(0, 0, -1, -1))
+        rect = self.rect().adjusted(0, 0, -1, -1)
+
+        # Outer Background Card
         p.setPen(QPen(COL_BORDER, 1))
         p.setBrush(QBrush(COL_CARD))
         p.drawRoundedRect(rect, 12, 12)
 
-        title = QRectF(rect.left() + 16, rect.top() + 10, rect.width() - 32, 20)
-        status, status_col = self._status()
+        # Main Header
+        header_rect = QRectF(rect.left() + 16, rect.top() + 10, rect.width() - 32, 22)
         p.setPen(COL_TEXT)
-        p.setFont(qfont(FONT_UI, 9, QFont.Bold, letter_spacing=1.5))
-        p.drawText(title, Qt.AlignLeft | Qt.AlignVCenter, "LIVE SMC RESPONSE")
-        p.setPen(status_col)
-        p.drawText(title, Qt.AlignRight | Qt.AlignVCenter, status)
+        p.setFont(qfont(FONT_UI, 10, QFont.Bold, letter_spacing=1.2))
+        p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter, "REAL-TIME PID TRACKING & RESPONS")
 
-        top = QRectF(rect.left() + 16, rect.top() + 42, rect.width() - 32, (rect.height() - 90) * 0.48)
-        bottom = QRectF(rect.left() + 16, top.bottom() + 20, rect.width() - 32, (rect.height() - 90) * 0.48)
-        for plot, label, scale in ((top, "ATTITUDE (deg)", 30.0), (bottom, "SMC OUTPUT (us)", 180.0)):
-            p.setPen(QPen(COL_BORDER, 1))
-            p.setBrush(QBrush(COL_CARD_ALT))
-            p.drawRoundedRect(plot, 6, 6)
-            p.setPen(QPen(COL_DIVIDER, 1, Qt.DashLine))
-            p.drawLine(QPointF(plot.left(), plot.center().y()), QPointF(plot.right(), plot.center().y()))
-            p.setPen(COL_SUBTEXT)
-            p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.0))
-            p.drawText(QRectF(plot.left() + 6, plot.top() + 4, plot.width() - 12, 13), Qt.AlignLeft, label)
-            p.drawText(QRectF(plot.right() - 36, plot.center().y() - 7, 30, 14), Qt.AlignRight, "0")
+        # Subplot Layout: 3 Rows
+        top_y = header_rect.bottom() + 8
+        avail_h = rect.bottom() - top_y - 12
+        row_h = (avail_h - 20) / 3.0
 
-        samples = list(self._samples)
-        self._draw_trace(p, top, [s[1] for s in samples], COL_ACCENT, 30.0)
-        self._draw_trace(p, top, [s[2] for s in samples], COL_OK, 30.0)
-        self._draw_trace(p, bottom, [s[3] for s in samples], COL_ACCENT, 180.0)
-        self._draw_trace(p, bottom, [s[4] for s in samples], COL_OK, 180.0)
-        self._draw_trace(p, bottom, [s[5] for s in samples], COL_WARN, 180.0)
+        # ──────────────── SUBPLOT 1: ROLL (Setpoint vs Actual) ────────────────
+        row1_rect = QRectF(rect.left() + 14, top_y, rect.width() - 28, row_h)
+        err_roll = self._cur_target_roll - self._cur_actual_roll
 
-        p.setFont(qfont(FONT_MONO, 8, QFont.Bold))
-        p.setPen(COL_ACCENT)
-        p.drawText(QRectF(top.left(), top.bottom() + 2, 95, 14), Qt.AlignLeft, f"ROLL {self._roll:+.2f}")
-        p.setPen(COL_OK)
-        p.drawText(QRectF(top.left() + 105, top.bottom() + 2, 100, 14), Qt.AlignLeft, f"PITCH {self._pitch:+.2f}")
-        p.setPen(COL_ACCENT)
-        p.drawText(QRectF(bottom.left(), bottom.bottom() + 2, 85, 14), Qt.AlignLeft, f"UR {self._ur:+.1f}")
-        p.setPen(COL_OK)
-        p.drawText(QRectF(bottom.left() + 90, bottom.bottom() + 2, 85, 14), Qt.AlignLeft, f"UP {self._up:+.1f}")
-        p.setPen(COL_WARN)
-        p.drawText(QRectF(bottom.left() + 180, bottom.bottom() + 2, 85, 14), Qt.AlignLeft, f"UY {self._uy:+.1f}")
-        p.end()
+        # Row 1 Header & Badges
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold))
+        p.setPen(COL_ACCENT_DK)
+        p.drawText(QRectF(row1_rect.left() + 44, row1_rect.top(), 220, 16),
+                   Qt.AlignLeft | Qt.AlignVCenter, "1. ROLL TRACKING (\u00B0)")
+
+        badges_roll = [
+            (f"SETPOINT: {self._cur_target_roll:+.1f}\u00B0", QColor("#F59E0B"), True),
+            (f"ACTUAL: {self._cur_actual_roll:+.1f}\u00B0", QColor("#2563EB"), False),
+            (f"ERROR: {err_roll:+.1f}\u00B0", COL_OK if abs(err_roll) < 2.0 else (COL_WARN if abs(err_roll) < 6.0 else COL_ERR), False),
+        ]
+        self._draw_badges(p, row1_rect.right(), row1_rect.top() + 1, badges_roll)
+
+        plot1_rect = QRectF(row1_rect.left() + 44, row1_rect.top() + 18, row1_rect.width() - 52, row1_rect.height() - 34)
+        self._draw_subplot_grid(p, plot1_rect, [20, 10, 0, -10, -20], 25.0, "\u00B0")
+        self._draw_series(p, plot1_rect, 1, QColor("#F59E0B"), 1.8, 25.0, Qt.DashLine)  # Target Roll
+        self._draw_series(p, plot1_rect, 2, QColor("#2563EB"), 2.2, 25.0, Qt.SolidLine) # Actual Roll
+
+        # ──────────────── SUBPLOT 2: PITCH (Setpoint vs Actual) ────────────────
+        row2_y = row1_rect.bottom() + 10
+        row2_rect = QRectF(rect.left() + 14, row2_y, rect.width() - 28, row_h)
+        err_pitch = self._cur_target_pitch - self._cur_actual_pitch
+
+        # Row 2 Header & Badges
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold))
+        p.setPen(COL_ACCENT_DK)
+        p.drawText(QRectF(row2_rect.left() + 44, row2_rect.top(), 220, 16),
+                   Qt.AlignLeft | Qt.AlignVCenter, "2. PITCH TRACKING (\u00B0)")
+
+        badges_pitch = [
+            (f"SETPOINT: {self._cur_target_pitch:+.1f}\u00B0", QColor("#F59E0B"), True),
+            (f"ACTUAL: {self._cur_actual_pitch:+.1f}\u00B0", QColor("#16A34A"), False),
+            (f"ERROR: {err_pitch:+.1f}\u00B0", COL_OK if abs(err_pitch) < 2.0 else (COL_WARN if abs(err_pitch) < 6.0 else COL_ERR), False),
+        ]
+        self._draw_badges(p, row2_rect.right(), row2_rect.top() + 1, badges_pitch)
+
+        plot2_rect = QRectF(row2_rect.left() + 44, row2_rect.top() + 18, row2_rect.width() - 52, row2_rect.height() - 34)
+        self._draw_subplot_grid(p, plot2_rect, [20, 10, 0, -10, -20], 25.0, "\u00B0")
+        self._draw_series(p, plot2_rect, 3, QColor("#F59E0B"), 1.8, 25.0, Qt.DashLine)  # Target Pitch
+        self._draw_series(p, plot2_rect, 4, QColor("#16A34A"), 2.2, 25.0, Qt.SolidLine) # Actual Pitch
+
+        # ──────────────── SUBPLOT 3: PWM OUTPUT CORRECTIONS ────────────────
+        row3_y = row2_rect.bottom() + 10
+        row3_rect = QRectF(rect.left() + 14, row3_y, rect.width() - 28, row_h)
+
+        # Row 3 Header & Badges
+        p.setFont(qfont(FONT_UI, 8, QFont.Bold))
+        p.setPen(COL_ACCENT_DK)
+        p.drawText(QRectF(row3_rect.left() + 44, row3_rect.top(), 220, 16),
+                   Qt.AlignLeft | Qt.AlignVCenter, "3. PID OUTPUT KOREKSI (\u03BCs)")
+
+        badges_pwm = [
+            (f"uROLL: {self._cur_u_roll:+.0f}\u03BCs", QColor("#2563EB"), False),
+            (f"uPITCH: {self._cur_u_pitch:+.0f}\u03BCs", QColor("#16A34A"), False),
+        ]
+        self._draw_badges(p, row3_rect.right(), row3_rect.top() + 1, badges_pwm)
+
+        plot3_rect = QRectF(row3_rect.left() + 44, row3_rect.top() + 18, row3_rect.width() - 52, row3_rect.height() - 34)
+        self._draw_subplot_grid(p, plot3_rect, [150, 75, 0, -75, -150], 200.0, "")
+        self._draw_series(p, plot3_rect, 5, QColor("#2563EB"), 2.0, 200.0, Qt.SolidLine) # uRoll
+        self._draw_series(p, plot3_rect, 6, QColor("#16A34A"), 2.0, 200.0, Qt.SolidLine) # uPitch
 
 
 # ───────────────────── Metric Card ─────────────────────
 
 class MetricCard(QFrame):
-    """Kartu metrik dengan 3 zona vertikal terpisah (label / nilai / satuan)
+    """Kartu metrik dengan 3 zona vertikal terpisah (label + target badge / nilai / satuan + error)
     yang dihitung memakai QRectF + alignment Qt, bukan baseline manual, agar
     tidak pernah tumpang tindih pada resolusi/DPI apa pun."""
 
@@ -1085,7 +1263,12 @@ class MetricCard(QFrame):
         self._accent = accent
         self._value = 0.0
         self._fmt = "{:+.1f}"
-        self.setMinimumHeight(96)
+        self._has_target = False
+        self._target_val = 0.0
+        self._target_unit = "°"
+        self._target_label = "CMD"
+        self._show_error = False
+        self.setMinimumHeight(100)
         self.setStyleSheet(f"""
             #MetricCard {{
                 background: {COL_CARD.name()};
@@ -1103,15 +1286,23 @@ class MetricCard(QFrame):
         self._value = v
         self.update()
 
+    def set_target(self, target_val, target_unit="°", label="CMD", show_error=False):
+        self._has_target = True
+        self._target_val = target_val
+        self._target_unit = target_unit
+        self._target_label = label
+        self._show_error = show_error
+        self.update()
+
     def paintEvent(self, event):
         super().paintEvent(event)
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = self.rect().adjusted(16, 0, -14, 0)
 
-        # Zone 1: accent dot + label (top strip)
-        label_h = 22.0
-        label_rect = QRectF(r.left(), r.top(), r.width(), label_h)
+        # Zone 1: accent dot + label (left) & target badge (right)
+        label_h = 24.0
+        label_rect = QRectF(r.left(), r.top() + 2, r.width(), label_h)
         dot_r = 3.0
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(self._accent))
@@ -1121,8 +1312,32 @@ class MetricCard(QFrame):
         p.drawText(label_rect.adjusted(dot_r * 2 + 6, 0, 0, 0),
                    Qt.AlignLeft | Qt.AlignVCenter, self._label.upper())
 
+        # Target badge on top-right (from Remote LoRa TX)
+        if self._has_target:
+            if isinstance(self._target_val, float):
+                tgt_str = f"{self._target_label}: {self._target_val:+.1f}{self._target_unit}"
+            elif isinstance(self._target_val, int):
+                tgt_str = f"{self._target_label}: {self._target_val}{self._target_unit}"
+            else:
+                tgt_str = f"{self._target_label}: {self._target_val}"
+
+            badge_font = qfont(FONT_UI, 7, QFont.Bold, letter_spacing=0.5)
+            badge_fm = QFontMetricsF(badge_font)
+            bw = badge_fm.horizontalAdvance(tgt_str) + 12
+            bh = 17.0
+            bx = r.right() - bw
+            by = label_rect.center().y() - bh / 2.0
+            badge_rect = QRectF(bx, by, bw, bh)
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor("#EFF6FF")))  # Soft light blue bg
+            p.drawRoundedRect(badge_rect, 4, 4)
+            p.setPen(QColor("#1D4ED8"))  # Deep blue text
+            p.setFont(badge_font)
+            p.drawText(badge_rect, Qt.AlignCenter, tgt_str)
+
         # Zone 2: big value (middle, generous height so glyphs never clip)
-        unit_h = 20.0
+        unit_h = 22.0
         value_rect = QRectF(r.left(), r.top() + label_h,
                             r.width(), r.height() - label_h - unit_h)
         p.setPen(COL_TEXT)
@@ -1130,7 +1345,7 @@ class MetricCard(QFrame):
         val_text = self._fmt.format(self._value)
         p.drawText(value_rect, Qt.AlignLeft | Qt.AlignVCenter, val_text)
 
-        # Zone 3: unit (bottom strip, separated by a hairline)
+        # Zone 3: unit on left + error on right (bottom strip, separated by a hairline)
         unit_rect = QRectF(r.left(), r.bottom() - unit_h, r.width(), unit_h)
         p.setPen(QPen(COL_BORDER, 1))
         p.drawLine(QPointF(unit_rect.left(), unit_rect.top()),
@@ -1139,6 +1354,16 @@ class MetricCard(QFrame):
         p.setFont(qfont(FONT_UI, 7, QFont.DemiBold, letter_spacing=1.2))
         p.drawText(unit_rect.adjusted(0, 1, 0, 0),
                    Qt.AlignLeft | Qt.AlignVCenter, self._unit.upper())
+
+        # Error display on bottom-right if enabled
+        if self._has_target and self._show_error and isinstance(self._target_val, (int, float)):
+            err = self._value - float(self._target_val)
+            err_str = f"ERR: {err:+.1f}°"
+            err_col = COL_OK if abs(err) < 2.0 else (COL_WARN if abs(err) < 6.0 else COL_ERR)
+            p.setPen(err_col)
+            p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=0.6))
+            p.drawText(unit_rect.adjusted(0, 1, 0, 0),
+                       Qt.AlignRight | Qt.AlignVCenter, err_str)
 
         p.end()
 
@@ -1161,6 +1386,8 @@ class SecondaryInfoBar(QFrame):
         self.press = 0.0
         self.rate = 0.0
         self._last_sample_ts = 0.0
+        self._gyro_calib = True  # dari [FLAGS] downlink drone
+        self._flags_received = False
 
     def update_vbat(self, vbat):
         if vbat > 3.0:
@@ -1169,6 +1396,14 @@ class SecondaryInfoBar(QFrame):
 
     def update_press(self, press):
         self.press = press
+        self.update()
+
+    def update_flags(self, flags: dict):
+        """Terima dict flags dari _parse_line: gyro_calib, bmi_ok, dst.
+        Saat ini kolom yang ditampilkan hanya GYRO CALIB (paling relevan
+        untuk debug drift IMU); flag lain disimpan untuk ekstensi UI."""
+        self._gyro_calib = bool(flags.get("gyro_calib", True))
+        self._flags_received = True
         self.update()
 
     def note_sample(self):
@@ -1188,9 +1423,16 @@ class SecondaryInfoBar(QFrame):
         rect = QRectF(self.rect())
 
         vbat_col = COL_OK if self.vbat >= 10.5 else (COL_WARN if self.vbat >= 9.9 else COL_ERR)
+        if not self._flags_received:
+            gyro_txt, gyro_col = "WAIT...", COL_MUTED
+        elif self._gyro_calib:
+            gyro_txt, gyro_col = "OK", COL_OK
+        else:
+            gyro_txt, gyro_col = "FAIL", COL_ERR
         cols = [
             ("BATTERY (3S)", f"{self.vbat:.2f} V", vbat_col),
             ("PRESSURE",     f"{self.press:.1f} hPa", COL_ACCENT_2),
+            ("GYRO CALIB",   gyro_txt, gyro_col),
             ("DATA RATE",    f"{self.rate:.0f} Hz",   COL_OK),
         ]
         col_w = rect.width() / len(cols)
@@ -1248,11 +1490,14 @@ class RCReadoutCard(QFrame):
         self.t = 128
         self.y = 128
         self.p = 128
+        self.targets = (0.0, 1200, 0.0, 0.0)
         self.calibrated = False
 
-    def set_values(self, r, t, y, p, calibrated):
+    def set_values(self, r, t, y, p, calibrated, targets=None):
         self.r, self.t, self.y, self.p = r, t, y, p
         self.calibrated = calibrated
+        if targets is not None:
+            self.targets = targets
         self.update()
 
     def paintEvent(self, event):
@@ -1311,12 +1556,27 @@ class RCReadoutCard(QFrame):
             p.drawText(name_rect.adjusted(11, 0, 0, 0),
                        Qt.AlignLeft | Qt.AlignVCenter, f"{code} \u00B7 {name}")
 
-            # value row
+            # value row with physical units from LoraTx
             value_rect = QRectF(col_rect.left(), name_rect.bottom() + 2,
                                 col_rect.width(), 22)
             p.setPen(COL_TEXT)
-            p.setFont(qfont(FONT_MONO, 15, QFont.Bold))
+            p.setFont(qfont(FONT_MONO, 14, QFont.Bold))
             p.drawText(value_rect, Qt.AlignLeft | Qt.AlignVCenter, f"{val:>3}")
+
+            # Physical Target String (Degrees, PWM, Rate)
+            target_str = ""
+            if i == 0:  # Roll
+                target_str = f"{self.targets[0]:+.1f}°"
+            elif i == 1: # Throttle
+                target_str = f"{int(self.targets[1])}us"
+            elif i == 2: # Yaw
+                target_str = f"{self.targets[2]:+.1f}°/s"
+            elif i == 3: # Pitch
+                target_str = f"{self.targets[3]:+.1f}°"
+
+            p.setPen(QColor(col))
+            p.setFont(qfont(FONT_UI, 9, QFont.Bold))
+            p.drawText(value_rect, Qt.AlignRight | Qt.AlignVCenter, target_str)
 
             # deflection bar row (0-255, center mark at 128)
             bar_rect = QRectF(col_rect.left(), value_rect.bottom() + 4,
@@ -1377,16 +1637,16 @@ class MotorRpmCard(QFrame):
         base_pwm = throttle_pwm if armed else 1000.0
 
         if armed:
-            m1 = max(1000.0, min(2000.0, base_pwm + ur + up + uy))
-            m2 = max(1000.0, min(2000.0, base_pwm - ur + up - uy))
-            m3 = max(1000.0, min(2000.0, base_pwm - ur - up + uy))
-            m4 = max(1000.0, min(2000.0, base_pwm + ur - up - uy))
+            m1 = max(1000.0, min(2000.0, base_pwm + ur + up - uy))
+            m2 = max(1000.0, min(2000.0, base_pwm - ur + up + uy))
+            m3 = max(1000.0, min(2000.0, base_pwm - ur - up - uy))
+            m4 = max(1000.0, min(2000.0, base_pwm + ur - up + uy))
         else:
             m1 = m2 = m3 = m4 = 1000.0
 
         self.pwm = [int(m1), int(m2), int(m3), int(m4)]
-        # A2212 1400KV * VBat * 0.80 loaded prop efficiency
-        max_rpm = 1400.0 * self.vbat * 0.80
+        # A2212 1400KV * VBat * 0.75 loaded prop efficiency
+        max_rpm = 1400.0 * self.vbat * 0.75
         self.rpm = [
             int(((p - 1000.0) / 1000.0) * max_rpm) if armed and p > 1020 else 0
             for p in self.pwm
@@ -1542,12 +1802,12 @@ class BenchMotorMixWidget(QWidget):
         self.ur, self.up, self.uy = ur, up, uy
         self.throttle = throttle
         self.armed = armed
-        # Mixer Quad-X (sinkron dengan writeSmcMotorMix di main.ino)
+        # Mixer Quad-X (sinkron dengan writeSmcMotorMix di motors.cpp)
         self.mix = {
-            "M1":  ur + up + uy,   # FL CW
-            "M2": -ur + up - uy,   # FR CCW
-            "M3": -ur - up + uy,   # BR CW
-            "M4":  ur - up - uy,   # BL CCW
+            "M1":  ur + up - uy,   # FL CW
+            "M2": -ur + up + uy,   # FR CCW
+            "M3": -ur - up - uy,   # BR CW
+            "M4":  ur - up + uy,   # BL CCW
         }
 
     def animate(self):
@@ -1940,10 +2200,24 @@ class MainWindow(QMainWindow):
         self._vbat = 11.1
         self._first_alt = True
 
+        # ── Drone health flags (dari [FLAGS] tag downlink) ──
+        # Default optimistic supaya tidak flicker warning saat baru konek
+        # sebelum paket pertama tiba.
+        self._flags = {
+            "gyro_calib": True,   # gyroCalibValid
+            "bmi_ok":     True,
+            "bmp_ok":     True,
+            "vbat_ok":    True,
+            "batt_stage": 0,      # 0=OK 1=WARN 2=LIMIT 3=CRITICAL
+            "fs_stage":   0,      # 0=OK 2=DESCENT 3=LAND
+        }
+        self._flags_received = False  # true setelah paket [FLAGS] pertama
+
         # ── joystick state ──
         # Kalibrasi dilakukan dan disimpan di ESP32. GUI hanya memicu "CAL
         # SAMPLE" lalu membaca balasan "[CAL] OK CR=.. CT=.. CY=.. CP=..".
         self._js_raw = (128, 128, 128, 128)
+        self._js_target = (0.0, 1200, 0.0, 0.0)  # (roll_deg, throttle_pwm, yaw_dps, pitch_deg)
         self._js_calibrated = False
         self._js_calib_center_display = None  # (cr,ct,cy,cp) ADC untuk banner
         self._js_calib_sampling = False       # menunggu balasan dari ESP32
@@ -1982,9 +2256,12 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_attitude_tab())  # 0
         self._stack.addWidget(self._build_rc_tab())        # 1
-        self._stack.addWidget(self._build_smc_tab())       # 2
-        self._stack.addWidget(self._build_bench_tab())     # 3
+        self._stack.addWidget(self._build_bench_tab())     # 2
+        self._stack.addWidget(self._build_pid_tab())       # 3
         body_lay.addWidget(self._stack, stretch=1)
+
+        # Muat konfigurasi parameter PID terakhir yang tersimpan
+        self._load_pid_config()
 
         # ── timers ──
         self._serial_timer = QTimer(self)
@@ -2051,27 +2328,6 @@ class MainWindow(QMainWindow):
             p.setBrush(QBrush(COL_ACCENT))
             p.drawEllipse(QPointF(knob_x, knob_y), knob_r, knob_r)
 
-        elif icon_type == "SMC":
-            # ── Sliding Mode / Tuning Response Wave Icon ──
-            rect_box = QRectF(center - r, center - r, 2 * r, 2 * r)
-            p.setPen(QPen(QColor("#E2E8F0"), 1))
-            p.setBrush(QBrush(QColor("#F8FAFC")))
-            p.drawRoundedRect(rect_box, 4, 4)
-
-            p.setPen(QPen(QColor("#CBD5E1"), 1, Qt.DotLine))
-            p.drawLine(QPointF(rect_box.left() + 2, center), QPointF(rect_box.right() - 2, center))
-
-            path = QPainterPath()
-            path.moveTo(rect_box.left() + 2, center + r * 0.65)
-            path.cubicTo(
-                rect_box.left() + r * 0.6, center - r * 0.75,
-                rect_box.left() + r * 1.3, center + r * 0.35,
-                rect_box.right() - 2, center
-            )
-            p.setPen(QPen(COL_ACCENT, 1.6, Qt.SolidLine, Qt.RoundCap))
-            p.setBrush(Qt.NoBrush)
-            p.drawPath(path)
-
         elif icon_type == "BENCH":
             # ── Quad-X Drone Motor Frame Icon ──
             d = r * 0.68
@@ -2088,6 +2344,23 @@ class MainWindow(QMainWindow):
                 p.setPen(QPen(QColor("#FFFFFF"), 0.8))
                 p.setBrush(QBrush(COL_ACCENT))
                 p.drawEllipse(QPointF(center + mx, center + my), motor_r, motor_r)
+
+        elif icon_type == "PID":
+            # ── PID Tuning / Waveform Icon ──
+            p.setPen(QPen(COL_ACCENT_DK, 1.2))
+            p.setBrush(QBrush(QColor("#E0F2FE")))
+            p.drawRoundedRect(QRectF(center - r, center - r, 2 * r, 2 * r), 4, 4)
+
+            p.setPen(QPen(COL_DIVIDER, 1, Qt.DashLine))
+            p.drawLine(QPointF(center - r + 2, center), QPointF(center + r - 2, center))
+
+            path = QPainterPath()
+            path.moveTo(center - r + 3, center + 2)
+            path.cubicTo(center - r * 0.3, center - r * 0.7,
+                         center + r * 0.3, center + r * 0.7,
+                         center + r - 3, center - 2)
+            p.setPen(QPen(COL_ACCENT, 1.5))
+            p.drawPath(path)
 
         p.end()
         return QIcon(pixmap)
@@ -2118,8 +2391,8 @@ class MainWindow(QMainWindow):
         views = [
             ("ATTITUDE", 0, "ATTITUDE", self._create_nav_icon("ATTITUDE")),
             ("CONTROL", 1, "CONTROL", self._create_nav_icon("CONTROL")),
-            ("SMC TUNING", 2, "SMC TUNING", self._create_nav_icon("SMC")),
-            ("BENCH TEST", 3, "BENCH TEST", self._create_nav_icon("BENCH")),
+            ("BENCH TEST", 2, "BENCH TEST", self._create_nav_icon("BENCH")),
+            ("PID TUNING", 3, "PID TUNING", self._create_nav_icon("PID")),
         ]
         for title, idx, short_name, icon in views:
             action = QAction(icon, f"  {title}", self)
@@ -2571,31 +2844,47 @@ class MainWindow(QMainWindow):
                 return
 
         if self._armed:
-            self._throttle_smoothed = 1200.0
+            esc_arm = self._pid_inputs["esc_arm_spin_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_arm_spin_pwm" in self._pid_inputs else 1200.0
+            self._throttle_smoothed = esc_arm
             self._throttle_last_ms = time.monotonic() * 1000.0
             self.set_hint("Drone ARMING / ARMED (Motors Live)", level="warn")
         else:
-            self._throttle_smoothed = 1000.0
+            esc_min = self._pid_inputs["esc_min_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_min_pwm" in self._pid_inputs else 1000.0
+            self._throttle_smoothed = esc_min
             self.set_hint("Drone DISARMED (Safe)", level="ok")
 
     def _update_gui_throttle(self):
-        now_ms = time.monotonic() * 1000.0
-        dt_s = (now_ms - self._throttle_last_ms) / 1000.0
-        self._throttle_last_ms = now_ms
+        # Cermin PERSIS logika firmware Dual-Zone Expo (LoraTx.ino & motors.cpp):
+        # - Tarik Bawah (0..128): Idle -> Min (Landing / Cut-off)
+        # - Tengah Netral (128): Idle spin aman
+        # - Dorong Atas (128..255): Idle -> Max dengan kurva Expo 40%
+        esc_min = self._pid_inputs["esc_min_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_min_pwm" in self._pid_inputs else 1000.0
+        esc_arm = self._pid_inputs["esc_arm_spin_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_arm_spin_pwm" in self._pid_inputs else 1200.0
+        esc_max = self._pid_inputs["esc_max_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_max_pwm" in self._pid_inputs else 1300.0
 
         if not self._armed:
-            self._throttle_smoothed = 1000.0
+            self._throttle_smoothed = esc_min
             return self._throttle_smoothed
 
+        THROTTLE_EXPO = 0.40
+
         t_raw = self._js_raw[1] if len(self._js_raw) > 1 else 128
-        throttle_delta = t_raw - 128
+        if t_raw > 128 + 6:
+            stick_norm = (t_raw - 134.0) / 121.0
+            stick_norm = max(0.0, min(1.0, stick_norm))
+            expo_factor = (1.0 - THROTTLE_EXPO) * stick_norm + THROTTLE_EXPO * (stick_norm * stick_norm)
+            target = esc_arm + expo_factor * (esc_max - esc_arm)
+        elif t_raw < 128 - 6:
+            stick_down_norm = (122.0 - t_raw) / 122.0
+            stick_down_norm = max(0.0, min(1.0, stick_down_norm))
+            target = esc_arm - stick_down_norm * (esc_arm - esc_min)
+        else:
+            target = esc_arm
 
-        if abs(throttle_delta) <= 4:
-            throttle_delta = 0
+        # Ramp halus + clamp aman
+        self._throttle_smoothed = 0.90 * self._throttle_smoothed + 0.10 * target
+        self._throttle_smoothed = max(esc_min, min(esc_max, self._throttle_smoothed))
 
-        stick_norm = (throttle_delta / 127.0) if throttle_delta >= 0 else (throttle_delta / 128.0)
-        self._throttle_smoothed += stick_norm * 150.0 * dt_s
-        self._throttle_smoothed = max(1000.0, min(2000.0, self._throttle_smoothed))
         return self._throttle_smoothed
 
     # ────────── tabs ──────────
@@ -2662,76 +2951,6 @@ class MainWindow(QMainWindow):
         self._rc_readout = RCReadoutCard()
         lay.addWidget(self._rc_readout)
 
-        return page
-
-    def _build_smc_tab(self):
-        page = QWidget()
-        page.setStyleSheet("background: transparent;")
-        root = QHBoxLayout(page)
-        root.setContentsMargins(0, 10, 0, 0)
-        root.setSpacing(12)
-
-        card = QFrame()
-        card.setStyleSheet(f"""
-            background: {COL_CARD.name()}; border: 1px solid {COL_BORDER.name()};
-            border-radius: 10px;
-        """)
-        add_shadow(card, blur=18, dy=2, alpha=20)
-        form = QFormLayout(card)
-        form.setContentsMargins(22, 18, 22, 18)
-        form.setSpacing(12)
-
-        title = QLabel("SLIDING MODE CONTROLLER")
-        title.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:800; font-size:14px; letter-spacing:2px;")
-        form.addRow(title)
-
-        self._smc_inputs = {}
-        fields = [
-            ("K1", "k1", 5.0, 0.1, 30.0, 0.1),
-            ("K2", "k2", 2.0, 0.1, 30.0, 0.1),
-            ("EPS", "eps", 8.0, 0.1, 100.0, 0.1),
-            ("FORCE TO PWM", "force", 30.0, 0.1, 200.0, 0.5),
-            ("MAX CORRECTION (us)", "delta", 180.0, 10.0, 500.0, 5.0),
-        ]
-        for label, key, value, low, high, step in fields:
-            spin = QDoubleSpinBox()
-            spin.setRange(low, high)
-            spin.setValue(value)
-            spin.setSingleStep(step)
-            spin.setDecimals(2)
-            spin.setSuffix(" us" if key == "delta" else "")
-            spin.setStyleSheet(f"background:{COL_CARD_ALT.name()}; color:{COL_TEXT.name()}; padding:5px; border:1px solid {COL_BORDER.name()}; border-radius:5px;")
-            self._smc_inputs[key] = spin
-
-            name = QLabel(label)
-            name.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:12px;")
-            form.addRow(name, spin)
-
-        self._smc_apply_btn = self._make_secondary_btn("APPLY SMC PARAMETERS")
-        self._smc_apply_btn.clicked.connect(self._apply_smc_parameters)
-        form.addRow(self._smc_apply_btn)
-        root.addWidget(card, 1)
-
-        self._smc_plot = SmcPlotWidget()
-        add_shadow(self._smc_plot, blur=18, dy=2, alpha=20)
-        root.addWidget(self._smc_plot, 2)
-
-        guide = QLabel(
-            "EFEK PARAMETER\n\n"
-            "K1\nLebih besar: drone kembali level lebih cepat. Terlalu besar: overshoot dan osilasi.\n\n"
-            "K2\nLebih besar: lebih kuat melawan gangguan. Terlalu besar: motor bergetar/chattering.\n\n"
-            "EPS\nLebih besar: koreksi lebih halus, tetapi leveling lebih lambat/longgar. Lebih kecil: koreksi tajam, tetapi lebih banyak chattering.\n\n"
-            "FORCE TO PWM\nMengubah torsi kendali hasil SMC menjadi koreksi PWM. Lebih besar membuat SMC lebih agresif.\n\n"
-            "MAX CORRECTION\nBatas keselamatan koreksi PWM per motor. Lebih besar memberi kemampuan pemulihan lebih besar, tetapi beda tenaga motor juga lebih besar.\n\n"
-            "Mulai tanpa propeller. Ubah satu parameter per kali, lalu uji kembali."
-        )
-        guide.setWordWrap(True)
-        guide.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        guide.setStyleSheet(f"""
-            background:{COL_CARD.name()}; color:{COL_SUBTEXT.name()}; border:1px solid {COL_BORDER.name()};
-            border-radius:10px; padding:20px; font-size:11px; line-height:1.4;
-        """)
-        root.addWidget(guide, 1)
         return page
 
     # ────────── Bench Test (Props-Off) tab ──────────
@@ -2928,21 +3147,316 @@ class MainWindow(QMainWindow):
                 }}
             """)
 
-    def _apply_smc_parameters(self):
-        if not self._serial or not self._serial.is_open:
-            self.set_hint("Connect to remote before applying SMC parameters.", level="warn")
+    # ────────── PID Tuning tab ──────────
+
+    def _build_pid_tab(self):
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 10, 0, 0)
+        root.setSpacing(14)
+
+        # ── Kolom Kiri: Form Parameter Tuning PID ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+
+        form_card = QFrame()
+        form_card.setObjectName("PidFormCard")
+        form_card.setStyleSheet(f"""
+            #PidFormCard {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 12px;
+            }}
+        """)
+        add_shadow(form_card, blur=18, dy=2, alpha=20)
+
+        form_vbox = QVBoxLayout(form_card)
+        form_vbox.setContentsMargins(18, 16, 18, 16)
+        form_vbox.setSpacing(12)
+
+        # Header Title
+        title_lbl = QLabel("CASCADE PID (ROLL & PITCH)")
+        title_lbl.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:800; font-size:13px; letter-spacing:1.5px;")
+        form_vbox.addWidget(title_lbl)
+
+        sub_lbl = QLabel("Tuning parameter inner/outer loop kendali sikap kestabilan Roll & Pitch")
+        sub_lbl.setStyleSheet(f"color:{COL_SUBTEXT.name()}; font-size:10px;")
+        form_vbox.addWidget(sub_lbl)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {COL_BORDER.name()};")
+        form_vbox.addWidget(sep)
+
+        self._pid_inputs = {}
+
+        # 1. Outer Loop (Angle PID)
+        angle_group = QLabel("1. OUTER LOOP — SUDUT SIKAP ROLL & PITCH (ANGLE)")
+        angle_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:4px;")
+        form_vbox.addWidget(angle_group)
+
+        angle_form = QFormLayout()
+        angle_form.setSpacing(8)
+        angle_fields = [
+            ("Angle Kp", "angle_kp", 5.00000, 0.0, 30.0, 0.00100, 5),
+            ("Angle Ki", "angle_ki", 0.05000, 0.0, 5.0, 0.00010, 5),
+            ("Angle Kd", "angle_kd", 0.12000, 0.0, 5.0, 0.00010, 5),
+        ]
+        for label, key, val, mn, mx, step, dec in angle_fields:
+            spin = self._make_pid_spinbox(val, mn, mx, step, dec)
+            self._pid_inputs[key] = spin
+            lbl_w = QLabel(f"{label}:")
+            lbl_w.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:11px;")
+            angle_form.addRow(lbl_w, spin)
+        form_vbox.addLayout(angle_form)
+
+        # 2. Inner Loop (Rate PID)
+        rate_group = QLabel("2. INNER LOOP — KECEPATAN SUDUT ROLL & PITCH (RATE)")
+        rate_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
+        form_vbox.addWidget(rate_group)
+
+        rate_form = QFormLayout()
+        rate_form.setSpacing(8)
+        rate_fields = [
+            ("Rate Kp", "rate_kp", 1.60000, 0.0, 10.0, 0.00100, 5),
+            ("Rate Ki", "rate_ki", 0.30000, 0.0, 5.0, 0.00100, 5),
+            ("Rate Kd", "rate_kd", 0.04500, 0.0, 1.0, 0.00005, 5),
+        ]
+        for label, key, val, mn, mx, step, dec in rate_fields:
+            spin = self._make_pid_spinbox(val, mn, mx, step, dec)
+            self._pid_inputs[key] = spin
+            lbl_w = QLabel(f"{label}:")
+            lbl_w.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:11px;")
+            rate_form.addRow(lbl_w, spin)
+        form_vbox.addLayout(rate_form)
+
+        # 3. ESC PWM Limits
+        esc_group = QLabel("3. BATASAN ESC PWM (MIN, IDLE & MAX OUTPUT)")
+        esc_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
+        form_vbox.addWidget(esc_group)
+
+        esc_form = QFormLayout()
+        esc_form.setSpacing(8)
+        esc_fields = [
+            ("Min ESC (Stop / Disarm)", "esc_min_pwm", 1000.0, 900.0, 1300.0, 10.0, 0, " \u03BCs"),
+            ("Idle / Arm Spin (20%)", "esc_arm_spin_pwm", 1200.0, 1000.0, 1500.0, 10.0, 0, " \u03BCs"),
+            ("Max ESC PWM (100%)", "esc_max_pwm", 1300.0, 1100.0, 2000.0, 10.0, 0, " \u03BCs"),
+        ]
+        for label, key, val, mn, mx, step, dec, suffix in esc_fields:
+            spin = self._make_pid_spinbox(val, mn, mx, step, dec, suffix=suffix)
+            self._pid_inputs[key] = spin
+            lbl_w = QLabel(f"{label}:")
+            lbl_w.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:11px;")
+            esc_form.addRow(lbl_w, spin)
+        form_vbox.addLayout(esc_form)
+
+        # 4. Limits & Safety
+        limit_group = QLabel("4. BATASAN SAFETY & DEFLEKSI")
+        limit_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
+        form_vbox.addWidget(limit_group)
+
+        limit_form = QFormLayout()
+        limit_form.setSpacing(8)
+        limit_fields = [
+            ("Max Delta PWM", "max_delta_pwm", 300.0, 50.0, 500.0, 10.0, 0, " \u03BCs"),
+            ("Max Angle", "max_angle", 25.0, 5.0, 45.0, 1.0, 1, " \u00B0"),
+        ]
+        for label, key, val, mn, mx, step, dec, suffix in limit_fields:
+            spin = self._make_pid_spinbox(val, mn, mx, step, dec, suffix=suffix)
+            self._pid_inputs[key] = spin
+            lbl_w = QLabel(f"{label}:")
+            lbl_w.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:11px;")
+            limit_form.addRow(lbl_w, spin)
+        form_vbox.addLayout(limit_form)
+
+        # Action Buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.setContentsMargins(0, 8, 0, 0)
+
+        self._pid_apply_btn = QPushButton("\u2713  APPLY PID PARAMETERS")
+        self._pid_apply_btn.setFixedHeight(34)
+        self._pid_apply_btn.setCursor(Qt.PointingHandCursor)
+        self._pid_apply_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COL_ACCENT.name()}; color: white;
+                border: none; border-radius: 7px;
+                font: bold 10px Inter, sans-serif; letter-spacing: 1.0px;
+            }}
+            QPushButton:hover {{
+                background: {COL_ACCENT_DK.name()};
+            }}
+        """)
+        self._pid_apply_btn.clicked.connect(self._apply_pid_parameters)
+        btn_row.addWidget(self._pid_apply_btn, 2)
+
+        self._pid_reset_btn = QPushButton("\u21BA  DEFAULT")
+        self._pid_reset_btn.setFixedHeight(34)
+        self._pid_reset_btn.setCursor(Qt.PointingHandCursor)
+        self._pid_reset_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COL_CARD_ALT.name()}; color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()}; border-radius: 7px;
+                font: bold 10px Inter, sans-serif; letter-spacing: 0.8px;
+            }}
+            QPushButton:hover {{
+                background: #E2E8F0;
+            }}
+        """)
+        self._pid_reset_btn.clicked.connect(self._restore_pid_defaults)
+        btn_row.addWidget(self._pid_reset_btn, 1)
+
+        form_vbox.addLayout(btn_row)
+
+        scroll.setWidget(form_card)
+        root.addWidget(scroll, 4)
+
+        # ── Kolom Kanan: Real-Time Waveform Plot + Guide ──
+        right_col = QVBoxLayout()
+        right_col.setSpacing(12)
+
+        self._pid_plot = PidPlotWidget()
+        add_shadow(self._pid_plot, blur=18, dy=2, alpha=20)
+        right_col.addWidget(self._pid_plot, 5)
+
+        guide_card = QFrame()
+        guide_card.setStyleSheet(f"""
+            background: {COL_CARD.name()};
+            border: 1px solid {COL_BORDER.name()};
+            border-radius: 12px;
+            padding: 14px;
+        """)
+        add_shadow(guide_card, blur=14, dy=1, alpha=16)
+
+        guide_lay = QVBoxLayout(guide_card)
+        guide_lay.setContentsMargins(10, 8, 10, 8)
+        guide_lay.setSpacing(6)
+
+        g_title = QLabel("PANDUAN PRAKTIS TUNING CASCADE PID (ROLL & PITCH)")
+        g_title.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:800; font-size:11px; letter-spacing:1.2px;")
+        guide_lay.addWidget(g_title)
+
+        g_text = QLabel(
+            "\u2022 Outer Angle Kp: Mengatur kecepatan respons drone kembali tegak saat stik Roll/Pitch dilepas. Jika berosilasi lambat (wobble), turunkan.\n"
+            "\u2022 Outer Angle Ki & Kd: Ki mengoreksi offset kemiringan konstan. Kd meredam overshoot saat mendekati target sudut datar (0\u00B0).\n"
+            "\u2022 Inner Rate Kp & Kd: Rate Kp memberi kekakuan terhadap hembusan angin. Rate Kd meredam osilasi frekuensi tinggi dan getaran motor.\n"
+            "\u2022 Inner Rate Ki: Menahan drone dari drift sikap ketika pusat massa (baterai/frame) tidak seimbang sempurna.\n"
+            "\u2022 Batasan ESC PWM: Min PWM (1000\u03BCs Stop/Disarm), Arm Spin (1200\u03BCs Idle saat Armed 20%), dan Max PWM (1300\u03BCs Batas Tenaga 100%) dapat disetel langsung dari GUI tanpa hardcode program.\n"
+            "\u2022 Lakukan uji tanpa baling-baling (props-off) di tab BENCH TEST terlebih dahulu sebelum uji terbang hover perdana!"
+        )
+        g_text.setWordWrap(True)
+        g_text.setStyleSheet(f"color:{COL_SUBTEXT.name()}; font-size:10px; line-height:1.4;")
+        guide_lay.addWidget(g_text)
+
+        right_col.addWidget(guide_card, 2)
+        root.addLayout(right_col, 5)
+
+        return page
+
+    def _make_pid_spinbox(self, value, min_val, max_val, step, decimals, suffix=""):
+        spin = QDoubleSpinBox()
+        spin.setRange(min_val, max_val)
+        spin.setValue(value)
+        spin.setSingleStep(step)
+        spin.setDecimals(decimals)
+        if suffix:
+            spin.setSuffix(suffix)
+        spin.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {COL_CARD_ALT.name()};
+                color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-family: {CSS_MONO};
+                font-size: 11px;
+                font-weight: bold;
+            }}
+            QDoubleSpinBox:focus {{
+                border: 1.5px solid {COL_ACCENT.name()};
+            }}
+        """)
+        return spin
+
+    def _save_pid_config(self):
+        if not hasattr(self, "_pid_inputs") or not self._pid_inputs:
+            return False
+        try:
+            data = {k: spin.value() for k, spin in self._pid_inputs.items()}
+            with open(PID_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+            return True
+        except Exception as e:
+            print(f"[WARN] Gagal menyimpan konfigurasi PID ke {PID_CONFIG_FILE}: {e}")
+            return False
+
+    def _load_pid_config(self):
+        if not hasattr(self, "_pid_inputs") or not self._pid_inputs:
             return
-        values = self._smc_inputs
-        command = "SMC {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}\n".format(
-            values["k1"].value(), values["k2"].value(), values["eps"].value(),
-            values["force"].value(), values["delta"].value()
+        if not os.path.exists(PID_CONFIG_FILE):
+            return
+        try:
+            with open(PID_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k in self._pid_inputs and isinstance(v, (int, float)):
+                        self._pid_inputs[k].setValue(float(v))
+        except Exception as e:
+            print(f"[WARN] Gagal memuat konfigurasi PID dari {PID_CONFIG_FILE}: {e}")
+
+    def _apply_pid_parameters(self):
+        # Simpan konfigurasi ke file json saat Apply diklik
+        saved = self._save_pid_config()
+
+        if not self._serial or not self._serial.is_open:
+            if saved:
+                self.set_hint("Parameter PID disimpan ke config (Hubungkan serial untuk kirim ke Drone)", level="ok")
+            else:
+                self.set_hint("Hubungkan ke Remote ESP32 sebelum mengirim parameter PID!", level="warn")
+            return
+        inputs = self._pid_inputs
+        esc_min = inputs['esc_min_pwm'].value() if 'esc_min_pwm' in inputs else 1000.0
+        esc_arm = inputs['esc_arm_spin_pwm'].value() if 'esc_arm_spin_pwm' in inputs else 1200.0
+        esc_max = inputs['esc_max_pwm'].value() if 'esc_max_pwm' in inputs else 1300.0
+        # Format: PID <angleKp> <angleKi> <angleKd> <rateKp> <rateKi> <rateKd> <yawKp> <yawKi> <yawKd> <maxAngle> <maxYawRate> <maxDeltaPwm> <escMinPwm> <escArmSpinPwm> <escMaxPwm>
+        cmd = (
+            f"PID {inputs['angle_kp'].value():.5f} {inputs['angle_ki'].value():.5f} {inputs['angle_kd'].value():.5f} "
+            f"{inputs['rate_kp'].value():.5f} {inputs['rate_ki'].value():.5f} {inputs['rate_kd'].value():.5f} "
+            f"0.00000 0.00000 0.00000 "
+            f"{inputs['max_angle'].value():.1f} 150.0 {inputs['max_delta_pwm'].value():.1f} "
+            f"{esc_min:.1f} {esc_arm:.1f} {esc_max:.1f}\n"
         )
         try:
-            self._serial.write(command.encode("ascii"))
+            self._serial.write(cmd.encode("ascii"))
             self._serial.flush()
-            self.set_hint("SMC parameters sent to remote and drone.", level="ok")
+            self.set_hint("Parameter PID tersimpan & berhasil dikirim ke Remote & Drone via LoRa \u2713", level="ok")
         except Exception as e:
-            self.set_hint(f"SMC parameter write error: {e}", level="err")
+            self.set_hint(f"Parameter PID tersimpan, namun gagal kirim via serial: {e}", level="err")
+
+    def _restore_pid_defaults(self):
+        defaults = {
+            "angle_kp": 5.00000, "angle_ki": 0.05000, "angle_kd": 0.12000,
+            "rate_kp": 1.60000, "rate_ki": 0.30000, "rate_kd": 0.04500,
+            "esc_min_pwm": 1000.0, "esc_arm_spin_pwm": 1200.0, "esc_max_pwm": 1300.0,
+            "max_angle": 25.0, "max_delta_pwm": 300.0
+        }
+        for k, v in defaults.items():
+            if k in self._pid_inputs:
+                self._pid_inputs[k].setValue(v)
+        self.set_hint("Parameter PID & Limit ESC PWM dikembalikan ke nilai default.", level="ok")
+
+    def closeEvent(self, event):
+        self._save_pid_config()
+        if self._serial and self._serial.is_open:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
     # ────────── lifecycle ──────────
 
@@ -3075,6 +3589,11 @@ class MainWindow(QMainWindow):
             self._serial = serial.Serial(port, 115200, timeout=0.02)
             self._buf = b""
             self._first_alt = True
+            # Reset filter orientasi agar tidak drift dari sesi sebelumnya
+            self._orient.reset()
+            # Reset attitude snapshot dari drone (biar horizon start di 0
+            # bukan nilai stale dari koneksi lama)
+            self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0)
             self._apply_connect_style(True)
             self.set_status(True, port)
             self._horizon.set_connected(True)
@@ -3105,27 +3624,42 @@ class MainWindow(QMainWindow):
     # ────────── data processing ──────────
 
     def _push_att_metrics(self):
-        self._card_roll.set_value(self._orient.roll)
-        self._card_pitch.set_value(self._orient.pitch)
+        # Roll & pitch DIAMBIL LANGSUNG dari drone (tag [SMC], berisi output
+        # complementary filter onboard yang sudah dikurangi gyro bias).
+        # Ini menghindari double-integrate di GUI yang menyebabkan drift
+        # ketika bias gyro drone tercemar saat kalibrasi boot.
+        # Yaw tetap dari GUI karena drone tidak mengirim yaw absolut.
+        roll_fw  = self._bench_smc[0]
+        pitch_fw = self._bench_smc[1]
+
+        tgt_r, tgt_t, tgt_y, tgt_p = self._js_target
+
+        self._card_roll.set_value(roll_fw)
+        self._card_roll.set_target(tgt_r, target_unit="°", label="CMD", show_error=True)
+
+        self._card_pitch.set_value(pitch_fw)
+        self._card_pitch.set_target(tgt_p, target_unit="°", label="CMD", show_error=True)
+
         self._card_yaw.set_value(self._orient.yaw)
+        self._card_yaw.set_target(tgt_y, target_unit="°/s", label="RATE")
+
         self._card_alt.set_value(self._alt_smooth)
-        self._horizon.set_orientation(self._orient.roll,
-                                      self._orient.pitch,
-                                      self._orient.yaw)
+        self._card_alt.set_target(tgt_t, target_unit="us", label="THR")
+
+        self._horizon.set_orientation(roll_fw, pitch_fw, self._orient.yaw)
+        self._horizon.set_target_orientation(tgt_r, tgt_p)
         self._alt_tape.set_altitude(self._alt_smooth)
         self._horizon.set_altitude(self._alt_smooth)
         self._info_bar.update_press(self._press)
         self._info_bar.update_vbat(self._vbat)
 
-        throttle_pwm = self._update_gui_throttle()
+        throttle_pwm = tgt_t if tgt_t >= 1000 else self._update_gui_throttle()
         ur, up, uy = self._bench_smc[2], self._bench_smc[3], self._bench_smc[4]
         if hasattr(self, "_motor_rpm_card"):
             self._motor_rpm_card.set_data(ur, up, uy, throttle_pwm, self._armed, vbat=self._vbat)
 
     def _push_rc_values(self):
-        # ESP32 sudah mengirim nilai 0-255 yang sudah terkalibrasi penuh
-        # (netral = 128). Terapkan langsung tanpa offset tambahan (tidak ada
-        # double-offsetting lagi).
+        # ESP32 sudah mengirim nilai yang sudah terkalibrasi penuh.
         r, t, y, p = self._js_raw
 
         # Left stick: X = YAW, Y = THROTTLE
@@ -3133,7 +3667,7 @@ class MainWindow(QMainWindow):
         # Normalize 0..255 -> 0..1; joy widget Y=0 at top so invert
         self._joy_left.set_position(y / 255.0, 1.0 - t / 255.0)
         self._joy_right.set_position(r / 255.0, 1.0 - p / 255.0)
-        self._rc_readout.set_values(r, t, y, p, self._js_calibrated)
+        self._rc_readout.set_values(r, t, y, p, self._js_calibrated, targets=self._js_target)
 
     def _parse_line(self, text: str):
         m = IMU_RE.search(text)
@@ -3166,8 +3700,45 @@ class MainWindow(QMainWindow):
 
         m = TX_RE.search(text)
         if m:
-            r, t, y, p = [int(v) for v in m.groups()]
-            self._js_raw = (r, t, y, p)
+            g = m.groups()
+            r_str, t_str, y_str, p_str = g[0], g[1], g[2], g[3]
+            arm_str = g[4] if len(g) > 4 else None
+
+            r_val = float(r_str)
+            t_val = int(t_str)
+            y_val = float(y_str)
+            p_val = float(p_str)
+
+            # Deteksi format satuan fisik (derajat/PWM dari LoraTx baru) atau format raw 0..255
+            if "deg" in text or "us" in text or t_val >= 900 or ("." in r_str or "." in p_str):
+                tgt_r = r_val
+                tgt_t = t_val
+                tgt_y = y_val
+                tgt_p = p_val
+                raw_r = int(round(128.0 + (tgt_r / 25.0) * 127.0))
+                raw_p = int(round(128.0 - (tgt_p / 25.0) * 127.0))  # Maju (tgt_p < 0) -> raw_p naik (> 128)
+                raw_y = int(round(128.0 + (tgt_y / 150.0) * 127.0))
+                raw_t = int(round(((tgt_t - 1000) / 1000.0) * 255.0))
+            else:
+                raw_r, raw_t, raw_y, raw_p = int(r_val), int(t_val), int(y_val), int(p_val)
+                tgt_r = ((raw_r - 128) / 127.0) * 25.0 if abs(raw_r - 128) > 4 else 0.0
+                tgt_p = -((raw_p - 128) / 127.0) * 25.0 if abs(raw_p - 128) > 4 else 0.0  # Maju -> Nose Down
+                tgt_y = ((raw_y - 128) / 127.0) * 150.0 if abs(raw_y - 128) > 4 else 0.0
+                tgt_t = int(1000 + (raw_t / 255.0) * 1000)
+
+            raw_r = max(0, min(255, raw_r))
+            raw_t = max(0, min(255, raw_t))
+            raw_y = max(0, min(255, raw_y))
+            raw_p = max(0, min(255, raw_p))
+
+            self._js_raw = (raw_r, raw_t, raw_y, raw_p)
+            self._js_target = (tgt_r, tgt_t, tgt_y, tgt_p)
+
+            if arm_str is not None:
+                self._armed = (arm_str == "1")
+                if hasattr(self, "_apply_arm_style"):
+                    self._apply_arm_style(self._armed)
+
             self._push_rc_values()
             self._push_att_metrics()
             return
@@ -3176,8 +3747,14 @@ class MainWindow(QMainWindow):
         if m:
             roll, pitch, u_roll, u_pitch, u_yaw = [float(v) for v in m.groups()]
             self._bench_smc = (roll, pitch, u_roll, u_pitch, u_yaw)
-            if hasattr(self, "_smc_plot"):
-                self._smc_plot.add_sample(roll, pitch, u_roll, u_pitch, u_yaw)
+            if hasattr(self, "_pid_plot"):
+                max_ang = 25.0
+                if hasattr(self, "_pid_inputs") and "max_angle" in self._pid_inputs:
+                    max_ang = self._pid_inputs["max_angle"].value()
+                r, t, y, p = self._js_raw
+                tgt_roll = ((r - 128) / 127.0) * max_ang if abs(r - 128) > 4 else 0.0
+                tgt_pitch = ((p - 128) / 127.0) * max_ang if abs(p - 128) > 4 else 0.0
+                self._pid_plot.add_sample(tgt_roll, roll, tgt_pitch, pitch, u_roll, u_pitch, u_yaw)
             self._push_att_metrics()
             return
 
@@ -3187,10 +3764,44 @@ class MainWindow(QMainWindow):
             self._push_att_metrics()
             return
 
+        m = PID_OK_RE.search(text)
+        if m:
+            self.set_hint("Parameter PID berhasil diterapkan ke Drone \u2713", level="ok")
+            return
+
         m = CAL_OK_RE.search(text)
         if m and self._js_calib_sampling:
             cr, ct, cy, cp = [int(v) for v in m.groups()]
             self._on_cal_ok(cr, ct, cy, cp, n_samples=None)
+            return
+
+        # ── [FLAGS] Drone health status (dari downlink byte flags) ──
+        m = FLAGS_RE.search(text)
+        if m:
+            g, b, p, v, bs, fs = [int(x) for x in m.groups()]
+            prev_gyro = self._flags.get("gyro_calib", True)
+            self._flags = {
+                "gyro_calib": bool(g),
+                "bmi_ok":     bool(b),
+                "bmp_ok":     bool(p),
+                "vbat_ok":    bool(v),
+                "batt_stage": bs,
+                "fs_stage":   fs,
+            }
+            self._flags_received = True
+
+            # Notifikasi user saat status kalibrasi gyro berubah
+            if prev_gyro and not bool(g):
+                self.set_hint(
+                    "\u26A0 GYRO NOT CALIBRATED - Reset drone di permukaan diam!",
+                    level="err"
+                )
+            elif not prev_gyro and bool(g):
+                self.set_hint("\u2713 Gyro calibration recovered (ZUPT)", level="ok")
+
+            # Refresh info bar (bila widget-nya sudah dibuat)
+            if hasattr(self, "_info_bar") and hasattr(self._info_bar, "update_flags"):
+                self._info_bar.update_flags(self._flags)
             return
 
 

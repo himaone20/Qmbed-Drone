@@ -1,124 +1,185 @@
 /* ==========================================================================
- * CONTROL.CPP — Implementation Kendali SMC, Throttle Ramping & TaskControl
+ * CONTROL.CPP — Cascade PID Flight Controller (Roll & Pitch Only)
+ * Target: Quadcopter Quad-X (STM32F401RCT6)
  * ==========================================================================
  */
 
 #include "control.h"
 
-SmcParams gSmcParams = {
-  SMC_K1_DEFAULT,
-  SMC_K2_DEFAULT,
-  SMC_EPS_DEFAULT,
-  SMC_FORCE_TO_PWM_DEFAULT,
-  SMC_DELTA_MAX_DEFAULT
-};
-SemaphoreHandle_t smcMutex = NULL;
-
-uint8_t lastRollCmd = 128;
-uint8_t lastThrottleCmd = 0;
-uint8_t lastYawCmd = 128;
-uint8_t lastPitchCmd = 128;
-
-float throttleSmoothed = ESC_ARM_SPIN_US;
-static unsigned long throttleRampLastMs = 0;
-
-float lastURoll = 0.0f;
+float lastURoll  = 0.0f;
 float lastUPitch = 0.0f;
-float lastUYaw = 0.0f;
+
+static SemaphoreHandle_t pidMutex = NULL;
+
+static PidParams gPidParams = {
+  PID_ANGLE_KP_DEFAULT, PID_ANGLE_KI_DEFAULT, PID_ANGLE_KD_DEFAULT, // Outer Angle (Kp=5.0, Ki=0.05, Kd=0.0)
+  PID_RATE_KP_DEFAULT,  PID_RATE_KI_DEFAULT,  PID_RATE_KD_DEFAULT,  // Inner Rate (Kp=1.6, Ki=0.3, Kd=0.045)
+  2.00f, 0.15f, 0.00f,                                              // Yaw (not used in mixing)
+  PID_MAX_ANGLE_DEG,                                                // maxAngle = 25°
+  150.0f,                                                           // maxYawRate
+  PID_MAX_DELTA_PWM,                                                // maxDeltaPwm = 300us
+  (float)ESC_MIN_US,                                                // escMinPwm = 1000us
+  (float)ESC_ARM_SPIN_US,                                           // escArmSpinPwm = 1200us
+  (float)ESC_MAX_US                                                 // escMaxPwm = 1300us
+};
+
+struct PidChannelState {
+  float prevMeasurement;
+  float prevError;
+  float iTerm;
+  float dTerm;
+};
+
+static PidChannelState stateAngleRoll;
+static PidChannelState stateAnglePitch;
+static PidChannelState stateRateRoll;
+static PidChannelState stateRatePitch;
+
+static unsigned long lastComputeUs = 0;
 
 void control_init()
 {
-  throttleRampLastMs = millis();
+  pidMutex = xSemaphoreCreateMutex();
+  resetPidState();
 }
 
-void updateThrottleCommand(uint8_t t)
+void setPidParams(const PidParams &newParams)
 {
-  int throttleDelta = (int)t - 128;
-  if (abs(throttleDelta) <= THROTTLE_DEADBAND) {
-    throttleDelta = 0;
+  if (pidMutex && xSemaphoreTake(pidMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    gPidParams = newParams;
+    xSemaphoreGive(pidMutex);
+  } else {
+    gPidParams = newParams;
+  }
+}
+
+void getPidParams(PidParams *outParams)
+{
+  if (!outParams) return;
+  if (pidMutex && xSemaphoreTake(pidMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    *outParams = gPidParams;
+    xSemaphoreGive(pidMutex);
+  } else {
+    *outParams = gPidParams;
+  }
+}
+
+void resetPidState()
+{
+  memset(&stateAngleRoll, 0, sizeof(PidChannelState));
+  memset(&stateAnglePitch, 0, sizeof(PidChannelState));
+  memset(&stateRateRoll, 0, sizeof(PidChannelState));
+  memset(&stateRatePitch, 0, sizeof(PidChannelState));
+  lastURoll  = 0.0f;
+  lastUPitch = 0.0f;
+}
+
+/* Outer Loop: Angle Error (deg) -> Desired Angular Rate (deg/s) */
+static float computeAngleP(float angleError, float currentRate,
+                           float Kp, float Ki, float Kd,
+                           PidChannelState &state, float dt,
+                           float maxI, float maxOutput, bool allowIntegrate)
+{
+  float P = Kp * angleError;
+
+  if (allowIntegrate && Ki > 0.0f) {
+    state.iTerm += 0.5f * Ki * dt * (angleError + state.prevError);
+    state.iTerm = constrain(state.iTerm, -maxI, maxI);
+  } else if (!allowIntegrate) {
+    state.iTerm = 0.0f;
+  }
+  state.prevError = angleError;
+
+  // D-term pada outer loop: turunan sudut adalah rate gyro langsung (-Kd * rate)
+  float D = -Kd * currentRate;
+
+  float output = P + state.iTerm + D;
+  return constrain(output, -maxOutput, maxOutput);
+}
+
+/* Inner Loop: Rate Error (deg/s) -> Motor Delta PWM (us) dengan Derivative-on-Measurement */
+static float computeRatePID(float rateError, float gyroRate,
+                            float Kp, float Ki, float Kd,
+                            PidChannelState &state, float dt, float tau,
+                            float maxI, float maxOutput, bool allowIntegrate)
+{
+  float P = Kp * rateError;
+
+  if (allowIntegrate && Ki > 0.0f) {
+    state.iTerm += 0.5f * Ki * dt * (rateError + state.prevError);
+    state.iTerm = constrain(state.iTerm, -maxI, maxI);
+  } else if (!allowIntegrate) {
+    state.iTerm = 0.0f;
+  }
+  state.prevError = rateError;
+
+  // Derivative-on-Measurement: dRate/dt dihitung murni dari gyro measurement (tanpa kick setpoint)
+  float deltaMeasurement = (dt > 0.0001f) ? (gyroRate - state.prevMeasurement) / dt : 0.0f;
+  state.prevMeasurement = gyroRate;
+
+  // 1st-order Low-pass filter untuk D-term (tau ~ 8ms)
+  float dRaw = -Kd * deltaMeasurement;
+  float alpha_d = (tau > 0.0001f) ? (dt / (tau + dt)) : 1.0f;
+  state.dTerm = state.dTerm + alpha_d * (dRaw - state.dTerm);
+
+  float output = P + state.iTerm + state.dTerm;
+  return constrain(output, -maxOutput, maxOutput);
+}
+
+void computeCascadePid(const SensorData &snap,
+                       float targetRollDeg, float targetPitchDeg,
+                       float throttlePwm,
+                       float &outURoll, float &outUPitch)
+{
+  unsigned long nowUs = micros();
+  float dt = (lastComputeUs > 0) ? (float)(nowUs - lastComputeUs) * 1e-6f : 0.005f;
+  lastComputeUs = nowUs;
+  if (dt < 0.0005f || dt > 0.050f) dt = 0.005f;
+
+  // Bila throttle di bawah ambang aktif (1000 - 1150us / cut-off), matikan PID dan reset integrator
+  if (throttlePwm < (float)MIX_ACTIVE_MIN_US) {
+    resetPidState();
+    outURoll  = 0.0f;
+    outUPitch = 0.0f;
+    lastURoll = 0.0f;
+    lastUPitch = 0.0f;
+    return;
   }
 
-  unsigned long now = millis();
-  float elapsedSeconds = (now - throttleRampLastMs) / 1000.0f;
-  throttleRampLastMs = now;
+  PidParams params;
+  getPidParams(&params);
 
-  // Stick tengah tidak mengubah PWM; nilai throttle terakhir tetap dipakai.
-  float stickNorm = throttleDelta >= 0 ?
-    (float)throttleDelta / 127.0f : (float)throttleDelta / 128.0f;
-  throttleSmoothed += stickNorm * THROTTLE_RATE_US_PER_S * elapsedSeconds;
-  throttleSmoothed = constrain(throttleSmoothed,
-                               (float)ESC_MIN_US, (float)ESC_MAX_US);
-}
+  // Integrator hanya aktif saat throttle di atas idle spin (anti-windup di tanah)
+  bool allowIntegrate = (throttlePwm >= params.escArmSpinPwm);
 
-void computeSmc(const SensorData &sensor, const SmcParams &params,
-                float *uRoll, float *uPitch, float *uYaw)
-{
-  // Hover mode: target roll/pitch is level. Yaw uses rate damping only.
-  float rollError = -sensor.roll;
-  float pitchError = -sensor.pitch;
-  float rollSurface = -sensor.gx + params.k1 * rollError;
-  float pitchSurface = -sensor.gy + params.k1 * pitchError;
+  // ── [1] Outer Loop (Angle Controller): Galat Sudut -> Target Laju Putar (°/s) ──
+  float galatAngleRoll  = targetRollDeg  - snap.roll;
+  float galatAnglePitch = targetPitchDeg - snap.pitch;
 
-  float rollTorque = SMC_IX_DEFAULT *
-    (params.k1 * (params.k1 * rollError - sensor.gx) +
-     params.k2 * tanhf(rollSurface / params.eps));
-  float pitchTorque = SMC_IY_DEFAULT *
-    (params.k1 * (params.k1 * pitchError - sensor.gy) +
-     params.k2 * tanhf(pitchSurface / params.eps));
-  float yawTorque = SMC_IZ_DEFAULT *
-    (-params.k1 * sensor.gz - params.k2 * tanhf(sensor.gz / params.eps));
+  float desiredRateRoll = computeAngleP(galatAngleRoll, snap.gx,
+                                        params.angleKp, params.angleKi, params.angleKd,
+                                        stateAngleRoll, dt,
+                                        PID_INTEGRAL_MAX, PID_MAX_RATE_DPS, allowIntegrate);
 
-  *uRoll = constrain((rollTorque / SMC_ARM_LENGTH_DEFAULT) * params.forceToPwm,
-                     -params.deltaMaxPwm, params.deltaMaxPwm);
-  *uPitch = constrain((pitchTorque / SMC_ARM_LENGTH_DEFAULT) * params.forceToPwm,
-                      -params.deltaMaxPwm, params.deltaMaxPwm);
-  *uYaw = constrain((yawTorque / SMC_ARM_LENGTH_DEFAULT) * params.forceToPwm,
-                    -params.deltaMaxPwm, params.deltaMaxPwm);
-}
+  float desiredRatePitch = computeAngleP(galatAnglePitch, snap.gy,
+                                         params.angleKp, params.angleKi, params.angleKd,
+                                         stateAnglePitch, dt,
+                                         PID_INTEGRAL_MAX, PID_MAX_RATE_DPS, allowIntegrate);
 
-void TaskControl(void *pvParameters)
-{
-  (void)pvParameters;
-  TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(TASK_CONTROL_PERIOD_MS);
-  unsigned long lastDebugMs = 0;
+  // ── [2] Inner Loop (Rate Controller): Galat Rate -> Koreksi PWM Delta (us) ──
+  float galatRateRoll  = desiredRateRoll  - snap.gx;
+  float galatRatePitch = desiredRatePitch - snap.gy;
 
-  for (;;) {
-    if (escState == ESC_ARMED) {
-      SensorData sensor = gSensorData;
-      SmcParams params = gSmcParams;
-      if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-        sensor = gSensorData;
-        xSemaphoreGive(sensorMutex);
-      }
-      if (xSemaphoreTake(smcMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-        params = gSmcParams;
-        xSemaphoreGive(smcMutex);
-      }
+  outURoll = computeRatePID(galatRateRoll, snap.gx,
+                            params.rateKp, params.rateKi, params.rateKd,
+                            stateRateRoll, dt, PID_TAU_FILTER,
+                            PID_INTEGRAL_MAX, params.maxDeltaPwm, allowIntegrate);
 
-      updateThrottleCommand(lastThrottleCmd);
-      float uRoll = 0.0f, uPitch = 0.0f, uYaw = 0.0f;
-      if (sensor.bmiOK && throttleSmoothed >= MIX_ACTIVE_MIN_US) {
-        computeSmc(sensor, params, &uRoll, &uPitch, &uYaw);
-      }
-      lastURoll = uRoll;
-      lastUPitch = uPitch;
-      lastUYaw = uYaw;
-      writeSmcMotorMix(throttleSmoothed, uRoll, uPitch, uYaw);
+  outUPitch = computeRatePID(galatRatePitch, snap.gy,
+                             params.rateKp, params.rateKi, params.rateKd,
+                             stateRatePitch, dt, PID_TAU_FILTER,
+                             PID_INTEGRAL_MAX, params.maxDeltaPwm, allowIntegrate);
 
-#if SMC_BENCH_DEBUG
-      if (millis() - lastDebugMs >= 100) {
-        lastDebugMs = millis();
-        Serial.print("[SMC] R:"); Serial.print(sensor.roll, 2);
-        Serial.print(" P:"); Serial.print(sensor.pitch, 2);
-        Serial.print(" T_CMD:"); Serial.print(lastThrottleCmd);
-        Serial.print(" T_PWM:"); Serial.print(throttleSmoothed, 1);
-        Serial.print(" U_R:"); Serial.print(uRoll, 1);
-        Serial.print(" U_P:"); Serial.print(uPitch, 1);
-        Serial.print(" U_Y:"); Serial.println(uYaw, 1);
-      }
-#endif
-    }
-    vTaskDelayUntil(&lastWakeTime, period);
-  }
+  lastURoll  = outURoll;
+  lastUPitch = outUPitch;
 }

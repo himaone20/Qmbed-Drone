@@ -4,8 +4,17 @@
  */
 
 #include "radio.h"
+#include "motors.h"
+#include "control.h"
 
 SPIClass SPI_2(LORA_MOSI_PIN, LORA_MISO_PIN, LORA_SCK_PIN); // PB15, PB14, PB13
+
+// Global buffer perintah terakhir dari remote
+float    gTargetRollDeg    = 0.0f;
+float    gTargetPitchDeg   = 0.0f;
+float    gTargetYawRateDps = 0.0f;
+uint16_t gTargetThrottlePwm = 1000;
+bool     gArmedCmd         = false;
 
 static unsigned long lastLinkMs = 0;
 static bool linkOK = false;
@@ -31,6 +40,8 @@ bool radio_init()
 void TaskLoRa_Control(void *pvParameters)
 {
   (void) pvParameters;
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(TASK_LORA_PERIOD_MS);
 
   for (;;)
   {
@@ -51,16 +62,15 @@ void TaskLoRa_Control(void *pvParameters)
         lastLinkMs = millis();
         if (!linkOK) {
           linkOK = true;
-          Serial.println(">>> Link dengan remote aktif <<<");
+          Serial.println(">>> Link LoRa Remote Aktif <<<");
         }
 
-        /* Update State Motor ESC (ARM / DISARM) */
-        lastRollCmd = up.r;
-        lastThrottleCmd = up.t;
-        lastYawCmd = up.y;
-        lastPitchCmd = up.p;
-        bool armCmd = (up.armed == 1);
-        updateEscFSM(armCmd);
+        // Simpan data perintah stik yang sudah berupa sudut (° & PWM)
+        gTargetRollDeg     = (float)up.targetRoll / 100.0f;
+        gTargetPitchDeg    = (float)up.targetPitch / 100.0f;
+        gTargetYawRateDps  = (float)up.targetYaw / 100.0f;
+        gTargetThrottlePwm = up.targetThrottle;
+        gArmedCmd          = (up.armed == 1);
 
         /* Ambil snapshot data sensor terbaru (thread-safe) */
         SensorData snap;
@@ -69,7 +79,7 @@ void TaskLoRa_Control(void *pvParameters)
           xSemaphoreGive(sensorMutex);
         }
 
-        /* Balas ke remote: DownlinkPacket biner (27 byte, termasuk data SMC) */
+        /* Balas ke remote & GUI drone_viewer: DownlinkPacket biner (28 byte) */
         DownlinkPacket down;
         down.magic = DOWNLINK_MAGIC;
         down.ax = (int16_t)(snap.ax * 100.0f);
@@ -82,35 +92,44 @@ void TaskLoRa_Control(void *pvParameters)
         down.alt = (int16_t)(snap.alt * 100.0f);
         down.roll = (int16_t)(snap.roll * 100.0f);
         down.pitch = (int16_t)(snap.pitch * 100.0f);
-        down.uRoll = (int16_t)(lastURoll * 100.0f);
-        down.uPitch = (int16_t)(lastUPitch * 100.0f);
-        down.uYaw = (int16_t)(lastUYaw * 100.0f);
+        down.uRoll = (int16_t)(lastURoll * 100.0f);   // Koreksi PID Roll aktual
+        down.uPitch = (int16_t)(lastUPitch * 100.0f); // Koreksi PID Pitch aktual
+        down.uYaw = 0;
         down.vbat = (uint16_t)(snap.vbat * 100.0f);
+
+        // Encode status flags: bit0=gyroCalibValid, bit1=bmiOK, bit2=bmpOK,
+        //   bit3=vbatOK, bit4-5=battStage (0..3), bit6-7=failsafeStage (0..3)
+        uint8_t flags = 0;
+        if (snap.gyroCalibValid) flags |= 0x01;
+        if (snap.bmiOK)          flags |= 0x02;
+        if (snap.bmpOK)          flags |= 0x04;
+        if (snap.vbatOK)         flags |= 0x08;
+        flags |= (snap.battStage & 0x03) << 4;
+        down.flags = flags;
 
         LoRa.beginPacket();
         LoRa.write((uint8_t *)&down, sizeof(DownlinkPacket));
         LoRa.endPacket();
 
-        LoRa.receive(); // kembali siaga menunggu paket joystick berikutnya
+        LoRa.receive(); // Kembali siaga menunggu paket berikutnya
 
-        /* Debug lokal via USB-TTL (USART1) */
-        Serial.print("[RX] R:"); Serial.print(up.r);
-        Serial.print(" T:"); Serial.print(up.t);
-        Serial.print(" Y:"); Serial.print(up.y);
-        Serial.print(" P:"); Serial.print(up.p);
-        Serial.print(" ARM:"); Serial.print(up.armed);
-        if (escState == ESC_ARMED) {
-          Serial.print(" | M1:"); Serial.print(getMotorPWM(0));
-          Serial.print(" M2:"); Serial.print(getMotorPWM(1));
-          Serial.print(" M3:"); Serial.print(getMotorPWM(2));
-          Serial.print(" M4:"); Serial.print(getMotorPWM(3));
+        /* Debug via Serial USART1 */
+        Serial.print("[RX CMD] R:"); Serial.print(gTargetRollDeg, 1);
+        Serial.print("° P:");        Serial.print(gTargetPitchDeg, 1);
+        Serial.print("° T:");        Serial.print(gTargetThrottlePwm);
+        Serial.print("us ARM:");     Serial.print(gArmedCmd ? "1" : "0");
+        if (gArmedCmd) {
+          Serial.print(" | M1:");    Serial.print(getMotorPWM(0));
+          Serial.print(" M2:");      Serial.print(getMotorPWM(1));
+          Serial.print(" M3:");      Serial.print(getMotorPWM(2));
+          Serial.print(" M4:");      Serial.print(getMotorPWM(3));
+          Serial.print(" | uR:");    Serial.print(lastURoll, 1);
+          Serial.print(" uP:");      Serial.print(lastUPitch, 1);
         }
-        Serial.print(" | AX:"); Serial.print(snap.ax, 2);
-        Serial.print(" AY:"); Serial.print(snap.ay, 2);
-        Serial.print(" AZ:"); Serial.print(snap.az, 2);
-        Serial.print(" | P:"); Serial.print(snap.press, 2);
-        Serial.print(" A:"); Serial.print(snap.alt, 2);
-        Serial.print(" | V:"); Serial.print(snap.vbat, 2); Serial.println("V");
+        Serial.print(" | Roll:");    Serial.print(snap.roll, 1);
+        Serial.print("° Pitch:");    Serial.print(snap.pitch, 1);
+        Serial.print("° VBat:");     Serial.print(snap.vbat, 2);
+        Serial.println("V");
       }
       else
       {
@@ -120,26 +139,33 @@ void TaskLoRa_Control(void *pvParameters)
     }
     else if (packetSize == sizeof(ConfigPacket))
     {
-      uint8_t buf[sizeof(ConfigPacket)];
+      uint8_t cfgBuf[sizeof(ConfigPacket)];
       for (uint8_t i = 0; i < sizeof(ConfigPacket) && LoRa.available(); i++) {
-        buf[i] = (uint8_t)LoRa.read();
+        cfgBuf[i] = (uint8_t)LoRa.read();
       }
+      ConfigPacket cfg;
+      memcpy(&cfg, cfgBuf, sizeof(ConfigPacket));
+      if (cfg.magic == CONFIG_MAGIC) {
+        PidParams newParams;
+        newParams.angleKp        = cfg.angleKp;
+        newParams.angleKi        = cfg.angleKi;
+        newParams.angleKd        = cfg.angleKd;
+        newParams.rateKp         = cfg.rateKp;
+        newParams.rateKi         = cfg.rateKi;
+        newParams.rateKd         = cfg.rateKd;
+        newParams.yawKp          = cfg.yawKp;
+        newParams.yawKi          = cfg.yawKi;
+        newParams.yawKd          = cfg.yawKd;
+        newParams.maxAngle       = cfg.maxAngle;
+        newParams.maxYawRate     = cfg.maxYawRate;
+        newParams.maxDeltaPwm    = cfg.maxDeltaPwm;
+        newParams.escMinPwm      = (cfg.escMinPwm >= 900.0f && cfg.escMinPwm <= 1400.0f) ? cfg.escMinPwm : (float)ESC_MIN_US;
+        newParams.escArmSpinPwm  = (cfg.escArmSpinPwm >= 1000.0f && cfg.escArmSpinPwm <= 1600.0f) ? cfg.escArmSpinPwm : (float)ESC_ARM_SPIN_US;
+        newParams.escMaxPwm      = (cfg.escMaxPwm >= 1100.0f && cfg.escMaxPwm <= 2200.0f) ? cfg.escMaxPwm : (float)ESC_MAX_US;
 
-      ConfigPacket config;
-      memcpy(&config, buf, sizeof(ConfigPacket));
-      if (config.magic == CONFIG_MAGIC && config.k1 > 0.0f && config.k2 > 0.0f &&
-          config.eps > 0.1f && config.forceToPwm > 0.0f && config.deltaMaxPwm > 0.0f) {
-        if (xSemaphoreTake(smcMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-          gSmcParams.k1 = config.k1;
-          gSmcParams.k2 = config.k2;
-          gSmcParams.eps = config.eps;
-          gSmcParams.forceToPwm = config.forceToPwm;
-          gSmcParams.deltaMaxPwm = config.deltaMaxPwm;
-          xSemaphoreGive(smcMutex);
-        }
-        Serial.print("[SMC] Params k1="); Serial.print(config.k1, 2);
-        Serial.print(" k2="); Serial.print(config.k2, 2);
-        Serial.print(" eps="); Serial.println(config.eps, 2);
+        setPidParams(newParams);
+        setEscPwmLimits((int)newParams.escMinPwm, (int)newParams.escArmSpinPwm, (int)newParams.escMaxPwm);
+        Serial.println("[PID] Parameter PID & Limit ESC PWM Baru Berhasil Diterapkan dari GUI!");
       }
       LoRa.receive();
     }
@@ -149,22 +175,13 @@ void TaskLoRa_Control(void *pvParameters)
       LoRa.receive();
     }
 
-    /* Update proses arming 5 detik saat timer berjalan */
-    if (escState == ESC_ARMING) {
-      updateEscFSM(true);
-    }
-
-    /* Update LED PC4 (Indikator Arming / Armed) */
-    updateLedIndicator();
-
-    /* Link timeout & Failsafe motor */
-    if (linkOK && (millis() - lastLinkMs > LINK_TIMEOUT_MS))
+    /* Link timeout check */
+    if (linkOK && (millis() - lastLinkMs > 3000))
     {
       linkOK = false;
-      updateEscFSM(false); // FAILSAFE: matikan motor seketika
-      Serial.println("! Link terputus: sinyal remote hilang > 1 detik. Motor STOP.");
+      Serial.println("[RADIO] Link LoRa terputus (> 3s tidak ada paket).");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(TASK_LORA_PERIOD_MS));
+    vTaskDelayUntil(&lastWakeTime, period);
   }
 }

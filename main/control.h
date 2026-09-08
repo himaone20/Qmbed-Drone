@@ -1,5 +1,6 @@
 /* ==========================================================================
- * CONTROL.H — Kendali Sliding Mode Controller (SMC), Throttle & TaskControl
+ * CONTROL.H — Cascade PID Controller (Roll & Pitch)
+ * Target: Quadcopter Quad-X (STM32F401RCT6)
  * ==========================================================================
  */
 
@@ -11,25 +12,18 @@
 #include <math.h>
 #include "config.h"
 #include "sensors.h"
-#include "motors.h"
 
-extern SmcParams gSmcParams;
-extern SemaphoreHandle_t smcMutex;
-
-extern uint8_t lastRollCmd;
-extern uint8_t lastThrottleCmd;
-extern uint8_t lastYawCmd;
-extern uint8_t lastPitchCmd;
-
-extern float throttleSmoothed;
 extern float lastURoll;
 extern float lastUPitch;
-extern float lastUYaw;
 
 void control_init();
-void updateThrottleCommand(uint8_t t);
-void computeSmc(const SensorData &sensor, const SmcParams &params,
-                float *uRoll, float *uPitch, float *uYaw);
-void TaskControl(void *pvParameters);
+void setPidParams(const PidParams &newParams);
+void getPidParams(PidParams *outParams);
+void resetPidState();
+
+void computeCascadePid(const SensorData &snap,
+                       float targetRollDeg, float targetPitchDeg,
+                       float throttlePwm,
+                       float &outURoll, float &outUPitch);
 
 #endif // CONTROL_H
