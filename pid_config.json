@@ -1,13 +1,13 @@
 {
-    "angle_kp": 2.0,
-    "angle_ki": 0.2,
-    "angle_kd": 0.0,
-    "rate_kp": 3.0,
+    "angle_kp": 5.0,
+    "angle_ki": 0.0,
+    "angle_kd": 0.07,
+    "rate_kp": 1.0,
     "rate_ki": 0.2,
-    "rate_kd": 0.0,
+    "rate_kd": 0.009,
     "esc_min_pwm": 1000.0,
     "esc_arm_spin_pwm": 1200.0,
-    "esc_max_pwm": 1700.0,
+    "esc_max_pwm": 1800.0,
     "max_delta_pwm": 100.0,
-    "max_angle": 20.0
+    "max_angle": 10.0
 }

@@ -2920,10 +2920,10 @@ class MainWindow(QMainWindow):
         sticks_row = QHBoxLayout()
         sticks_row.setSpacing(12)
 
-        self._joy_left = JoystickWidget("LEFT STICK", mode="MODE 2",
-                                        vx_label="YAW", vy_label="THROTTLE")
-        self._joy_right = JoystickWidget("RIGHT STICK", mode="MODE 2",
-                                         vx_label="ROLL", vy_label="PITCH")
+        self._joy_left = JoystickWidget("LEFT STICK", mode="CUSTOM",
+                                        vx_label="ROLL", vy_label="THROTTLE")
+        self._joy_right = JoystickWidget("RIGHT STICK", mode="CUSTOM",
+                                         vx_label="YAW", vy_label="PITCH")
         add_shadow(self._joy_left, blur=22, dy=3, alpha=22)
         add_shadow(self._joy_right, blur=22, dy=3, alpha=22)
         sticks_row.addWidget(self._joy_left, stretch=1)
@@ -3644,11 +3644,11 @@ class MainWindow(QMainWindow):
         # ESP32 sudah mengirim nilai yang sudah terkalibrasi penuh.
         r, t, y, p = self._js_raw
 
-        # Left stick: X = YAW, Y = THROTTLE
-        # Right stick: X = ROLL, Y = PITCH
+        # Left stick: X = ROLL, Y = THROTTLE
+        # Right stick: X = YAW, Y = PITCH
         # Normalize 0..255 -> 0..1; joy widget Y=0 at top so invert
-        self._joy_left.set_position(y / 255.0, 1.0 - t / 255.0)
-        self._joy_right.set_position(r / 255.0, 1.0 - p / 255.0)
+        self._joy_left.set_position(r / 255.0, 1.0 - t / 255.0)
+        self._joy_right.set_position(y / 255.0, 1.0 - p / 255.0)
         self._rc_readout.set_values(r, t, y, p, self._js_calibrated, targets=self._js_target)
 
     def _parse_line(self, text: str):
@@ -3667,16 +3667,11 @@ class MainWindow(QMainWindow):
             self._press = float(m.group(1))
             alt = float(m.group(2))
             if self._first_alt:
-                self._alt_offset = alt
-                self._alt_smooth = 0.0
+                self._alt_smooth = alt
                 self._first_alt = False
-            corrected = alt - self._alt_offset
-            if corrected < 0.0:
-                corrected = 0.0
-            # Digital IIR Low-Pass Filter: y[k] = 0.80 * y[k-1] + 0.20 * x[k]
-            self._alt_smooth = 0.80 * self._alt_smooth + 0.20 * corrected
-            if self._alt_smooth < 0.0:
-                self._alt_smooth = 0.0
+            else:
+                # Filter IIR ringan agar responsif terhadap ketinggian asli dari drone
+                self._alt_smooth = 0.80 * self._alt_smooth + 0.20 * alt
             self._push_att_metrics()
             return
 

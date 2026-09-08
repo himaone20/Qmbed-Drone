@@ -116,10 +116,10 @@ const float    THROTTLE_EXPO  = 0.40f;   // 40% kurva eksponensial agar respon g
 const int   STICK_DEADBAND    = 6;       // Deadzone toleransi ADC di sekitar 128
 
 /* ------------------------- konfigurasi joystick --------------------------- */
-const int PIN_LEFT_X  = 34;   // ROLL
-const int PIN_LEFT_Y  = 35;   // THROTTLE
-const int PIN_RIGHT_X = 32;   // YAW
-const int PIN_RIGHT_Y = 33;   // PITCH
+const int PIN_LEFT_X  = 33;   // ROLL
+const int PIN_LEFT_Y  = 32;   // THROTTLE
+const int PIN_RIGHT_X = 35;   // YAW
+const int PIN_RIGHT_Y = 34;   // PITCH
 
 const int   CALIBRATION_SAMPLES   = 400;   // sampel saat startup
 const float JOYSTICK_DEADZONE     = 0.07f; // 7% rentang
@@ -207,11 +207,11 @@ void calibrateFromGui() {
     center[ch] = (int)(sum[ch] / GUI_CAL_SAMPLES);
     filt[ch] = (float)center[ch];
   }
-  // Label sesuai mapping akhir: R=cmd[1], T=cmd[2], Y=cmd[3], P=cmd[0]
-  Serial.print("[CAL] OK CR=");  Serial.print(center[1]);
-  Serial.print(" CT=");          Serial.print(center[2]);
-  Serial.print(" CY=");          Serial.print(center[3]);
-  Serial.print(" CP=");          Serial.println(center[0]);
+  // Label sesuai mapping: R=cmd[0], T=cmd[1], Y=cmd[2], P=cmd[3]
+  Serial.print("[CAL] OK CR=");  Serial.print(center[0]);
+  Serial.print(" CT=");          Serial.print(center[1]);
+  Serial.print(" CY=");          Serial.print(center[2]);
+  Serial.print(" CP=");          Serial.println(center[3]);
 }
 
 int applyInvert(int ch, int raw) {
@@ -566,46 +566,46 @@ void renderDashboard(uint8_t rawR, uint8_t rawT, uint8_t rawY, uint8_t rawP,
   display.drawFastHLine(0, 10, 128, SH110X_WHITE);
 
   // ---------------- [2] JOYSTICK PADS (y: 11 - 44) ----------------
-  // Mode 2 Standard:
-  // Stick Kiri  : X = YAW (rawY), Y = THROTTLE (rawT) - cy=27, r=15
-  // Stick Kanan : X = ROLL (rawR), Y = PITCH (rawP)    - cy=27, r=15
-  drawJoystickPad(32, 27, 15, rawY, rawT);
-  drawJoystickPad(96, 27, 15, rawR, rawP);
+  // Layout Stik:
+  // Stick Kiri  : X = ROLL (rawR), Y = THROTTLE (rawT) - cy=27, r=15
+  // Stick Kanan : X = YAW (rawY),  Y = PITCH (rawP)    - cy=27, r=15
+  drawJoystickPad(32, 27, 15, rawR, rawT);
+  drawJoystickPad(96, 27, 15, rawY, rawP);
 
   // Garis pemisah tengah vertikal & pemisah readout horizontal
   display.drawFastVLine(64, 11, 53, SH110X_WHITE);
   display.drawFastHLine(0, 44, 128, SH110X_WHITE);
 
   // ---------------- [3] VALUE READOUT (2-KOLOM x 2-BARIS) ----------------
-  // Kolom Kiri (Gimbal Kiri): Throttle & Yaw (x: 0 - 63)
+  // Kolom Kiri (Gimbal Kiri): Throttle & Roll (x: 0 - 63)
   // Baris 1 (y: 47): Throttle PWM us
   display.setCursor(3, 47);
   display.print("T:");
   display.print(throttlePwm);
   display.print("us");
 
-  // Baris 2 (y: 56): Yaw Rate °/s
+  // Baris 2 (y: 56): Roll Angle °
   display.setCursor(3, 56);
-  display.print("Y:");
-  if (yawRateDps > 0.5f) display.print("+");
-  display.print((int)round(yawRateDps));
-  display.print((char)247);
-  display.print("/s");
-
-  // Kolom Kanan (Gimbal Kanan): Roll & Pitch Angle (x: 65 - 127)
-  // Baris 1 (y: 47): Roll Angle °
-  display.setCursor(68, 47);
   display.print("R:");
   if (rollDeg > 0.05f) display.print("+");
   display.print((int)round(rollDeg));
   display.print((char)247);
 
-  // Baris 2 (y: 56): Pitch Angle °
-  display.setCursor(68, 56);
+  // Kolom Kanan (Gimbal Kanan): Pitch Angle & Yaw Rate (x: 65 - 127)
+  // Baris 1 (y: 47): Pitch Angle °
+  display.setCursor(68, 47);
   display.print("P:");
   if (pitchDeg > 0.05f) display.print("+");
   display.print((int)round(pitchDeg));
   display.print((char)247);
+
+  // Baris 2 (y: 56): Yaw Rate °/s
+  display.setCursor(68, 56);
+  display.print("Y:");
+  if (yawRateDps > 0.5f) display.print("+");
+  display.print((int)round(yawRateDps));
+  display.print((char)247);
+  display.print("/s");
 
   display.display();
 }
@@ -615,10 +615,10 @@ void renderDashboard(uint8_t rawR, uint8_t rawT, uint8_t rawY, uint8_t rawP,
  * ========================================================================== */
 void setup()
 {
-  PINS[0] = SWAP_LEFT_X_Y  ? PIN_LEFT_Y  : PIN_LEFT_X;    // ROLL
-  PINS[1] = SWAP_LEFT_X_Y  ? PIN_LEFT_X  : PIN_LEFT_Y;    // THROTTLE
-  PINS[2] = SWAP_RIGHT_X_Y ? PIN_RIGHT_Y : PIN_RIGHT_X;   // YAW
-  PINS[3] = SWAP_RIGHT_X_Y ? PIN_RIGHT_X : PIN_RIGHT_Y;   // PITCH
+  PINS[0] = PIN_LEFT_X;    // ROLL (Stik Kiri X)
+  PINS[1] = PIN_LEFT_Y;    // THROTTLE (Stik Kiri Y)
+  PINS[2] = PIN_RIGHT_X;   // YAW (Stik Kanan X)
+  PINS[3] = PIN_RIGHT_Y;   // PITCH (Stik Kanan Y)
   INVERT[0] = INVERT_LEFT_X;
   INVERT[1] = INVERT_LEFT_Y;
   INVERT[2] = INVERT_RIGHT_X;
@@ -827,21 +827,19 @@ void loop()
   int cmd[N_CH];
   if (guiOverride) {
     // Mode Tes PID: abai joystick hardware, pakai nilai dari GUI.
-    // R=guiRoll, T=guiThrottle, Y=guiYaw, P=guiPitch (semua 128 kecuali throttle)
-    cmd[0] = guiPitch;      // P (indeks 0 di array, = guiPitch)
-    cmd[1] = guiRoll;       // R (indeks 1)
-    cmd[2] = guiThrottle;   // T (indeks 2)
-    cmd[3] = guiYaw;        // Y (indeks 3)
+    cmd[0] = guiRoll;       // ROLL
+    cmd[1] = guiThrottle;   // THROTTLE
+    cmd[2] = guiYaw;        // YAW
+    cmd[3] = guiPitch;      // PITCH
   } else {
     processJoystick(cmd);
   }
 
-  // Mapping internal (sama persis dengan referensi JoystickTest yang sudah
-  // terbukti benar): cmd[1]->R, cmd[2]->T, cmd[3]->Y, cmd[0]->P
-  int dispR = cmd[1];
-  int dispT = cmd[2];
-  int dispY = cmd[3];
-  int dispP = cmd[0];
+  // Mapping kanal: cmd[0]->R (Kiri X), cmd[1]->T (Kiri Y), cmd[2]->Y (Kanan X), cmd[3]->P (Kanan Y)
+  int dispR = cmd[0];
+  int dispT = cmd[1];
+  int dispY = cmd[2];
+  int dispP = cmd[3];
 
   // 1. Roll: dispR 128 -> 0.0°, 255 -> +25.0°, 0 -> -25.0°
   float targetRollDeg = 0.0f;

@@ -30,7 +30,7 @@ static float az_f = 9.80665f;
 static bool attitudeInitialized = false;
 static unsigned long lastAttitudeUs = 0;
 
-/* ── Baro Altitude Conditioning Pipeline ───────────────────────────────── */
+/* ── Baro Altitude PT1 + Median Filter ─────────────────────────────────── */
 struct MedianFilter5 {
   float buf[5];
   uint8_t count = 0;
@@ -62,37 +62,33 @@ struct MedianFilter5 {
   }
 };
 
-struct AltitudeConditioner {
+struct AltitudeFilter {
   MedianFilter5 median;
-  float ema = 0.0f;
-  float slewed = 0.0f;
+  float alt_filtered = 0.0f;
   bool initialized = false;
 
   float update(float raw_alt, float dt) {
     float med = median.update(raw_alt);
     if (!initialized) {
-      ema = med;
-      slewed = med;
+      alt_filtered = med;
       initialized = true;
-      return slewed;
+      return alt_filtered;
     }
-    ema = (1.0f - BARO_EMA_ALPHA) * ema + BARO_EMA_ALPHA * med;
-
-    float maxStep = ALT_SLEW_MAX_MPS * dt;
-    float delta = constrain(ema - slewed, -maxStep, maxStep);
-    slewed += delta;
-    return slewed;
+    // Time constant tau = 0.30s (stabil, responsif, zero slew-rate ramp drift)
+    float tau = 0.30f;
+    float alpha = (tau > 0.001f) ? (dt / (tau + dt)) : 1.0f;
+    alt_filtered += alpha * (med - alt_filtered);
+    return alt_filtered;
   }
 
   void reset(float value) {
     median.reset(value);
-    ema = value;
-    slewed = value;
+    alt_filtered = value;
     initialized = true;
   }
 };
 
-static AltitudeConditioner altitudeCond;
+static AltitudeFilter altitudeFilter;
 
 /* ========================= FUNGSI ADC VBAT (NON-BLOCKING) ================ */
 
@@ -230,7 +226,8 @@ struct bmp180_calib {
 };
 
 static bmp180_calib cal180;
-static const uint8_t bmp180_oss = 1; // Standard resolution (oss = 1, delay 7.5ms)
+static const uint8_t bmp180_oss = 2; // High Resolution (4 sampel internal, 13.5ms, noise rendah ~0.2m)
+static int32_t bmp180_b5 = 4000;
 
 static bool bmp180_init(void)
 {
@@ -258,129 +255,19 @@ static bool bmp180_init(void)
   return true;
 }
 
-/* Non-blocking BMP180 State Machine: 100% bebas blocking delay */
-static bool bmp180_poll(float &press_hpa, float &alt_m)
+static void bmp180_compute_b5(int32_t ut)
 {
-  static uint8_t phase = 0; // 0: Idle, 1: Reading temp, 2: Reading press
-  static unsigned long last_start_ms = 0;
-  static unsigned long due_ms = 0;
-  static unsigned long last_temp_ms = 0;
-  static int32_t cached_b5 = 0;
-  static bool temp_valid = false;
-
-  unsigned long now = millis();
-
-  if (phase == 0) {
-    if (now - last_start_ms < 50) return false; // 20 Hz baro poll
-    last_start_ms = now;
-
-    if (!temp_valid || (now - last_temp_ms >= 2000)) {
-      i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, BMP180_CMD_READ_TEMP);
-      due_ms = now + 6;
-      phase = 1;
-    } else {
-      uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
-      i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
-      due_ms = now + 9;
-      phase = 2;
-    }
-    return false;
+  int32_t x1 = ((ut - (int32_t)cal180.ac6) * (int32_t)cal180.ac5) >> 15;
+  int32_t denom = x1 + cal180.md;
+  if (denom != 0) {
+    int32_t x2 = ((int32_t)cal180.mc << 11) / denom;
+    bmp180_b5 = x1 + x2;
   }
-
-  if ((long)(now - due_ms) < 0) {
-    return false; // Sedang konversi hardware di sensor, jangan block CPU!
-  }
-
-  if (phase == 1) {
-    uint8_t t_buf[2];
-    if (i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, t_buf, 2)) {
-      int32_t ut = (int32_t)(t_buf[0] << 8 | t_buf[1]);
-      int32_t x1 = ((ut - (int32_t)cal180.ac6) * (int32_t)cal180.ac5) >> 15;
-      int32_t denom = x1 + cal180.md;
-      if (denom != 0) {
-        int32_t x2 = ((int32_t)cal180.mc << 11) / denom;
-        cached_b5 = x1 + x2;
-        temp_valid = true;
-        last_temp_ms = now;
-      }
-    }
-    uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
-    i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
-    due_ms = now + 9;
-    phase = 2;
-    return false;
-  }
-
-  if (phase == 2) {
-    phase = 0;
-    uint8_t p_buf[3];
-    if (!i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, p_buf, 3)) {
-      return false;
-    }
-    int32_t up = (((int32_t)p_buf[0] << 16) | ((int32_t)p_buf[1] << 8) | (int32_t)p_buf[2]) >> (8 - bmp180_oss);
-
-    int32_t b5 = cached_b5;
-    int32_t b6 = b5 - 4000;
-    int32_t x1 = (cal180.b2 * ((b6 * b6) >> 12)) >> 11;
-    int32_t x2 = (cal180.ac2 * b6) >> 11;
-    int32_t x3 = x1 + x2;
-    int32_t b3 = ((((int32_t)cal180.ac1 * 4 + x3) << bmp180_oss) + 2) >> 2;
-
-    x1 = (cal180.ac3 * b6) >> 13;
-    x2 = (cal180.b1 * ((b6 * b6) >> 12)) >> 16;
-    x3 = ((x1 + x2) + 2) >> 2;
-    uint32_t b4 = ((uint32_t)cal180.ac4 * (uint32_t)(x3 + 32768)) >> 15;
-    uint32_t b7 = ((uint32_t)up - b3) * (50000 >> bmp180_oss);
-
-    int32_t p;
-    if (b7 < 0x80000000) {
-      p = (b7 * 2) / b4;
-    } else {
-      p = (b7 / b4) * 2;
-    }
-
-    x1 = (p >> 8) * (p >> 8);
-    x1 = (x1 * 3038) >> 16;
-    x2 = (-7357 * p) >> 16;
-    p = p + ((x1 + x2 + 3791) >> 4);
-
-    float press = p / 100.0f;
-    if (press > 300.0f && press < 1200.0f) {
-      press_hpa = press;
-      alt_m = 44330.0f * (1.0f - powf(press / 1013.25f, 0.190284f));
-      return true;
-    }
-  }
-  return false;
 }
 
-/* Synchronous Baro Read for Setup Baseline Only */
-static bool bmp180_read_sync(float *press_hpa, float *alt_m)
+static float bmp180_compute_pressure(int32_t up)
 {
-  i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, BMP180_CMD_READ_TEMP);
-  delay(6);
-  uint8_t t_buf[2];
-  int32_t b5 = 0;
-  if (i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, t_buf, 2)) {
-    int32_t ut = (int32_t)(t_buf[0] << 8 | t_buf[1]);
-    int32_t x1 = ((ut - (int32_t)cal180.ac6) * (int32_t)cal180.ac5) >> 15;
-    int32_t denom = x1 + cal180.md;
-    if (denom != 0) {
-      int32_t x2 = ((int32_t)cal180.mc << 11) / denom;
-      b5 = x1 + x2;
-    }
-  }
-
-  uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
-  i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
-  delay(9);
-  uint8_t p_buf[3];
-  if (!i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, p_buf, 3)) {
-    return false;
-  }
-  int32_t up = (((int32_t)p_buf[0] << 16) | ((int32_t)p_buf[1] << 8) | (int32_t)p_buf[2]) >> (8 - bmp180_oss);
-
-  int32_t b6 = b5 - 4000;
+  int32_t b6 = bmp180_b5 - 4000;
   int32_t x1 = (cal180.b2 * ((b6 * b6) >> 12)) >> 11;
   int32_t x2 = (cal180.ac2 * b6) >> 11;
   int32_t x3 = x1 + x2;
@@ -398,7 +285,96 @@ static bool bmp180_read_sync(float *press_hpa, float *alt_m)
   x2 = (-7357 * p) >> 16;
   p = p + ((x1 + x2 + 3791) >> 4);
 
-  *press_hpa = p / 100.0f;
+  return (float)p / 100.0f;
+}
+
+/* Non-blocking BMP180 State Machine: 20 Hz, 100% Bebas Blocking Delay */
+static bool bmp180_poll(float &press_hpa, float &alt_m)
+{
+  static uint8_t phase = 0; // 0: Idle, 1: Reading Temp, 2: Reading Press
+  static unsigned long last_start_ms = 0;
+  static unsigned long due_ms = 0;
+  static unsigned long last_temp_ms = 0;
+
+  unsigned long now = millis();
+
+  if (phase == 0) {
+    if (now - last_start_ms < 50) return false; // 20 Hz poll
+    last_start_ms = now;
+
+    // Baca suhu tiap 10 detik sekali (hanya untuk kompensasi termal chip)
+    if (now - last_temp_ms >= 10000 || last_temp_ms == 0) {
+      i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, BMP180_CMD_READ_TEMP);
+      due_ms = now + 5;
+      phase = 1;
+    } else {
+      uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
+      i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
+      due_ms = now + 14; // OSS 2 delay = 13.5 ms
+      phase = 2;
+    }
+    return false;
+  }
+
+  if ((long)(now - due_ms) < 0) {
+    return false; // Konversi hardware di sensor belum selesai, jangan block CPU!
+  }
+
+  if (phase == 1) {
+    uint8_t t_buf[2];
+    if (i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, t_buf, 2)) {
+      int32_t ut = (int32_t)(t_buf[0] << 8 | t_buf[1]);
+      bmp180_compute_b5(ut);
+      last_temp_ms = now;
+    }
+    // Langsung trigger pembacaan tekanan
+    uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
+    i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
+    due_ms = now + 14;
+    phase = 2;
+    return false;
+  }
+
+  if (phase == 2) {
+    phase = 0;
+    uint8_t p_buf[3];
+    if (!i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, p_buf, 3)) {
+      return false;
+    }
+    int32_t up = (((int32_t)p_buf[0] << 16) | ((int32_t)p_buf[1] << 8) | (int32_t)p_buf[2]) >> (8 - bmp180_oss);
+
+    float press = bmp180_compute_pressure(up);
+    if (press > 300.0f && press < 1200.0f) {
+      press_hpa = press;
+      alt_m = 44330.0f * (1.0f - powf(press / 1013.25f, 0.190284f));
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Synchronous Baro Read for Setup Baseline Only */
+static bool bmp180_read_sync(float *press_hpa, float *alt_m)
+{
+  i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, BMP180_CMD_READ_TEMP);
+  delay(6);
+  uint8_t t_buf[2];
+  if (i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, t_buf, 2)) {
+    int32_t ut = (int32_t)(t_buf[0] << 8 | t_buf[1]);
+    bmp180_compute_b5(ut);
+  }
+
+  uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
+  i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
+  delay(14);
+  uint8_t p_buf[3];
+  if (!i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, p_buf, 3)) {
+    return false;
+  }
+  int32_t up = (((int32_t)p_buf[0] << 16) | ((int32_t)p_buf[1] << 8) | (int32_t)p_buf[2]) >> (8 - bmp180_oss);
+
+  float press = bmp180_compute_pressure(up);
+  *press_hpa = press;
   if (*press_hpa > 300.0f && *press_hpa < 1200.0f) {
     *alt_m = 44330.0f * (1.0f - powf(*press_hpa / 1013.25f, 0.190284f));
     return true;
@@ -544,10 +520,10 @@ bool sensors_init()
       }
       float firstReading = samples[valid_baro / 2];
       altitude_offset = firstReading;
-      altitudeCond.reset(firstReading);
+      altitudeFilter.reset(firstReading);
     } else {
       altitude_offset = 0.0f;
-      altitudeCond.reset(0.0f);
+      altitudeFilter.reset(0.0f);
     }
     alt_filtered = 0.0f;
     Serial.println("OK");
@@ -708,9 +684,8 @@ void sensors_poll_telemetry()
     last_baro_ms = now;
     if (dt_baro < 0.005f || dt_baro > 0.5f) dt_baro = 0.05f;
 
-    float cond_alt = altitudeCond.update(raw_a, dt_baro);
+    float cond_alt = altitudeFilter.update(raw_a, dt_baro);
     float raw_rel_alt = cond_alt - altitude_offset;
-    if (raw_rel_alt < 0.0f) raw_rel_alt = 0.0f;
 
     float baro_vz = (raw_rel_alt - prev_alt) / dt_baro;
     prev_alt = raw_rel_alt;

@@ -4,7 +4,7 @@
  *
  * Modul Aktif:
  * - config.h   : Konfigurasi Pinout, Parameter Sensor, PID & Telemetri
- * - sensors.*  : Driver I2C (BMI160 + BMP280), Kalibrasi Boot & Fusi Attitude Roll/Pitch (100Hz)
+ * - sensors.*  : Driver I2C (BMI160 + BMP180), Kalibrasi Boot & Fusi Attitude Roll/Pitch (100Hz)
  * - control.*  : Cascade PID Controller (Roll & Pitch Loop) & Window Tuning GUI Handler
  * - radio.*    : Driver LoRa RA-02 (SPI2) & Telemetri 2-Arah ke Remote / GUI drone_viewer
  * - motors.*   : Driver 4 ESC PWM PB6..PB9 (Quad-X Mixer) & TaskMotors (100Hz)
