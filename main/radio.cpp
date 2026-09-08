@@ -72,15 +72,16 @@ void TaskLoRa_Control(void *pvParameters)
         gTargetThrottlePwm = up.targetThrottle;
         gArmedCmd          = (up.armed == 1);
 
-        /* Ambil snapshot data sensor terbaru (thread-safe) */
-        SensorData snap;
+        /* Ambil snapshot data sensor terbaru (thread-safe, inisialisasi aman anti-glitch) */
+        SensorData snap = {};
         if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
           snap = gSensorData;
           xSemaphoreGive(sensorMutex);
         }
 
-        /* Balas ke remote & GUI drone_viewer: DownlinkPacket biner (28 byte) */
+        /* Balas ke remote & GUI drone_viewer: DownlinkPacket biner (30 byte) */
         DownlinkPacket down;
+        memset(&down, 0, sizeof(DownlinkPacket));
         down.magic = DOWNLINK_MAGIC;
         down.ax = (int16_t)(snap.ax * 100.0f);
         down.ay = (int16_t)(snap.ay * 100.0f);
@@ -92,9 +93,10 @@ void TaskLoRa_Control(void *pvParameters)
         down.alt = (int16_t)(snap.alt * 100.0f);
         down.roll = (int16_t)(snap.roll * 100.0f);
         down.pitch = (int16_t)(snap.pitch * 100.0f);
+        down.yaw = (int16_t)(snap.yaw * 100.0f);
         down.uRoll = (int16_t)(lastURoll * 100.0f);   // Koreksi PID Roll aktual
         down.uPitch = (int16_t)(lastUPitch * 100.0f); // Koreksi PID Pitch aktual
-        down.uYaw = 0;
+        down.uYaw = (int16_t)(lastUYaw * 100.0f);     // Koreksi PID Yaw aktual
         down.vbat = (uint16_t)(snap.vbat * 100.0f);
 
         // Encode status flags: bit0=gyroCalibValid, bit1=bmiOK, bit2=bmpOK,
@@ -116,7 +118,8 @@ void TaskLoRa_Control(void *pvParameters)
         /* Debug via Serial USART1 */
         Serial.print("[RX CMD] R:"); Serial.print(gTargetRollDeg, 1);
         Serial.print("° P:");        Serial.print(gTargetPitchDeg, 1);
-        Serial.print("° T:");        Serial.print(gTargetThrottlePwm);
+        Serial.print("° Y:");        Serial.print(gTargetYawRateDps, 1);
+        Serial.print("°/s T:");      Serial.print(gTargetThrottlePwm);
         Serial.print("us ARM:");     Serial.print(gArmedCmd ? "1" : "0");
         if (gArmedCmd) {
           Serial.print(" | M1:");    Serial.print(getMotorPWM(0));
@@ -125,6 +128,7 @@ void TaskLoRa_Control(void *pvParameters)
           Serial.print(" M4:");      Serial.print(getMotorPWM(3));
           Serial.print(" | uR:");    Serial.print(lastURoll, 1);
           Serial.print(" uP:");      Serial.print(lastUPitch, 1);
+          Serial.print(" uY:");      Serial.print(lastUYaw, 1);
         }
         Serial.print(" | Roll:");    Serial.print(snap.roll, 1);
         Serial.print("° Pitch:");    Serial.print(snap.pitch, 1);

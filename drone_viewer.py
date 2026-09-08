@@ -52,10 +52,11 @@ BMP_RE = re.compile(
     r"\[BMP\]\s*P:([-\d.]+)\s*A:([-\d.]+)"
 )
 TX_RE = re.compile(
-    r"\[TX\]\s*R:([-+\d.]+)(?:deg)?\s*T:(\d+)(?:us)?\s*Y:([-+\d.]+)(?:dps)?\s*P:([-+\d.]+)(?:deg)?(?:\s*ARM:(\d+))?"
+    r"\[TX\]\s*R:([-+\d.]+)(?:deg)?\s*T:(\d+)(?:us)?\s*Y:([-+\d.]+)(?:dps)?\s*P:([-+\d.]+)(?:deg)?(?:\s*ARM:(\d+))?(?:\s*RAW_T:(\d+))?"
 )
 SMC_RE = re.compile(
     r"\[SMC\]\s*ROLL:([-\d.]+)\s*PITCH:([-\d.]+)"
+    r"(?:\s*YAW:([-\d.]+))?"
     r"\s*UR:([-\d.]+)\s*UP:([-\d.]+)\s*UY:([-\d.]+)"
 )
 BAT_RE = re.compile(
@@ -173,7 +174,7 @@ class OrientationFilter:
         acc_total = math.sqrt(ax*ax + ay*ay + az*az)
         if acc_total > 1.0:
             acc_roll  = math.atan2(ay, az) * DEG
-            acc_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az)) * DEG
+            acc_pitch = math.atan2(ax, math.sqrt(ay*ay + az*az)) * DEG
         else:
             acc_roll = self.roll
             acc_pitch = self.pitch
@@ -1664,7 +1665,7 @@ class MotorRpmCard(QFrame):
         p.setPen(COL_SUBTEXT)
         p.setFont(qfont(FONT_UI, 8, QFont.Bold, letter_spacing=1.6))
         p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter,
-                   f"4-MOTOR REALTIME RPM \u00B7 A2212 1400KV (3S {self.vbat:.2f}V)")
+                   f"MOTOR REALTIME RPM \u00B7 A2212 1400KV (3S {self.vbat:.2f}V)")
 
         badge_txt = "ARMED" if self.armed else "DISARMED"
         badge_bg = COL_OK if self.armed else COL_MUTED
@@ -2228,7 +2229,7 @@ class MainWindow(QMainWindow):
         self._throttle_last_ms = time.monotonic() * 1000.0
 
         # ── bench-test live state (SMC + IMU) ──
-        self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0)  # (roll, pitch, uRoll, uPitch, uYaw)
+        self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # (roll, pitch, yaw, uRoll, uPitch, uYaw)
         self._bench_imu = (0.0, 0.0, 0.0)           # (gx, gy, gz) deg/s
         self._bench_alt_press = (0.0, 0.0)          # (alt, press)
 
@@ -3049,17 +3050,18 @@ class MainWindow(QMainWindow):
         return page
 
     def _update_bench(self):
-        # Gunakan roll/pitch ONBOARD drone (dari paket SMC) karena itulah yang
+        # Gunakan roll/pitch/yaw ONBOARD drone (dari paket SMC) karena itulah yang
         # benar-benar dipakai controller, bukan filter ulang di GUI.
         roll = self._bench_smc[0]
         pitch = self._bench_smc[1]
-        ur, up, uy = self._bench_smc[2], self._bench_smc[3], self._bench_smc[4]
+        yaw = self._bench_smc[2]
+        ur, up, uy = self._bench_smc[3], self._bench_smc[4], self._bench_smc[5]
         gz = self._bench_imu[2]
 
         # Ramping throttle dari stik berpegas
         throttle = self._update_gui_throttle()
 
-        self._bench_mix.set_data(roll, pitch, self._orient.yaw,
+        self._bench_mix.set_data(roll, pitch, yaw,
                                  ur, up, uy, throttle, self._armed)
 
         # ── Roll check ──
@@ -3593,7 +3595,7 @@ class MainWindow(QMainWindow):
             self._orient.reset()
             # Reset attitude snapshot dari drone (biar horizon start di 0
             # bukan nilai stale dari koneksi lama)
-            self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0)
+            self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             self._apply_connect_style(True)
             self.set_status(True, port)
             self._horizon.set_connected(True)
@@ -3624,13 +3626,12 @@ class MainWindow(QMainWindow):
     # ────────── data processing ──────────
 
     def _push_att_metrics(self):
-        # Roll & pitch DIAMBIL LANGSUNG dari drone (tag [SMC], berisi output
-        # complementary filter onboard yang sudah dikurangi gyro bias).
-        # Ini menghindari double-integrate di GUI yang menyebabkan drift
-        # ketika bias gyro drone tercemar saat kalibrasi boot.
-        # Yaw tetap dari GUI karena drone tidak mengirim yaw absolut.
+        # Roll, pitch & yaw DIAMBIL LANGSUNG dari drone (tag [SMC], berisi output
+        # fusi complementary filter & integrasi onboard 200Hz).
+        # Ini menghindari double-integrate di GUI yang menyebabkan drift & aliasing.
         roll_fw  = self._bench_smc[0]
         pitch_fw = self._bench_smc[1]
+        yaw_fw   = self._bench_smc[2]
 
         tgt_r, tgt_t, tgt_y, tgt_p = self._js_target
 
@@ -3640,13 +3641,13 @@ class MainWindow(QMainWindow):
         self._card_pitch.set_value(pitch_fw)
         self._card_pitch.set_target(tgt_p, target_unit="°", label="CMD", show_error=True)
 
-        self._card_yaw.set_value(self._orient.yaw)
+        self._card_yaw.set_value(yaw_fw)
         self._card_yaw.set_target(tgt_y, target_unit="°/s", label="RATE")
 
         self._card_alt.set_value(self._alt_smooth)
         self._card_alt.set_target(tgt_t, target_unit="us", label="THR")
 
-        self._horizon.set_orientation(roll_fw, pitch_fw, self._orient.yaw)
+        self._horizon.set_orientation(roll_fw, pitch_fw, yaw_fw)
         self._horizon.set_target_orientation(tgt_r, tgt_p)
         self._alt_tape.set_altitude(self._alt_smooth)
         self._horizon.set_altitude(self._alt_smooth)
@@ -3654,7 +3655,7 @@ class MainWindow(QMainWindow):
         self._info_bar.update_vbat(self._vbat)
 
         throttle_pwm = tgt_t if tgt_t >= 1000 else self._update_gui_throttle()
-        ur, up, uy = self._bench_smc[2], self._bench_smc[3], self._bench_smc[4]
+        ur, up, uy = self._bench_smc[3], self._bench_smc[4], self._bench_smc[5]
         if hasattr(self, "_motor_rpm_card"):
             self._motor_rpm_card.set_data(ur, up, uy, throttle_pwm, self._armed, vbat=self._vbat)
 
@@ -3703,6 +3704,7 @@ class MainWindow(QMainWindow):
             g = m.groups()
             r_str, t_str, y_str, p_str = g[0], g[1], g[2], g[3]
             arm_str = g[4] if len(g) > 4 else None
+            raw_t_str = g[5] if len(g) > 5 else None
 
             r_val = float(r_str)
             t_val = int(t_str)
@@ -3718,7 +3720,24 @@ class MainWindow(QMainWindow):
                 raw_r = int(round(128.0 + (tgt_r / 25.0) * 127.0))
                 raw_p = int(round(128.0 - (tgt_p / 25.0) * 127.0))  # Maju (tgt_p < 0) -> raw_p naik (> 128)
                 raw_y = int(round(128.0 + (tgt_y / 150.0) * 127.0))
-                raw_t = int(round(((tgt_t - 1000) / 1000.0) * 255.0))
+
+                if raw_t_str is not None:
+                    raw_t = int(raw_t_str)
+                else:
+                    # Dual-Zone Spring Stick: PWM 1200us = netral (128)
+                    idle_pwm = 1200
+                    min_pwm = 1000
+                    max_pwm = 1300
+                    if tgt_t >= idle_pwm:
+                        if max_pwm > idle_pwm:
+                            raw_t = int(round(128.0 + ((tgt_t - idle_pwm) / float(max_pwm - idle_pwm)) * 127.0))
+                        else:
+                            raw_t = 128
+                    else:
+                        if idle_pwm > min_pwm:
+                            raw_t = int(round(128.0 - ((idle_pwm - tgt_t) / float(idle_pwm - min_pwm)) * 128.0))
+                        else:
+                            raw_t = 128
             else:
                 raw_r, raw_t, raw_y, raw_p = int(r_val), int(t_val), int(y_val), int(p_val)
                 tgt_r = ((raw_r - 128) / 127.0) * 25.0 if abs(raw_r - 128) > 4 else 0.0
@@ -3745,8 +3764,22 @@ class MainWindow(QMainWindow):
 
         m = SMC_RE.search(text)
         if m:
-            roll, pitch, u_roll, u_pitch, u_yaw = [float(v) for v in m.groups()]
-            self._bench_smc = (roll, pitch, u_roll, u_pitch, u_yaw)
+            g = m.groups()
+            roll = float(g[0])
+            pitch = float(g[1])
+            if g[2] is not None:
+                yaw = float(g[2])
+                u_roll = float(g[3])
+                u_pitch = float(g[4])
+                u_yaw = float(g[5])
+            else:
+                yaw = self._orient.yaw
+                u_roll = float(g[3])
+                u_pitch = float(g[4])
+                u_yaw = float(g[5])
+
+            self._bench_smc = (roll, pitch, yaw, u_roll, u_pitch, u_yaw)
+            self._orient.yaw = yaw
             if hasattr(self, "_pid_plot"):
                 max_ang = 25.0
                 if hasattr(self, "_pid_inputs") and "max_angle" in self._pid_inputs:

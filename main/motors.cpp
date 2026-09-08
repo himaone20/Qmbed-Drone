@@ -169,13 +169,14 @@ void TaskMotors(void *pvParameters)
       float targetThrottle = (float)gTargetThrottlePwm;
       targetThrottle = constrain(targetThrottle, (float)gEscMinPwm, (float)gEscMaxPwm);
 
-      // Hitung koreksi Cascade PID untuk Roll & Pitch
+      // Hitung koreksi Cascade PID untuk Roll, Pitch & Yaw Rate (200 Hz)
       float uRoll = 0.0f;
       float uPitch = 0.0f;
-      computeCascadePid(snap, gTargetRollDeg, gTargetPitchDeg, targetThrottle, uRoll, uPitch);
+      float uYaw = 0.0f;
+      computeCascadePid(snap, gTargetRollDeg, gTargetPitchDeg, gTargetYawRateDps, targetThrottle, uRoll, uPitch, uYaw);
 
       // Terapkan hasil pencampuran Base Throttle + Koreksi PID ke 4 Motor ESC via Fast Hardware PWM
-      writeMotorMix(targetThrottle, uRoll, uPitch, 0.0f);
+      writeMotorMix(targetThrottle, uRoll, uPitch, uYaw);
     }
 
     // 2. Poll Telemetri Non-Blocking (Baro BMP180 & ADC VBat)
@@ -191,6 +192,7 @@ void TaskMotors(void *pvParameters)
       gSensorData.gz = snap.gz;
       gSensorData.roll = snap.roll;
       gSensorData.pitch = snap.pitch;
+      gSensorData.yaw = snap.yaw;
       gSensorData.yawRate = snap.yawRate;
       gSensorData.bmiOK = snap.bmiOK;
       xSemaphoreGive(sensorMutex);

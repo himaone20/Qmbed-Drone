@@ -20,6 +20,7 @@ static float alt_filtered = 0.0f;
 /* ── Attitude State ───────────────────────────────────────────────────── */
 static float roll_f = 0.0f;
 static float pitch_f = 0.0f;
+static float yaw_f = 0.0f;
 static float gx_f = 0.0f;
 static float gy_f = 0.0f;
 static float gz_f = 0.0f;
@@ -593,13 +594,13 @@ bool sensors_step_imu(SensorData &outData)
 
   // 2. Transform to Body Frame Coordinates:
   // - Roll (X-axis): Miring KANAN -> Sensor Y naik (+Y) -> raw_ay > 0, roll > 0, gx_body > 0
-  // - Pitch (Y-axis): Hidung NAIK (Nose-Up) -> Sensor X naik (+X) -> gravitasi condong ke belakang -> raw_ax < 0!
-  //   Maka pitchAcc = atan2f(-raw_ax, ...) agar Nose-Up bernilai POSITIF (+pitch > 0)!
+  // - Pitch (Y-axis): Hidung NAIK (Nose-Up) -> Sensor X naik (+X) -> reaksi pegas memanjang ke depan -> raw_ax > 0!
+  //   Maka pitchAcc = atan2f(ax_f, ...) agar Nose-Up bernilai POSITIF (+pitch > 0)!
   //   Saat Nose-Up, rotasi mengelilingi sumbu Kiri (+Y) adalah negatif, maka gy_body = -raw_gy (> 0 saat nose up)!
-  // - Yaw (Z-axis): gz_body = raw_gz
+  // - Yaw (Z-axis): Putar KANAN (CW / Heading naik) -> sensor Z negatif -> maka gz_body = -raw_gz (> 0 saat putar kanan)!
   float gx_body = raw_gx;
   float gy_body = -raw_gy;
-  float gz_body = raw_gz;
+  float gz_body = -raw_gz;
 
   // Deadband filter: bersihkan noise sensor mikro saat diam (< 0.10 dps)
   if (fabsf(gx_body) < 0.10f) gx_body = 0.0f;
@@ -618,7 +619,7 @@ bool sensors_step_imu(SensorData &outData)
 
   // Accel Angles (Roll & Pitch)
   float rollAcc  = atan2f(ay_f, az_f) * (180.0f / PI);
-  float pitchAcc = atan2f(-ax_f, sqrtf(ay_f * ay_f + az_f * az_f)) * (180.0f / PI);
+  float pitchAcc = atan2f(ax_f, sqrtf(ay_f * ay_f + az_f * az_f)) * (180.0f / PI);
 
   // 3. Fusi Attitude Complementary Filter
   // Dynamic alpha based on dt (tau ~ 0.50 s) -> alpha = tau / (tau + dt)
@@ -628,10 +629,21 @@ bool sensors_step_imu(SensorData &outData)
   if (!attitudeInitialized) {
     roll_f = rollAcc;
     pitch_f = pitchAcc;
+    yaw_f = 0.0f;
     attitudeInitialized = true;
   } else {
     roll_f  = alpha_cf * (roll_f  + gx_f * dt) + (1.0f - alpha_cf) * rollAcc;
     pitch_f = alpha_cf * (pitch_f + gy_f * dt) + (1.0f - alpha_cf) * pitchAcc;
+
+    // 4. Integrasi Yaw Onboard 200 Hz presisi tinggi (bebas aliasing transmisi radio lambat)
+    if (fabsf(gz_f) >= 0.10f) {
+      yaw_f += gz_f * dt;
+    }
+    if (yaw_f > 180.0f) {
+      yaw_f -= 360.0f;
+    } else if (yaw_f < -180.0f) {
+      yaw_f += 360.0f;
+    }
   }
 
   // Populate output
@@ -643,6 +655,7 @@ bool sensors_step_imu(SensorData &outData)
   outData.gz = gz_f;       // deg/s (body yaw rate)
   outData.roll = roll_f;   // degrees (+ when bank right)
   outData.pitch = pitch_f; // degrees (+ when nose up)
+  outData.yaw = yaw_f;     // degrees (+ when turning right/CW)
   outData.yawRate = gz_f;
   outData.bmiOK = true;
   outData.gyroCalibValid = gSensorData.gyroCalibValid;

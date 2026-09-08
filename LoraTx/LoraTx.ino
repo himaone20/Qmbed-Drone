@@ -85,12 +85,12 @@ struct DownlinkPacket {
   int16_t  gx, gy, gz;   // deg/s  x100
   uint16_t press;        // hPa    x10
   int16_t  alt;          // meter  x100
-  int16_t  roll, pitch;  // derajat x100, complementary filter onboard
+  int16_t  roll, pitch, yaw; // derajat x100, fusi onboard (200Hz)
   int16_t  uRoll, uPitch, uYaw; // koreksi kontrol PWM x100 (PID output)
   uint16_t vbat;         // Volts x100 (contoh: 1110 = 11.10V)
   uint8_t  flags;        // bit0=gyroCalibValid, bit1=bmiOK, bit2=bmpOK,
                          // bit3=vbatOK, bit4-5=battStage, bit6-7=failsafeStage
-};  // total 28 bytes
+};  // total 30 bytes
 
 struct ConfigPacket {
   uint8_t magic;         // harus == CONFIG_MAGIC (0xC3)
@@ -903,7 +903,8 @@ void loop()
   Serial.print("deg T:");   Serial.print(targetThrottlePwm);
   Serial.print("us Y:");    Serial.print(targetYawRateDps, 1);
   Serial.print("dps P:");   Serial.print(targetPitchDeg, 1);
-  Serial.print("deg ARM:"); Serial.println(armedState ? 1 : 0);
+  Serial.print("deg ARM:"); Serial.print(armedState ? 1 : 0);
+  Serial.print(" RAW_T:");  Serial.println(dispT);
 
   /* ---------- [2] Beralih ke RX, tunggu balasan telemetri drone ---------- */
   LoRa.receive();
@@ -914,7 +915,7 @@ void loop()
   while (!gotReply && (millis() - waitStart < replyTimeout))
   {
     int packetSize = LoRa.parsePacket();
-    if (packetSize >= 28)
+    if (packetSize >= (int)sizeof(DownlinkPacket))
     {
       uint8_t buf[32];
       memset(buf, 0, sizeof(buf));
@@ -953,6 +954,7 @@ void loop()
 
         Serial.print("[SMC] ROLL:");  Serial.print(down.roll / 100.0f, 2);
         Serial.print(" PITCH:");     Serial.print(down.pitch / 100.0f, 2);
+        Serial.print(" YAW:");       Serial.print(down.yaw / 100.0f, 2);
         Serial.print(" UR:");        Serial.print(down.uRoll / 100.0f, 2);
         Serial.print(" UP:");        Serial.print(down.uPitch / 100.0f, 2);
         Serial.print(" UY:");        Serial.println(down.uYaw / 100.0f, 2);

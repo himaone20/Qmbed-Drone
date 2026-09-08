@@ -1,5 +1,5 @@
 /* ==========================================================================
- * CONTROL.CPP — Cascade PID Flight Controller (Roll & Pitch Only)
+ * CONTROL.CPP — Cascade PID Flight Controller (Roll, Pitch & Yaw Heading Lock)
  * Target: Quadcopter Quad-X (STM32F401RCT6)
  * ==========================================================================
  */
@@ -8,15 +8,16 @@
 
 float lastURoll  = 0.0f;
 float lastUPitch = 0.0f;
+float lastUYaw   = 0.0f;
 
 static SemaphoreHandle_t pidMutex = NULL;
 
 static PidParams gPidParams = {
   PID_ANGLE_KP_DEFAULT, PID_ANGLE_KI_DEFAULT, PID_ANGLE_KD_DEFAULT, // Outer Angle (Kp=5.0, Ki=0.05, Kd=0.0)
   PID_RATE_KP_DEFAULT,  PID_RATE_KI_DEFAULT,  PID_RATE_KD_DEFAULT,  // Inner Rate (Kp=1.6, Ki=0.3, Kd=0.045)
-  2.00f, 0.15f, 0.00f,                                              // Yaw (not used in mixing)
+  2.00f, 0.15f, 0.00f,                                              // Yaw Rate PI (Kp=2.0, Ki=0.15, Kd=0.0)
   PID_MAX_ANGLE_DEG,                                                // maxAngle = 25°
-  150.0f,                                                           // maxYawRate
+  150.0f,                                                           // maxYawRate = 150°/s
   PID_MAX_DELTA_PWM,                                                // maxDeltaPwm = 300us
   (float)ESC_MIN_US,                                                // escMinPwm = 1000us
   (float)ESC_ARM_SPIN_US,                                           // escArmSpinPwm = 1200us
@@ -32,8 +33,13 @@ struct PidChannelState {
 
 static PidChannelState stateAngleRoll;
 static PidChannelState stateAnglePitch;
+static PidChannelState stateAngleYaw;
 static PidChannelState stateRateRoll;
 static PidChannelState stateRatePitch;
+static PidChannelState stateRateYaw;
+
+static float lockedYawDeg = 0.0f;
+static bool headingLocked = false;
 
 static unsigned long lastComputeUs = 0;
 
@@ -68,10 +74,14 @@ void resetPidState()
 {
   memset(&stateAngleRoll, 0, sizeof(PidChannelState));
   memset(&stateAnglePitch, 0, sizeof(PidChannelState));
+  memset(&stateAngleYaw, 0, sizeof(PidChannelState));
   memset(&stateRateRoll, 0, sizeof(PidChannelState));
   memset(&stateRatePitch, 0, sizeof(PidChannelState));
-  lastURoll  = 0.0f;
-  lastUPitch = 0.0f;
+  memset(&stateRateYaw, 0, sizeof(PidChannelState));
+  lastURoll     = 0.0f;
+  lastUPitch    = 0.0f;
+  lastUYaw      = 0.0f;
+  headingLocked = false;
 }
 
 /* Outer Loop: Angle Error (deg) -> Desired Angular Rate (deg/s) */
@@ -127,9 +137,9 @@ static float computeRatePID(float rateError, float gyroRate,
 }
 
 void computeCascadePid(const SensorData &snap,
-                       float targetRollDeg, float targetPitchDeg,
+                       float targetRollDeg, float targetPitchDeg, float targetYawRateDps,
                        float throttlePwm,
-                       float &outURoll, float &outUPitch)
+                       float &outURoll, float &outUPitch, float &outUYaw)
 {
   unsigned long nowUs = micros();
   float dt = (lastComputeUs > 0) ? (float)(nowUs - lastComputeUs) * 1e-6f : 0.005f;
@@ -141,8 +151,10 @@ void computeCascadePid(const SensorData &snap,
     resetPidState();
     outURoll  = 0.0f;
     outUPitch = 0.0f;
+    outUYaw   = 0.0f;
     lastURoll = 0.0f;
     lastUPitch = 0.0f;
+    lastUYaw  = 0.0f;
     return;
   }
 
@@ -166,9 +178,39 @@ void computeCascadePid(const SensorData &snap,
                                          stateAnglePitch, dt,
                                          PID_INTEGRAL_MAX, PID_MAX_RATE_DPS, allowIntegrate);
 
+  // ── Yaw Mode: Heading Lock (saat stik netral) vs Rate Command (saat stik digerakkan) ──
+  float desiredRateYaw = 0.0f;
+  if (fabsf(targetYawRateDps) > 3.0f) {
+    // Pilot sedang mengarahkan belokan (Rate Mode)
+    headingLocked = false;
+    lockedYawDeg  = snap.yaw; // Update heading target mengikuti putaran aktual
+    desiredRateYaw = constrain(targetYawRateDps, -params.maxYawRate, params.maxYawRate);
+    stateAngleYaw.iTerm = 0.0f;
+  } else {
+    // Pilot melepas stik ke tengah (Heading Lock Mode)
+    if (!headingLocked) {
+      lockedYawDeg  = snap.yaw;
+      headingLocked = true;
+    }
+
+    // Galat sudut yaw dengan wrapping circular [-180°, +180°]
+    float galatAngleYaw = lockedYawDeg - snap.yaw;
+    while (galatAngleYaw > 180.0f)  galatAngleYaw -= 360.0f;
+    while (galatAngleYaw < -180.0f) galatAngleYaw += 360.0f;
+
+    // Angle Loop P controller untuk Yaw (Kp=2.5 dps/deg error)
+    float yawAngleKp = 2.50f;
+    float yawAngleKi = 0.02f;
+    desiredRateYaw = computeAngleP(galatAngleYaw, snap.gz,
+                                   yawAngleKp, yawAngleKi, 0.0f,
+                                   stateAngleYaw, dt,
+                                   PID_INTEGRAL_MAX, params.maxYawRate, allowIntegrate);
+  }
+
   // ── [2] Inner Loop (Rate Controller): Galat Rate -> Koreksi PWM Delta (us) ──
   float galatRateRoll  = desiredRateRoll  - snap.gx;
   float galatRatePitch = desiredRatePitch - snap.gy;
+  float galatRateYaw   = desiredRateYaw   - snap.gz;
 
   outURoll = computeRatePID(galatRateRoll, snap.gx,
                             params.rateKp, params.rateKi, params.rateKd,
@@ -180,6 +222,12 @@ void computeCascadePid(const SensorData &snap,
                              stateRatePitch, dt, PID_TAU_FILTER,
                              PID_INTEGRAL_MAX, params.maxDeltaPwm, allowIntegrate);
 
+  outUYaw = computeRatePID(galatRateYaw, snap.gz,
+                           params.yawKp, params.yawKi, params.yawKd,
+                           stateRateYaw, dt, PID_TAU_FILTER,
+                           PID_INTEGRAL_MAX, params.maxDeltaPwm, allowIntegrate);
+
   lastURoll  = outURoll;
   lastUPitch = outUPitch;
+  lastUYaw   = outUYaw;
 }

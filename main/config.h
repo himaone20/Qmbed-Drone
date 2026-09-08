@@ -163,12 +163,12 @@ struct DownlinkPacket {
   int16_t  gx, gy, gz;   // deg/s  x100
   uint16_t press;        // hPa    x10
   int16_t  alt;          // meter  x100
-  int16_t  roll, pitch;  // derajat x100, complementary filter onboard
+  int16_t  roll, pitch, yaw; // derajat x100, fusi onboard (200Hz)
   int16_t  uRoll, uPitch, uYaw; // koreksi kontrol PWM x100 (PID output)
   uint16_t vbat;         // Volts x100 (contoh: 1110 = 11.10V)
   uint8_t  flags;        // bit0=gyroCalibValid, bit1=bmiOK, bit2=bmpOK,
                          // bit3=vbatOK, bit4-5=battStage, bit6-7=failsafeStage
-};  // total 28 bytes
+};  // total 30 bytes
 
 struct ConfigPacket {
   uint8_t magic;         // harus == CONFIG_MAGIC (0xC3)
@@ -193,6 +193,7 @@ struct SensorData {
   float vz;              // m/s kecepatan vertikal (climb/descent rate)
   float roll;            // derajat, complementary filter onboard
   float pitch;           // derajat, complementary filter onboard
+  float yaw;             // derajat, integrasi gyro 200Hz onboard
   float yawRate;         // deg/s, untuk yaw-rate damping
   float vbat;            // Volt (baterai real-time)
   bool  bmiOK;
