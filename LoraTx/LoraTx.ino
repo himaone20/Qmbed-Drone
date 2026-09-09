@@ -114,6 +114,7 @@ uint16_t throttleIdlePwm      = 1200;    // PWM saat stik netral di tengah (Idle
 uint16_t throttleMaxPwm       = 1300;    // PWM maksimum (100% daya terbang)
 const float    THROTTLE_EXPO  = 0.40f;   // 40% kurva eksponensial agar respon gas halus dan jinak
 const int   STICK_DEADBAND    = 6;       // Deadzone toleransi ADC di sekitar 128
+const uint16_t THROTTLE_STEP_US = 10;    // Perubahan throttle terkunci tiap siklus saat stik ditahan
 
 /* ------------------------- konfigurasi joystick --------------------------- */
 const int PIN_LEFT_X  = 33;   // ROLL
@@ -145,6 +146,7 @@ float filt[N_CH];
 
 bool loraOK = false;
 bool armedState = false;
+uint16_t lockedThrottlePwm = throttleIdlePwm;
 
 /* -------------------- Override stik dari GUI (Mode Tes PID) ------------------ */
 // Saat GUI mengirim "STICK t", remote mengabaikan joystick hardware dan memakai
@@ -865,23 +867,16 @@ void loop()
     targetYawRateDps = constrain(targetYawRateDps, -remoteMaxYawRateDps, remoteMaxYawRateDps);
   }
 
-  // 4. Throttle Dual-Zone (Stik Pegas):
-  // - Zona Atas (dispT > 128 + deadband): Naik halus idle -> max dengan kurva Expo 40%
-  // - Zona Tengah (128 +/- deadband): Tepat di throttleIdlePwm (Idle spin aman)
-  // - Zona Bawah (dispT < 128 - deadband): Turun bertahap idle -> min (Descent / Landing Cut-off)
-  uint16_t targetThrottlePwm = throttleIdlePwm;
+  // 4. Throttle terkunci: tahan stik atas/bawah untuk mengubah PWM,
+  // lalu lepaskan ke tengah untuk mempertahankan PWM terakhir.
   if (dispT > 128 + STICK_DEADBAND) {
-    float stickNorm = (float)(dispT - (128 + STICK_DEADBAND)) / (127.0f - STICK_DEADBAND);
-    if (stickNorm > 1.0f) stickNorm = 1.0f;
-    // Kurva Expo (kombinasi linier + kuadratik):
-    float expoFactor = (1.0f - THROTTLE_EXPO) * stickNorm + THROTTLE_EXPO * (stickNorm * stickNorm);
-    targetThrottlePwm = (uint16_t)(throttleIdlePwm + expoFactor * (throttleMaxPwm - throttleIdlePwm));
+    lockedThrottlePwm = min((uint16_t)(lockedThrottlePwm + THROTTLE_STEP_US), throttleMaxPwm);
   } else if (dispT < 128 - STICK_DEADBAND) {
-    float stickDownNorm = (float)((128 - STICK_DEADBAND) - dispT) / (128.0f - STICK_DEADBAND);
-    if (stickDownNorm > 1.0f) stickDownNorm = 1.0f;
-    // Turun linier dari throttleIdlePwm menuju throttleMinPwm saat stik ditarik ke bawah
-    targetThrottlePwm = (uint16_t)(throttleIdlePwm - stickDownNorm * (throttleIdlePwm - throttleMinPwm));
+    lockedThrottlePwm = (lockedThrottlePwm > throttleMinPwm + THROTTLE_STEP_US)
+      ? lockedThrottlePwm - THROTTLE_STEP_US
+      : throttleMinPwm;
   }
+  uint16_t targetThrottlePwm = lockedThrottlePwm;
 
   // Siapkan paket biner uplink (Fixed-point x100, total 10 byte)
   UplinkPacket up;
