@@ -76,6 +76,37 @@
 
 #define MIX_ACTIVE_MIN_US        1150   // Ambang batas throttle aktif PID (> 1150us)
 
+/* ── Vertical Velocity Control (BMI160 only, no barometer feedback) ──── */
+// targetThrottle pada paket LoRa adalah command stick 0..255 dari remote.
+#define VERTICAL_THROTTLE_CENTER             128.0f
+#define VERTICAL_THROTTLE_DEADBAND            8.0f
+#define VERTICAL_MAX_TARGET_SPEED_MPS         0.60f
+#define VERTICAL_STICK_EXPO                   0.45f
+#define VERTICAL_TARGET_SLEW_MPS2             0.80f
+#define VERTICAL_ACCEL_LPF_ALPHA              0.12f
+#define VERTICAL_MAX_ACCEL_MPS2                4.0f
+#define VERTICAL_VELOCITY_LPF_ALPHA           0.10f
+#define VERTICAL_VELOCITY_LEAK_PER_S          0.80f
+#define VERTICAL_MAX_ESTIMATED_SPEED_MPS      2.00f
+#define VERTICAL_ACCEL_DAMP_US_PER_MPS2       5.0f
+// IMU velocity is only short-term damping. It must not be able to cancel
+// the pilot collective command because accelerometer integration drifts.
+#define VERTICAL_KP_FULL_ERROR_FRACTION        0.18f
+#define VERTICAL_OUTPUT_LIMIT_FRACTION         0.22f
+
+// Nilai awal hover tidak mengikuti Max ESC GUI: Max ESC hanya mengatur headroom
+// stick, bukan thrust hover. Sesuaikan setelah uji tethered bila diperlukan.
+#define HOVER_THROTTLE_INITIAL_US             1260.0f
+#define HOVER_THROTTLE_MARGIN_US              0.0f
+#define HOVER_ADAPT_RATE_US_PER_S             0.25f
+#define HOVER_ADAPT_MAX_VZ_MPS                0.10f
+#define HOVER_ADAPT_MAX_ACCEL_MPS2            0.35f
+#define HOVER_ADAPT_MAX_ATTITUDE_DEG          10.0f
+#define COLLECTIVE_SLEW_US_PER_S              700.0f
+
+#define VERTICAL_DEBUG                         0
+#define VERTICAL_DEBUG_PERIOD_MS               200
+
 struct PidParams {
   float angleKp, angleKi, angleKd;
   float rateKp, rateKi, rateKd;
@@ -153,7 +184,7 @@ struct UplinkPacket {
   int16_t  targetRoll;     // Derajat x100 (-2500 s.d. +2500 -> -25.00° s.d. +25.00°)
   int16_t  targetPitch;    // Derajat x100 (-2500 s.d. +2500 -> -25.00° s.d. +25.00°)
   int16_t  targetYaw;      // Deg/s x100 (-15000 s.d. +15000 -> -150.00°/s s.d. +150.00°/s)
-  uint16_t targetThrottle; // Base PWM us (1200 s.d. 2000 us)
+  uint16_t targetThrottle; // Command stick throttle (0..255, 128 = netral)
   uint8_t  armed;          // 0 = DISARM, 1 = ARM
 }; // Total: 10 byte (Sangat cepat & rendah latensi di LoRa)
 
@@ -181,6 +212,7 @@ struct ConfigPacket {
   float escMinPwm;
   float escArmSpinPwm;
   float escMaxPwm;
+  float hoverThrottlePwm;
 };
 #pragma pack(pop)
 

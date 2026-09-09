@@ -715,7 +715,7 @@ void sensors_poll_telemetry()
 
 void TaskSensors(void *pvParameters)
 {
-  (void) pvParameters;
+  (void) pvParameters;  
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }

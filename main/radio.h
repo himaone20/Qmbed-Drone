@@ -17,7 +17,7 @@
 extern float   gTargetRollDeg;
 extern float   gTargetPitchDeg;
 extern float   gTargetYawRateDps;
-extern uint16_t gTargetThrottlePwm;
+extern uint16_t gTargetThrottlePwm; // Stick throttle 0..255, 128 = vertical hold command
 extern bool    gArmedCmd;
 
 bool radio_init();

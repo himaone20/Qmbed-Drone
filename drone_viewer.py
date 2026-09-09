@@ -2836,10 +2836,8 @@ class MainWindow(QMainWindow):
             self.set_hint("Drone DISARMED (Safe)", level="ok")
 
     def _update_gui_throttle(self):
-        # Cermin PERSIS logika firmware Dual-Zone Expo (LoraTx.ino & motors.cpp):
-        # - Tarik Bawah (0..128): Idle -> Min (Landing / Cut-off)
-        # - Tengah Netral (128): Idle spin aman
-        # - Dorong Atas (128..255): Idle -> Max dengan kurva Expo 40%
+        # Preview collective only. Firmware receives the self-centering stick
+        # command and applies its own BMI160 vertical damping.
         esc_min = self._pid_inputs["esc_min_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_min_pwm" in self._pid_inputs else 1000.0
         esc_arm = self._pid_inputs["esc_arm_spin_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_arm_spin_pwm" in self._pid_inputs else 1200.0
         esc_max = self._pid_inputs["esc_max_pwm"].value() if hasattr(self, "_pid_inputs") and "esc_max_pwm" in self._pid_inputs else 1300.0
@@ -2848,14 +2846,11 @@ class MainWindow(QMainWindow):
             self._throttle_smoothed = esc_min
             return self._throttle_smoothed
 
-        THROTTLE_EXPO = 0.40
-
         t_raw = self._js_raw[1] if len(self._js_raw) > 1 else 128
         if t_raw > 128 + 6:
             stick_norm = (t_raw - 134.0) / 121.0
             stick_norm = max(0.0, min(1.0, stick_norm))
-            expo_factor = (1.0 - THROTTLE_EXPO) * stick_norm + THROTTLE_EXPO * (stick_norm * stick_norm)
-            target = esc_arm + expo_factor * (esc_max - esc_arm)
+            target = esc_arm + stick_norm * (esc_max - esc_arm)
         elif t_raw < 128 - 6:
             stick_down_norm = (122.0 - t_raw) / 122.0
             stick_down_norm = max(0.0, min(1.0, stick_down_norm))
@@ -3256,8 +3251,22 @@ class MainWindow(QMainWindow):
             esc_form.addRow(lbl_w, spin)
         form_vbox.addLayout(esc_form)
 
-        # 5. Limits & Safety
-        limit_group = QLabel("5. BATASAN SAFETY & DEFLEKSI")
+        # 5. Vertical Hover
+        hover_group = QLabel("5. VERTICAL HOVER THROTTLE")
+        hover_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
+        form_vbox.addWidget(hover_group)
+
+        hover_form = QFormLayout()
+        hover_form.setSpacing(8)
+        hover_spin = self._make_pid_spinbox(1260.0, 1000.0, 2000.0, 5.0, 0, suffix=" us")
+        self._pid_inputs["hover_throttle_pwm"] = hover_spin
+        hover_label = QLabel("Hover Throttle (Stick Center):")
+        hover_label.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:11px;")
+        hover_form.addRow(hover_label, hover_spin)
+        form_vbox.addLayout(hover_form)
+
+        # 6. Limits & Safety
+        limit_group = QLabel("6. BATASAN SAFETY & DEFLEKSI")
         limit_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
         form_vbox.addWidget(limit_group)
 
@@ -3425,13 +3434,17 @@ class MainWindow(QMainWindow):
         esc_min = inputs['esc_min_pwm'].value() if 'esc_min_pwm' in inputs else 1000.0
         esc_arm = inputs['esc_arm_spin_pwm'].value() if 'esc_arm_spin_pwm' in inputs else 1200.0
         esc_max = inputs['esc_max_pwm'].value() if 'esc_max_pwm' in inputs else 1300.0
-        # Format: PID <angleKp> <angleKi> <angleKd> <rateKp> <rateKi> <rateKd> <yawKp> <yawKi> <yawKd> <maxAngle> <maxYawRate> <maxDeltaPwm> <escMinPwm> <escArmSpinPwm> <escMaxPwm>
+        hover = inputs['hover_throttle_pwm'].value() if 'hover_throttle_pwm' in inputs else 1260.0
+        hover = max(esc_arm, min(hover, esc_max))
+        if 'hover_throttle_pwm' in inputs:
+            inputs['hover_throttle_pwm'].setValue(hover)
+        # Format: PID <angleKp> <angleKi> <angleKd> <rateKp> <rateKi> <rateKd> <yawKp> <yawKi> <yawKd> <maxAngle> <maxYawRate> <maxDeltaPwm> <escMinPwm> <escArmSpinPwm> <escMaxPwm> <hoverThrottlePwm>
         cmd = (
             f"PID {inputs['angle_kp'].value():.5f} {inputs['angle_ki'].value():.5f} {inputs['angle_kd'].value():.5f} "
             f"{inputs['rate_kp'].value():.5f} {inputs['rate_ki'].value():.5f} {inputs['rate_kd'].value():.5f} "
             f"{inputs['yaw_kp'].value():.5f} {inputs['yaw_ki'].value():.5f} {inputs['yaw_kd'].value():.5f} "
             f"{inputs['max_angle'].value():.1f} 150.0 {inputs['max_delta_pwm'].value():.1f} "
-            f"{esc_min:.1f} {esc_arm:.1f} {esc_max:.1f}\n"
+            f"{esc_min:.1f} {esc_arm:.1f} {esc_max:.1f} {hover:.1f}\n"
         )
         try:
             self._serial.write(cmd.encode("ascii"))
@@ -3446,6 +3459,7 @@ class MainWindow(QMainWindow):
             "rate_kp": 1.60000, "rate_ki": 0.30000, "rate_kd": 0.04500,
             "yaw_kp": 2.00000, "yaw_ki": 0.15000, "yaw_kd": 0.00000,
             "esc_min_pwm": 1000.0, "esc_arm_spin_pwm": 1200.0, "esc_max_pwm": 1300.0,
+            "hover_throttle_pwm": 1260.0,
             "max_angle": 25.0, "max_delta_pwm": 300.0
         }
         for k, v in defaults.items():

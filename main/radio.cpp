@@ -13,7 +13,7 @@ SPIClass SPI_2(LORA_MOSI_PIN, LORA_MISO_PIN, LORA_SCK_PIN); // PB15, PB14, PB13
 float    gTargetRollDeg    = 0.0f;
 float    gTargetPitchDeg   = 0.0f;
 float    gTargetYawRateDps = 0.0f;
-uint16_t gTargetThrottlePwm = 1000;
+uint16_t gTargetThrottlePwm = 128;
 bool     gArmedCmd         = false;
 
 static unsigned long lastLinkMs = 0;
@@ -65,7 +65,7 @@ void TaskLoRa_Control(void *pvParameters)
           Serial.println(">>> Link LoRa Remote Aktif <<<");
         }
 
-        // Simpan data perintah stik yang sudah berupa sudut (° & PWM)
+        // Simpan data perintah stik; throttle adalah command self-centering 0..255.
         gTargetRollDeg     = (float)up.targetRoll / 100.0f;
         gTargetPitchDeg    = (float)up.targetPitch / 100.0f;
         gTargetYawRateDps  = (float)up.targetYaw / 100.0f;
@@ -120,7 +120,7 @@ void TaskLoRa_Control(void *pvParameters)
         Serial.print("° P:");        Serial.print(gTargetPitchDeg, 1);
         Serial.print("° Y:");        Serial.print(gTargetYawRateDps, 1);
         Serial.print("°/s T:");      Serial.print(gTargetThrottlePwm);
-        Serial.print("us ARM:");     Serial.print(gArmedCmd ? "1" : "0");
+        Serial.print("cmd ARM:");    Serial.print(gArmedCmd ? "1" : "0");
         if (gArmedCmd) {
           Serial.print(" | M1:");    Serial.print(getMotorPWM(0));
           Serial.print(" M2:");      Serial.print(getMotorPWM(1));
@@ -169,7 +169,9 @@ void TaskLoRa_Control(void *pvParameters)
 
         setPidParams(newParams);
         setEscPwmLimits((int)newParams.escMinPwm, (int)newParams.escArmSpinPwm, (int)newParams.escMaxPwm);
-        Serial.println("[PID] Parameter PID & Limit ESC PWM Baru Berhasil Diterapkan dari GUI!");
+        setHoverThrottlePwm(cfg.hoverThrottlePwm);
+        Serial.print("[PID] Parameter PID, Hover Throttle & Limit ESC PWM Baru Diterapkan. Hover:");
+        Serial.println(gHoverThrottlePwm, 1);
       }
       LoRa.receive();
     }

@@ -75,7 +75,7 @@ struct UplinkPacket {
   int16_t  targetRoll;     // Derajat x100 (-2500 s.d. +2500 -> -25.00° s.d. +25.00°)
   int16_t  targetPitch;    // Derajat x100 (-2500 s.d. +2500 -> -25.00° s.d. +25.00°)
   int16_t  targetYaw;      // Deg/s x100 (-15000 s.d. +15000 -> -150.00°/s s.d. +150.00°/s)
-  uint16_t targetThrottle; // Base PWM us (1200 s.d. 2000 us saat armed)
+  uint16_t targetThrottle; // Command stick throttle self-centering (0..255, 128 = netral)
   uint8_t  armed;          // 0 = DISARM, 1 = ARM
 }; // total 10 bytes (sangat ringkas, transmisi LoRa ultra-cepat & rendah latensi)
 
@@ -103,18 +103,19 @@ struct ConfigPacket {
   float escMinPwm;
   float escArmSpinPwm;
   float escMaxPwm;
+  float hoverThrottlePwm;
 };
 #pragma pack(pop)
 
 /* ── Parameter Konversi Sudut & Throttle Remote ─────────────────────────── */
 float    remoteMaxAngleDeg    = 25.0f;   // Sudut Roll/Pitch maksimum (±25.0°)
 float    remoteMaxYawRateDps  = 150.0f;  // Laju putar Yaw maksimum (±150.0°/s)
-uint16_t throttleMinPwm       = 1000;    // PWM cut-off saat stik ditarik mentok bawah (Landing / Cut-off)
-uint16_t throttleIdlePwm      = 1200;    // PWM saat stik netral di tengah (Idle spin saat armed 20%)
-uint16_t throttleMaxPwm       = 1300;    // PWM maksimum (100% daya terbang)
+uint16_t throttleMinPwm       = 1000;    // Konfigurasi ESC untuk GUI/flight controller
+uint16_t throttleIdlePwm      = 1200;    // Konfigurasi ESC untuk GUI/flight controller
+uint16_t throttleMaxPwm       = 1300;    // Konfigurasi ESC untuk GUI/flight controller
+float    hoverThrottlePwm     = 1260.0f; // Collective awal saat stick throttle di tengah
 const float    THROTTLE_EXPO  = 0.40f;   // 40% kurva eksponensial agar respon gas halus dan jinak
 const int   STICK_DEADBAND    = 6;       // Deadzone toleransi ADC di sekitar 128
-const uint16_t THROTTLE_STEP_US = 10;    // Perubahan throttle terkunci tiap siklus saat stik ditahan
 
 /* ------------------------- konfigurasi joystick --------------------------- */
 const int PIN_LEFT_X  = 33;   // ROLL
@@ -146,7 +147,6 @@ float filt[N_CH];
 
 bool loraOK = false;
 bool armedState = false;
-uint16_t lockedThrottlePwm = throttleIdlePwm;
 
 /* -------------------- Override stik dari GUI (Mode Tes PID) ------------------ */
 // Saat GUI mengirim "STICK t", remote mengabaikan joystick hardware dan memakai
@@ -782,12 +782,14 @@ void loop()
       cfg.escMinPwm     = (float)throttleMinPwm;
       cfg.escArmSpinPwm = (float)throttleIdlePwm;
       cfg.escMaxPwm     = (float)throttleMaxPwm;
-      int count = sscanf(payload.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f",
+      cfg.hoverThrottlePwm = hoverThrottlePwm;
+      int count = sscanf(payload.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f",
                          &cfg.angleKp, &cfg.angleKi, &cfg.angleKd,
                          &cfg.rateKp, &cfg.rateKi, &cfg.rateKd,
                          &cfg.yawKp, &cfg.yawKi, &cfg.yawKd,
                          &cfg.maxAngle, &cfg.maxYawRate, &cfg.maxDeltaPwm,
-                         &cfg.escMinPwm, &cfg.escArmSpinPwm, &cfg.escMaxPwm);
+                         &cfg.escMinPwm, &cfg.escArmSpinPwm, &cfg.escMaxPwm,
+                         &cfg.hoverThrottlePwm);
       if (count >= 12) {
         if (cfg.maxAngle >= 5.0f && cfg.maxAngle <= 45.0f) {
           remoteMaxAngleDeg = cfg.maxAngle;
@@ -805,6 +807,9 @@ void loop()
           if (cfg.escMaxPwm >= 1100.0f && cfg.escMaxPwm <= 2200.0f && cfg.escMaxPwm >= throttleIdlePwm) {
             throttleMaxPwm = (uint16_t)cfg.escMaxPwm;
           }
+          if (count >= 16 && cfg.hoverThrottlePwm >= throttleIdlePwm && cfg.hoverThrottlePwm <= throttleMaxPwm) {
+            hoverThrottlePwm = cfg.hoverThrottlePwm;
+          }
         } else if (count == 14) {
           if (cfg.escMinPwm >= 900.0f && cfg.escMinPwm <= 1400.0f) {
             throttleMinPwm = (uint16_t)cfg.escMinPwm;
@@ -818,9 +823,9 @@ void loop()
         LoRa.write((uint8_t *)&cfg, sizeof(ConfigPacket));
         LoRa.endPacket();
         LoRa.receive();
-        Serial.println("[PID] OK CONFIG SENT TO DRONE");
+        Serial.println("[PID] OK CONFIG + HOVER THROTTLE SENT TO DRONE");
       } else {
-        Serial.println("[PID] ERR FORMAT INVALID (need 12-15 float values)");
+        Serial.println("[PID] ERR FORMAT INVALID (need 12-16 float values)");
       }
     }
   }
@@ -867,16 +872,9 @@ void loop()
     targetYawRateDps = constrain(targetYawRateDps, -remoteMaxYawRateDps, remoteMaxYawRateDps);
   }
 
-  // 4. Throttle terkunci: tahan stik atas/bawah untuk mengubah PWM,
-  // lalu lepaskan ke tengah untuk mempertahankan PWM terakhir.
-  if (dispT > 128 + STICK_DEADBAND) {
-    lockedThrottlePwm = min((uint16_t)(lockedThrottlePwm + THROTTLE_STEP_US), throttleMaxPwm);
-  } else if (dispT < 128 - STICK_DEADBAND) {
-    lockedThrottlePwm = (lockedThrottlePwm > throttleMinPwm + THROTTLE_STEP_US)
-      ? lockedThrottlePwm - THROTTLE_STEP_US
-      : throttleMinPwm;
-  }
-  uint16_t targetThrottlePwm = lockedThrottlePwm;
+  // 4. Throttle pegas dikirim langsung sebagai command 0..255. Field packet
+  // tetap sama; flight controller mengubahnya menjadi target vertical velocity.
+  uint16_t targetThrottlePwm = (uint16_t)constrain(dispT, 0, 255);
 
   // Siapkan paket biner uplink (Fixed-point x100, total 10 byte)
   UplinkPacket up;
@@ -894,7 +892,7 @@ void loop()
   /* Teruskan data target sudut dan telemetri ke GUI via USB */
   Serial.print("[TX] R:"); Serial.print(targetRollDeg, 1);
   Serial.print("deg T:");   Serial.print(targetThrottlePwm);
-  Serial.print("us Y:");    Serial.print(targetYawRateDps, 1);
+  Serial.print("cmd Y:");   Serial.print(targetYawRateDps, 1);
   Serial.print("dps P:");   Serial.print(targetPitchDeg, 1);
   Serial.print("deg ARM:"); Serial.print(armedState ? 1 : 0);
   Serial.print(" RAW_T:");  Serial.println(dispT);

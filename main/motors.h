@@ -21,9 +21,11 @@ extern int gMotorPWM[4]; // M1, M2, M3, M4 PWM microseconds
 extern int gEscMinPwm;
 extern int gEscArmSpinPwm;
 extern int gEscMaxPwm;
+extern float gHoverThrottlePwm;
 
 void motors_init();
 void setEscPwmLimits(int minPwm, int armSpinPwm, int maxPwm);
+void setHoverThrottlePwm(float hoverPwm);
 void writeMotorMix(float basePwm, float uRoll = 0.0f, float uPitch = 0.0f, float uYaw = 0.0f);
 void setAllMotorsPWM(int us);
 int  getMotorPWM(int index);
