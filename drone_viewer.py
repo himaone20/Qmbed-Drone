@@ -3161,11 +3161,11 @@ class MainWindow(QMainWindow):
         form_vbox.setSpacing(12)
 
         # Header Title
-        title_lbl = QLabel("CASCADE PID (ROLL & PITCH)")
+        title_lbl = QLabel("CASCADE PID (ROLL, PITCH & YAW)")
         title_lbl.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:800; font-size:13px; letter-spacing:1.5px;")
         form_vbox.addWidget(title_lbl)
 
-        sub_lbl = QLabel("Tuning parameter inner/outer loop kendali sikap kestabilan Roll & Pitch")
+        sub_lbl = QLabel("Tuning inner/outer loop Roll & Pitch serta inner rate PID Yaw")
         sub_lbl.setStyleSheet(f"color:{COL_SUBTEXT.name()}; font-size:10px;")
         form_vbox.addWidget(sub_lbl)
 
@@ -3216,8 +3216,28 @@ class MainWindow(QMainWindow):
             rate_form.addRow(lbl_w, spin)
         form_vbox.addLayout(rate_form)
 
-        # 3. ESC PWM Limits
-        esc_group = QLabel("3. BATASAN ESC PWM (MIN, IDLE & MAX OUTPUT)")
+        # 3. Yaw Inner Loop (Rate PID)
+        yaw_group = QLabel("3. YAW RATE PID (KECEPATAN PUTAR)")
+        yaw_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
+        form_vbox.addWidget(yaw_group)
+
+        yaw_form = QFormLayout()
+        yaw_form.setSpacing(8)
+        yaw_fields = [
+            ("Yaw Kp", "yaw_kp", 2.00000, 0.0, 10.0, 0.00100, 5),
+            ("Yaw Ki", "yaw_ki", 0.15000, 0.0, 5.0, 0.00100, 5),
+            ("Yaw Kd", "yaw_kd", 0.00000, 0.0, 1.0, 0.00005, 5),
+        ]
+        for label, key, val, mn, mx, step, dec in yaw_fields:
+            spin = self._make_pid_spinbox(val, mn, mx, step, dec)
+            self._pid_inputs[key] = spin
+            lbl_w = QLabel(f"{label}:")
+            lbl_w.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:600; font-size:11px;")
+            yaw_form.addRow(lbl_w, spin)
+        form_vbox.addLayout(yaw_form)
+
+        # 4. ESC PWM Limits
+        esc_group = QLabel("4. BATASAN ESC PWM (MIN, IDLE & MAX OUTPUT)")
         esc_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
         form_vbox.addWidget(esc_group)
 
@@ -3236,8 +3256,8 @@ class MainWindow(QMainWindow):
             esc_form.addRow(lbl_w, spin)
         form_vbox.addLayout(esc_form)
 
-        # 4. Limits & Safety
-        limit_group = QLabel("4. BATASAN SAFETY & DEFLEKSI")
+        # 5. Limits & Safety
+        limit_group = QLabel("5. BATASAN SAFETY & DEFLEKSI")
         limit_group.setStyleSheet(f"color:{COL_ACCENT_DK.name()}; font-weight:700; font-size:11px; letter-spacing:1.0px; margin-top:6px;")
         form_vbox.addWidget(limit_group)
 
@@ -3318,7 +3338,7 @@ class MainWindow(QMainWindow):
         guide_lay.setContentsMargins(10, 8, 10, 8)
         guide_lay.setSpacing(6)
 
-        g_title = QLabel("PANDUAN PRAKTIS TUNING CASCADE PID (ROLL & PITCH)")
+        g_title = QLabel("PANDUAN TUNING PID (ROLL, PITCH & YAW)")
         g_title.setStyleSheet(f"color:{COL_TEXT.name()}; font-weight:800; font-size:11px; letter-spacing:1.2px;")
         guide_lay.addWidget(g_title)
 
@@ -3409,7 +3429,7 @@ class MainWindow(QMainWindow):
         cmd = (
             f"PID {inputs['angle_kp'].value():.5f} {inputs['angle_ki'].value():.5f} {inputs['angle_kd'].value():.5f} "
             f"{inputs['rate_kp'].value():.5f} {inputs['rate_ki'].value():.5f} {inputs['rate_kd'].value():.5f} "
-            f"0.00000 0.00000 0.00000 "
+            f"{inputs['yaw_kp'].value():.5f} {inputs['yaw_ki'].value():.5f} {inputs['yaw_kd'].value():.5f} "
             f"{inputs['max_angle'].value():.1f} 150.0 {inputs['max_delta_pwm'].value():.1f} "
             f"{esc_min:.1f} {esc_arm:.1f} {esc_max:.1f}\n"
         )
@@ -3424,6 +3444,7 @@ class MainWindow(QMainWindow):
         defaults = {
             "angle_kp": 5.00000, "angle_ki": 0.05000, "angle_kd": 0.12000,
             "rate_kp": 1.60000, "rate_ki": 0.30000, "rate_kd": 0.04500,
+            "yaw_kp": 2.00000, "yaw_ki": 0.15000, "yaw_kd": 0.00000,
             "esc_min_pwm": 1000.0, "esc_arm_spin_pwm": 1200.0, "esc_max_pwm": 1300.0,
             "max_angle": 25.0, "max_delta_pwm": 300.0
         }
