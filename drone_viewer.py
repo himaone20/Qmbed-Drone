@@ -4,12 +4,14 @@ import json
 import re
 import math
 import time
+import csv
+from datetime import datetime
 from collections import deque
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QPoint
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QPoint, QUrl
 from PySide6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QFontMetricsF,
     QRadialGradient, QLinearGradient, QPolygonF, QPainterPath,
-    QAction, QPixmap, QIcon
+    QAction, QPixmap, QIcon, QDesktopServices
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -54,6 +56,7 @@ FLAGS_RE = re.compile(
 )
 
 PID_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pid_config.json")
+RECORDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "records")
 
 # ─────────────── Palette : Sky Blue & White ───────────────
 COL_BG          = QColor("#F5F9FF")   # window bg
@@ -1004,7 +1007,7 @@ class PidPlotWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(480, 480)
+        self.setMinimumSize(480, 440)
         self._samples = deque(maxlen=250)
         self._cur_target_roll = 0.0
         self._cur_actual_roll = 0.0
@@ -1013,6 +1016,13 @@ class PidPlotWidget(QWidget):
         self._cur_u_roll = 0.0
         self._cur_u_pitch = 0.0
         self._cur_u_yaw = 0.0
+        self._recording = False
+        self._record_time_str = ""
+
+    def set_recording_status(self, recording: bool, time_str: str = ""):
+        self._recording = recording
+        self._record_time_str = time_str
+        self.update()
 
     def add_sample(self, target_roll, actual_roll, target_pitch, actual_pitch, u_roll, u_pitch, u_yaw):
         self._cur_target_roll = target_roll
@@ -1158,6 +1168,19 @@ class PidPlotWidget(QWidget):
         p.setFont(qfont(FONT_UI, 10, QFont.Bold, letter_spacing=1.2))
         p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter, "REAL-TIME PID TRACKING & RESPONS")
 
+        # Live Recording Indicator on Plot Header
+        if self._recording:
+            rec_badge = f"\u25CF REC {self._record_time_str}".strip() if self._record_time_str else "\u25CF REC"
+            p.setFont(qfont(FONT_MONO, 7.5, QFont.Bold))
+            rec_fm = QFontMetricsF(p.font())
+            rec_w = rec_fm.horizontalAdvance(rec_badge) + 16
+            rec_rect = QRectF(header_rect.right() - rec_w, header_rect.top() + 1, rec_w, 20)
+            p.setPen(QPen(QColor("#EF4444"), 1))
+            p.setBrush(QBrush(QColor(239, 68, 68, 25)))
+            p.drawRoundedRect(rec_rect, 4, 4)
+            p.setPen(QColor("#DC2626"))
+            p.drawText(rec_rect, Qt.AlignCenter, rec_badge)
+
         # Subplot Layout: 3 Rows
         top_y = header_rect.bottom() + 8
         avail_h = rect.bottom() - top_y - 12
@@ -1221,6 +1244,7 @@ class PidPlotWidget(QWidget):
         badges_pwm = [
             (f"uROLL: {self._cur_u_roll:+.0f}\u03BCs", QColor("#2563EB"), False),
             (f"uPITCH: {self._cur_u_pitch:+.0f}\u03BCs", QColor("#16A34A"), False),
+            (f"uYAW: {self._cur_u_yaw:+.0f}\u03BCs", QColor("#8B5CF6"), False),
         ]
         self._draw_badges(p, row3_rect.right(), row3_rect.top() + 1, badges_pwm)
 
@@ -1228,6 +1252,7 @@ class PidPlotWidget(QWidget):
         self._draw_subplot_grid(p, plot3_rect, [150, 75, 0, -75, -150], 200.0, "")
         self._draw_series(p, plot3_rect, 5, QColor("#2563EB"), 2.0, 200.0, Qt.SolidLine) # uRoll
         self._draw_series(p, plot3_rect, 6, QColor("#16A34A"), 2.0, 200.0, Qt.SolidLine) # uPitch
+        self._draw_series(p, plot3_rect, 7, QColor("#8B5CF6"), 1.8, 200.0, Qt.DashLine)  # uYaw
 
 
 # ───────────────────── Metric Card ─────────────────────
@@ -2213,6 +2238,16 @@ class MainWindow(QMainWindow):
         self._bench_smc = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # (roll, pitch, yaw, uRoll, uPitch, uYaw)
         self._bench_imu = (0.0, 0.0, 0.0)           # (gx, gy, gz) deg/s
         self._bench_alt_press = (0.0, 0.0)          # (alt, press)
+
+        # ── Telemetry & PID CSV Recorder state ──
+        self._is_recording = False
+        self._record_file = None
+        self._record_writer = None
+        self._record_filepath = ""
+        self._record_start_time = 0.0
+        self._record_sample_count = 0
+        self._record_timer = QTimer(self)
+        self._record_timer.timeout.connect(self._update_record_ui)
 
         # ── central ──
         central = QWidget()
@@ -3326,9 +3361,92 @@ class MainWindow(QMainWindow):
         scroll.setWidget(form_card)
         root.addWidget(scroll, 4)
 
-        # ── Kolom Kanan: Real-Time Waveform Plot + Guide ──
+        # ── Kolom Kanan: Real-Time Waveform Plot + Telemetry CSV Recorder + Guide ──
         right_col = QVBoxLayout()
-        right_col.setSpacing(12)
+        right_col.setSpacing(10)
+
+        # ── Card Kontrol Recording Telemetri & PID ke CSV ──
+        rec_card = QFrame()
+        rec_card.setObjectName("PidRecordCard")
+        rec_card.setStyleSheet(f"""
+            #PidRecordCard {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 12px;
+            }}
+        """)
+        add_shadow(rec_card, blur=14, dy=1, alpha=16)
+
+        rec_layout = QVBoxLayout(rec_card)
+        rec_layout.setContentsMargins(14, 10, 14, 10)
+        rec_layout.setSpacing(8)
+
+        rec_top_row = QHBoxLayout()
+        rec_top_row.setSpacing(10)
+
+        rec_title_box = QVBoxLayout()
+        rec_title_box.setSpacing(2)
+
+        rec_title_lbl = QLabel("RECORD TELEMETRI ATTITUDE & PID KE CSV")
+        rec_title_lbl.setStyleSheet(f"color: {COL_TEXT.name()}; font-weight: 800; font-size: 11px; letter-spacing: 1.2px;")
+        rec_title_box.addWidget(rec_title_lbl)
+
+        rec_sub_lbl = QLabel(" ")
+        rec_sub_lbl.setStyleSheet(f"color: {COL_SUBTEXT.name()}; font-size: 9.5px;")
+        rec_title_box.addWidget(rec_sub_lbl)
+
+        rec_top_row.addLayout(rec_title_box, 1)
+
+        self._rec_btn = QPushButton("⏺  START RECORDING")
+        self._rec_btn.setFixedHeight(32)
+        self._rec_btn.setCursor(Qt.PointingHandCursor)
+        self._rec_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COL_ACCENT.name()}; color: white;
+                border: none; border-radius: 7px;
+                padding: 0 16px;
+                font: bold 10px Inter, sans-serif; letter-spacing: 0.8px;
+            }}
+            QPushButton:hover {{
+                background: {COL_ACCENT_DK.name()};
+            }}
+        """)
+        self._rec_btn.clicked.connect(self._toggle_recording)
+        rec_top_row.addWidget(self._rec_btn)
+
+        self._rec_open_btn = QPushButton("📁  BUKA FOLDER")
+        self._rec_open_btn.setFixedHeight(32)
+        self._rec_open_btn.setCursor(Qt.PointingHandCursor)
+        self._rec_open_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COL_CARD_ALT.name()}; color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()}; border-radius: 7px;
+                padding: 0 12px;
+                font: bold 10px Inter, sans-serif; letter-spacing: 0.6px;
+            }}
+            QPushButton:hover {{
+                background: #E2E8F0;
+            }}
+        """)
+        self._rec_open_btn.clicked.connect(self._open_records_folder)
+        rec_top_row.addWidget(self._rec_open_btn)
+
+        rec_layout.addLayout(rec_top_row)
+
+        self._rec_status_lbl = QLabel("● IDLE — Siap merekam telemetri penerbangan")
+        self._rec_status_lbl.setStyleSheet(f"""
+            color: {COL_SUBTEXT.name()};
+            font-size: 10px;
+            font-family: {CSS_MONO};
+            font-weight: 600;
+            padding: 5px 10px;
+            background: {COL_CARD_ALT.name()};
+            border-radius: 6px;
+            border: 1px solid {COL_BORDER.name()};
+        """)
+        rec_layout.addWidget(self._rec_status_lbl)
+
+        right_col.addWidget(rec_card, 0)
 
         self._pid_plot = PidPlotWidget()
         add_shadow(self._pid_plot, blur=18, dy=2, alpha=20)
@@ -3467,7 +3585,203 @@ class MainWindow(QMainWindow):
                 self._pid_inputs[k].setValue(v)
         self.set_hint("Parameter PID & Limit ESC PWM dikembalikan ke nilai default.", level="ok")
 
+    # ────────── CSV Recording (Telemetry & PID) ──────────
+
+    def _toggle_recording(self):
+        if getattr(self, "_is_recording", False):
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self):
+        try:
+            os.makedirs(RECORDS_DIR, exist_ok=True)
+            timestamp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._record_filepath = os.path.join(RECORDS_DIR, f"pid_record_{timestamp_tag}.csv")
+            self._record_file = open(self._record_filepath, "w", newline="", encoding="utf-8")
+            self._record_writer = csv.writer(self._record_file)
+
+            headers = [
+                "timestamp", "elapsed_sec",
+                "roll_actual_deg", "roll_target_deg", "roll_error_deg",
+                "pitch_actual_deg", "pitch_target_deg", "pitch_error_deg",
+                "yaw_actual_deg", "yaw_target_dps",
+                "u_roll", "u_pitch", "u_yaw",
+                "gyro_x_dps", "gyro_y_dps", "gyro_z_dps",
+                "altitude_m", "vbat_v", "armed",
+                "angle_kp", "angle_ki", "angle_kd",
+                "rate_kp", "rate_ki", "rate_kd",
+                "yaw_kp", "yaw_ki", "yaw_kd"
+            ]
+            self._record_writer.writerow(headers)
+            self._record_file.flush()
+
+            self._is_recording = True
+            self._record_start_time = time.time()
+            self._record_sample_count = 0
+            self._record_timer.start(200)
+
+            if hasattr(self, "_rec_btn"):
+                self._rec_btn.setText("⏹  STOP RECORDING")
+                self._rec_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {COL_ERR.name()}; color: white;
+                        border: none; border-radius: 7px;
+                        padding: 0 16px;
+                        font: bold 10px Inter, sans-serif; letter-spacing: 0.8px;
+                    }}
+                    QPushButton:hover {{
+                        background: #DC2626;
+                    }}
+                """)
+
+            fname = os.path.basename(self._record_filepath)
+            if hasattr(self, "_rec_status_lbl"):
+                self._rec_status_lbl.setText(f"● RECORDING [00:00:00] · 0 baris · {fname}")
+                self._rec_status_lbl.setStyleSheet(f"""
+                    color: {COL_ERR.name()};
+                    font-size: 10px;
+                    font-family: {CSS_MONO};
+                    font-weight: 700;
+                    padding: 5px 10px;
+                    background: #FEF2F2;
+                    border-radius: 6px;
+                    border: 1px solid #FECACA;
+                """)
+
+            if hasattr(self, "_pid_plot"):
+                self._pid_plot.set_recording_status(True, "00:00:00")
+
+            self.set_hint(f"Mulai merekam telemetri ke records/{fname}...", level="ok")
+        except Exception as e:
+            self._is_recording = False
+            self.set_hint(f"Gagal memulai recording: {e}", level="err")
+
+    def _record_csv_sample(self, tgt_roll, roll, tgt_pitch, pitch, yaw, u_roll, u_pitch, u_yaw):
+        if not getattr(self, "_is_recording", False) or not self._record_writer:
+            return
+        try:
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            elapsed = time.time() - self._record_start_time
+            err_roll = tgt_roll - roll
+            err_pitch = tgt_pitch - pitch
+            tgt_yaw = self._js_target[2] if hasattr(self, "_js_target") else 0.0
+
+            gx, gy, gz = self._bench_imu if hasattr(self, "_bench_imu") else (0.0, 0.0, 0.0)
+            alt = self._alt_smooth if hasattr(self, "_alt_smooth") else 0.0
+            vbat = self._vbat if hasattr(self, "_vbat") else 0.0
+            armed = 1 if getattr(self, "_armed", False) else 0
+
+            p = getattr(self, "_pid_inputs", {})
+            a_kp = p['angle_kp'].value() if 'angle_kp' in p else 0.0
+            a_ki = p['angle_ki'].value() if 'angle_ki' in p else 0.0
+            a_kd = p['angle_kd'].value() if 'angle_kd' in p else 0.0
+            r_kp = p['rate_kp'].value() if 'rate_kp' in p else 0.0
+            r_ki = p['rate_ki'].value() if 'rate_ki' in p else 0.0
+            r_kd = p['rate_kd'].value() if 'rate_kd' in p else 0.0
+            y_kp = p['yaw_kp'].value() if 'yaw_kp' in p else 0.0
+            y_ki = p['yaw_ki'].value() if 'yaw_ki' in p else 0.0
+            y_kd = p['yaw_kd'].value() if 'yaw_kd' in p else 0.0
+
+            row = [
+                now_ts,
+                f"{elapsed:.3f}",
+                f"{roll:.2f}", f"{tgt_roll:.2f}", f"{err_roll:.2f}",
+                f"{pitch:.2f}", f"{tgt_pitch:.2f}", f"{err_pitch:.2f}",
+                f"{yaw:.2f}", f"{tgt_yaw:.2f}",
+                f"{u_roll:.2f}", f"{u_pitch:.2f}", f"{u_yaw:.2f}",
+                f"{gx:.2f}", f"{gy:.2f}", f"{gz:.2f}",
+                f"{alt:.2f}", f"{vbat:.2f}", armed,
+                f"{a_kp:.5f}", f"{a_ki:.5f}", f"{a_kd:.5f}",
+                f"{r_kp:.5f}", f"{r_ki:.5f}", f"{r_kd:.5f}",
+                f"{y_kp:.5f}", f"{y_ki:.5f}", f"{y_kd:.5f}"
+            ]
+            self._record_writer.writerow(row)
+            self._record_sample_count += 1
+            if self._record_sample_count % 10 == 0:
+                self._record_file.flush()
+        except Exception as e:
+            print(f"[WARN] Error menulis sample CSV: {e}")
+
+    def _stop_recording(self):
+        if not getattr(self, "_is_recording", False):
+            return
+        self._is_recording = False
+        self._record_timer.stop()
+
+        if self._record_file:
+            try:
+                self._record_file.flush()
+                self._record_file.close()
+            except Exception:
+                pass
+            self._record_file = None
+            self._record_writer = None
+
+        if hasattr(self, "_pid_plot"):
+            self._pid_plot.set_recording_status(False)
+
+        if hasattr(self, "_rec_btn"):
+            self._rec_btn.setText("⏺  START RECORDING")
+            self._rec_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COL_ACCENT.name()}; color: white;
+                    border: none; border-radius: 7px;
+                    padding: 0 16px;
+                    font: bold 10px Inter, sans-serif; letter-spacing: 0.8px;
+                }}
+                QPushButton:hover {{
+                    background: {COL_ACCENT_DK.name()};
+                }}
+            """)
+
+        duration_sec = int(time.time() - self._record_start_time)
+        m, s = divmod(duration_sec, 60)
+        h, m = divmod(m, 60)
+        dur_str = f"{h:02d}:{m:02d}:{s:02d}"
+        fname = os.path.basename(self._record_filepath)
+
+        if hasattr(self, "_rec_status_lbl"):
+            self._rec_status_lbl.setText(f"\u2713 TERSIMPAN — Total {self._record_sample_count:,} baris ({dur_str}) di {fname}")
+            self._rec_status_lbl.setStyleSheet(f"""
+                color: {COL_OK.name()};
+                font-size: 10px;
+                font-family: {CSS_MONO};
+                font-weight: 700;
+                padding: 5px 10px;
+                background: #F0FDF4;
+                border-radius: 6px;
+                border: 1px solid #BBF7D0;
+            """)
+
+        self.set_hint(f"Perekaman selesai! {self._record_sample_count:,} baris tersimpan ke records/{fname}", level="ok")
+
+    def _update_record_ui(self):
+        if not getattr(self, "_is_recording", False):
+            return
+        elapsed_int = int(time.time() - self._record_start_time)
+        m, s = divmod(elapsed_int, 60)
+        h, m = divmod(m, 60)
+        dur_str = f"{h:02d}:{m:02d}:{s:02d}"
+        fname = os.path.basename(self._record_filepath)
+
+        if hasattr(self, "_rec_status_lbl"):
+            self._rec_status_lbl.setText(f"● RECORDING [{dur_str}] · {self._record_sample_count:,} baris data · {fname}")
+
+        if hasattr(self, "_pid_plot"):
+            self._pid_plot.set_recording_status(True, dur_str)
+
+    def _open_records_folder(self):
+        try:
+            os.makedirs(RECORDS_DIR, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(RECORDS_DIR)))
+            self.set_hint(f"Membuka folder rekaman: {RECORDS_DIR}", level="ok")
+        except Exception as e:
+            self.set_hint(f"Gagal membuka folder: {e}", level="err")
+
     def closeEvent(self, event):
+        if getattr(self, "_is_recording", False):
+            self._stop_recording()
         self._save_pid_config()
         if self._serial and self._serial.is_open:
             try:
@@ -3791,14 +4105,19 @@ class MainWindow(QMainWindow):
 
             self._bench_smc = (roll, pitch, yaw, u_roll, u_pitch, u_yaw)
             self._orient.yaw = yaw
+            max_ang = 25.0
+            if hasattr(self, "_pid_inputs") and "max_angle" in self._pid_inputs:
+                max_ang = self._pid_inputs["max_angle"].value()
+            r, t, y, p = self._js_raw
+            tgt_roll = ((r - 128) / 127.0) * max_ang if abs(r - 128) > 4 else 0.0
+            tgt_pitch = ((p - 128) / 127.0) * max_ang if abs(p - 128) > 4 else 0.0
+
             if hasattr(self, "_pid_plot"):
-                max_ang = 25.0
-                if hasattr(self, "_pid_inputs") and "max_angle" in self._pid_inputs:
-                    max_ang = self._pid_inputs["max_angle"].value()
-                r, t, y, p = self._js_raw
-                tgt_roll = ((r - 128) / 127.0) * max_ang if abs(r - 128) > 4 else 0.0
-                tgt_pitch = ((p - 128) / 127.0) * max_ang if abs(p - 128) > 4 else 0.0
                 self._pid_plot.add_sample(tgt_roll, roll, tgt_pitch, pitch, u_roll, u_pitch, u_yaw)
+
+            if getattr(self, "_is_recording", False):
+                self._record_csv_sample(tgt_roll, roll, tgt_pitch, pitch, yaw, u_roll, u_pitch, u_yaw)
+
             self._push_att_metrics()
             return
 

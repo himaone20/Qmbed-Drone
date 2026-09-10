@@ -1,0 +1,1 @@
+timestamp,elapsed_sec,roll_actual_deg,roll_target_deg,roll_error_deg,pitch_actual_deg,pitch_target_deg,pitch_error_deg,yaw_actual_deg,yaw_target_dps,u_roll,u_pitch,u_yaw,gyro_x_dps,gyro_y_dps,gyro_z_dps,altitude_m,vbat_v,armed,angle_kp,angle_ki,angle_kd,rate_kp,rate_ki,rate_kd,yaw_kp,yaw_ki,yaw_kd
