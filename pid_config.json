@@ -10,8 +10,8 @@
     "yaw_kd": 0.0,
     "esc_min_pwm": 1000.0,
     "esc_arm_spin_pwm": 1200.0,
-    "esc_max_pwm": 1750.0,
-    "hover_throttle_pwm": 1515.0,
+    "esc_max_pwm": 1800.0,
+    "hover_throttle_pwm": 1570.0,
     "max_delta_pwm": 100.0,
     "max_angle": 10.0
 }
