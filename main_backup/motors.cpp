@@ -25,15 +25,15 @@ int gEscMaxPwm = ESC_MAX_US;         // 1300us (PWM Maksimum)
 float gHoverThrottlePwm = HOVER_THROTTLE_INITIAL_US;
 
 struct VerticalControlState {
-  float targetAltitude;
   float targetVz;
-  float vzIntegrator;
+  float estimatedVz;
+  float verticalAccel;
   float hoverThrottle;
   float configuredHoverThrottle;
+  float pilotCollective;
+  float correction;
   float finalThrottle;
   unsigned long lastUpdateUs;
-  bool altHoldLocked;
-  bool airborne;
   bool initialized;
 };
 
@@ -41,15 +41,15 @@ static VerticalControlState verticalState = {};
 
 static void resetVerticalControl()
 {
-  verticalState.targetAltitude = 0.0f;
   verticalState.targetVz = 0.0f;
-  verticalState.vzIntegrator = 0.0f;
+  verticalState.estimatedVz = 0.0f;
+  verticalState.verticalAccel = 0.0f;
   verticalState.hoverThrottle = (float)gEscArmSpinPwm;
   verticalState.configuredHoverThrottle = (float)gEscArmSpinPwm;
+  verticalState.pilotCollective = (float)gEscMinPwm;
+  verticalState.correction = 0.0f;
   verticalState.finalThrottle = (float)gEscMinPwm;
   verticalState.lastUpdateUs = 0;
-  verticalState.altHoldLocked = false;
-  verticalState.airborne = false;
   verticalState.initialized = false;
 }
 
@@ -61,119 +61,98 @@ static float updateVerticalCollective(const SensorData &snap, uint16_t rawThrott
   verticalState.lastUpdateUs = nowUs;
   if (dt < 0.0005f || dt > 0.050f) dt = 0.005f;
 
+  const float rollRad = snap.roll * DEG_TO_RAD;
+  const float pitchRad = snap.pitch * DEG_TO_RAD;
+  const float gravity = 9.80665f;
+  const float rawStick = constrain((float)rawThrottle, 0.0f, 255.0f);
+  float stick = (rawStick - VERTICAL_THROTTLE_CENTER) / 127.0f;
+  stick = constrain(stick, -1.0f, 1.0f);
+
+  const float deadband = VERTICAL_THROTTLE_DEADBAND / 127.0f;
+  float targetVz = 0.0f;
+  if (fabsf(stick) > deadband) {
+    const float normalized = (fabsf(stick) - deadband) / (1.0f - deadband);
+    const float expo = (1.0f - VERTICAL_STICK_EXPO) * normalized +
+                       VERTICAL_STICK_EXPO * normalized * normalized * normalized;
+    targetVz = copysignf(expo * VERTICAL_MAX_TARGET_SPEED_MPS, stick);
+  }
+
   if (!verticalState.initialized) {
     verticalState.hoverThrottle = gHoverThrottlePwm;
     verticalState.configuredHoverThrottle = gHoverThrottlePwm;
-    verticalState.finalThrottle = (float)gEscArmSpinPwm;
-    verticalState.targetAltitude = snap.alt;
-    verticalState.targetVz = 0.0f;
-    verticalState.vzIntegrator = 0.0f;
-    verticalState.altHoldLocked = false;
-    verticalState.airborne = false;
+    verticalState.finalThrottle = verticalState.hoverThrottle;
     verticalState.initialized = true;
   }
 
-  // Sinkronisasi bila nilai hover throttle diubah dari GUI (Window Tuning PID)
   if (fabsf(gHoverThrottlePwm - verticalState.configuredHoverThrottle) > 0.5f) {
     verticalState.hoverThrottle = gHoverThrottlePwm;
     verticalState.configuredHoverThrottle = gHoverThrottlePwm;
   }
 
-  const float rawStick = constrain((float)rawThrottle, 0.0f, 255.0f);
+  const float maxTargetDelta = VERTICAL_TARGET_SLEW_MPS2 * dt;
+  verticalState.targetVz += constrain(targetVz - verticalState.targetVz, -maxTargetDelta, maxTargetDelta);
 
-  // [1] Proteksi stik mentok bawah (Cut-off / Land / Stop)
-  if (rawStick <= 5.0f) {
-    verticalState.vzIntegrator = 0.0f;
-    verticalState.targetAltitude = snap.alt;
-    verticalState.targetVz = 0.0f;
-    verticalState.altHoldLocked = false;
-    verticalState.airborne = false;
+  // Sensor axes are X forward, Y left, Z up. This projects body specific force
+  // into world-up using the existing roll/pitch estimate, then removes gravity.
+  const float worldUpSpecificForce = snap.ax * sinf(pitchRad) +
+                                     snap.ay * sinf(rollRad) * cosf(pitchRad) +
+                                     snap.az * cosf(rollRad) * cosf(pitchRad);
+  const float rawVerticalAccel = constrain(worldUpSpecificForce - gravity,
+                                           -VERTICAL_MAX_ACCEL_MPS2,
+                                           VERTICAL_MAX_ACCEL_MPS2);
+  verticalState.verticalAccel += VERTICAL_ACCEL_LPF_ALPHA *
+                                 (rawVerticalAccel - verticalState.verticalAccel);
+
+  // Wash out accelerometer bias continuously. Vz stays a short-term damping signal.
+  float integratedVz = (verticalState.estimatedVz + verticalState.verticalAccel * dt) *
+                       max(0.0f, 1.0f - VERTICAL_VELOCITY_LEAK_PER_S * dt);
+  integratedVz = constrain(integratedVz, -VERTICAL_MAX_ESTIMATED_SPEED_MPS, VERTICAL_MAX_ESTIMATED_SPEED_MPS);
+  verticalState.estimatedVz += VERTICAL_VELOCITY_LPF_ALPHA * (integratedVz - verticalState.estimatedVz);
+
+  const float velocityError = verticalState.targetVz - verticalState.estimatedVz;
+  const float upwardHeadroom = max(0.0f, (float)gEscMaxPwm - verticalState.hoverThrottle);
+  const float downwardHeadroom = max(0.0f, verticalState.hoverThrottle - (float)gEscArmSpinPwm);
+  const float correctionHeadroom = (velocityError >= 0.0f) ? upwardHeadroom : downwardHeadroom;
+  const float velocityGain = (VERTICAL_MAX_TARGET_SPEED_MPS > 0.0f) ?
+                             (correctionHeadroom / VERTICAL_MAX_TARGET_SPEED_MPS) *
+                             VERTICAL_KP_FULL_ERROR_FRACTION : 0.0f;
+  const float correctionLimit = correctionHeadroom * VERTICAL_OUTPUT_LIMIT_FRACTION;
+  verticalState.correction = constrain(velocityGain * velocityError -
+                                       VERTICAL_ACCEL_DAMP_US_PER_MPS2 * verticalState.verticalAccel,
+                                       -downwardHeadroom, correctionLimit);
+
+  const bool adaptHover = fabsf(verticalState.targetVz) < 0.01f &&
+                          fabsf(verticalState.estimatedVz) < HOVER_ADAPT_MAX_VZ_MPS &&
+                          fabsf(verticalState.verticalAccel) < HOVER_ADAPT_MAX_ACCEL_MPS2 &&
+                          fabsf(snap.roll) < HOVER_ADAPT_MAX_ATTITUDE_DEG &&
+                          fabsf(snap.pitch) < HOVER_ADAPT_MAX_ATTITUDE_DEG;
+  if (adaptHover) {
+    verticalState.hoverThrottle += constrain(verticalState.correction,
+                                             -HOVER_ADAPT_RATE_US_PER_S * dt,
+                                             HOVER_ADAPT_RATE_US_PER_S * dt);
+    verticalState.hoverThrottle = constrain(verticalState.hoverThrottle,
+                                            (float)gEscArmSpinPwm,
+                                            (float)gEscMaxPwm - HOVER_THROTTLE_MARGIN_US);
+  }
+
+  // Pilot stick owns collective authority; BMI160 only adds bounded damping.
+  const float pilotCollective = (stick >= 0.0f) ?
+                                verticalState.hoverThrottle + stick * upwardHeadroom :
+                                verticalState.hoverThrottle + stick * downwardHeadroom;
+  verticalState.pilotCollective = pilotCollective;
+  const float requestedUnclamped = pilotCollective + verticalState.correction;
+  const float requestedThrottle = constrain(requestedUnclamped,
+                                            (float)gEscMinPwm, (float)gEscMaxPwm);
+  const float maxThrottleDelta = COLLECTIVE_SLEW_US_PER_S * dt;
+  if (rawStick <= 3.0f) {
+    // Only an explicit full-down command cuts motors; partial down remains descent.
     verticalState.finalThrottle = (float)gEscMinPwm;
     return verticalState.finalThrottle;
-  }
-
-  // [2] Proteksi di tanah: saat baru di-ARM, motor berputar idle (1200us)
-  // Drone tidak akan melompat terbang sampai pilot mendorong stik ke atas melewati deadband.
-  float stickDelta = rawStick - ALTHOLD_STICK_CENTER;
-  if (!verticalState.airborne) {
-    if (stickDelta <= ALTHOLD_STICK_DEADBAND) {
-      verticalState.targetAltitude = snap.alt;
-      verticalState.targetVz = 0.0f;
-      verticalState.vzIntegrator = 0.0f;
-      verticalState.finalThrottle = (float)gEscArmSpinPwm;
-      return verticalState.finalThrottle;
-    } else {
-      // Pilot mendorong stik naik: mulai fase terbang aktif!
-      verticalState.airborne = true;
-      verticalState.targetAltitude = snap.alt;
-    }
-  }
-
-  // [3] Outer Loop (Position) & Perintah Pilot via Stik Pegas
-  float commandedVz = 0.0f;
-  if (fabsf(stickDelta) <= ALTHOLD_STICK_DEADBAND) {
-    // Mode: Altitude Hold Lock (Stik berada di tengah netral)
-    if (!verticalState.altHoldLocked) {
-      verticalState.targetAltitude = snap.alt; // Kunci ketinggian saat ini tepat saat stik kembali ke tengah!
-      verticalState.altHoldLocked = true;
-    }
-    // Outer Loop Position P Controller:
-    float altError = verticalState.targetAltitude - snap.alt;
-    commandedVz = constrain(ALTHOLD_POS_KP * altError, -ALTHOLD_MAX_POS_CORR_MPS, ALTHOLD_MAX_POS_CORR_MPS);
   } else {
-    // Mode: Altitude Adjust (Pilot menggerakkan stik naik atau turun)
-    verticalState.altHoldLocked = false;
-    verticalState.targetAltitude = snap.alt; // Target mengikuti ketinggian agar langsung terkunci saat stik dilepas
-
-    float stickNorm = (fabsf(stickDelta) - ALTHOLD_STICK_DEADBAND) / (127.0f - ALTHOLD_STICK_DEADBAND);
-    stickNorm = constrain(stickNorm, 0.0f, 1.0f);
-    float expo = (1.0f - ALTHOLD_STICK_EXPO) * stickNorm +
-                 ALTHOLD_STICK_EXPO * stickNorm * stickNorm * stickNorm;
-
-    if (stickDelta > 0.0f) {
-      commandedVz = expo * ALTHOLD_MAX_CLIMB_MPS;
-    } else {
-      commandedVz = -expo * ALTHOLD_MAX_DESCENT_MPS;
-    }
+    verticalState.finalThrottle += constrain(requestedThrottle - verticalState.finalThrottle,
+                                              -maxThrottleDelta, maxThrottleDelta);
   }
-
-  // Slew rate limit pada target kecepatan vertikal agar transisi gerakan halus
-  float maxVzDelta = ALTHOLD_TARGET_SLEW_MPS2 * dt;
-  verticalState.targetVz += constrain(commandedVz - verticalState.targetVz, -maxVzDelta, maxVzDelta);
-
-  // [4] Inner Loop: Velocity PID Controller
-  float vzError = verticalState.targetVz - snap.vz;
-
-  // P-term
-  float P = ALTHOLD_VEL_KP * vzError;
-
-  // I-term (dengan anti-windup clamping)
-  verticalState.vzIntegrator += ALTHOLD_VEL_KI * vzError * dt;
-  verticalState.vzIntegrator = constrain(verticalState.vzIntegrator,
-                                         -ALTHOLD_VEL_I_MAX, ALTHOLD_VEL_I_MAX);
-
-  // D-term: Derivative-on-measurement menggunakan akselerasi vertikal bumi langsung
-  float D = -ALTHOLD_VEL_KD * snap.worldAz;
-
-  float uThrust = constrain(P + verticalState.vzIntegrator + D,
-                            -ALTHOLD_OUTPUT_MAX_US, ALTHOLD_OUTPUT_MAX_US);
-
-  // [5] Base Collective (Hover PWM) + Koreksi Altitude + Tilt Compensation (Angle Boost)
-  float rawThrustPwm = verticalState.hoverThrottle + uThrust;
-
-  // Tilt Compensation (Angle Boost): menjaga daya angkat vertikal saat drone miring bank/pitch
-  float cosTilt = cosf(snap.roll * DEG_TO_RAD) * cosf(snap.pitch * DEG_TO_RAD);
-  cosTilt = max(0.70f, cosTilt); // Cegah lonjakan ekstrem bila drone miring curam
-  float compensatedPwm = ((rawThrustPwm - (float)gEscArmSpinPwm) / cosTilt) + (float)gEscArmSpinPwm;
-
-  float requestedThrottle = constrain(compensatedPwm, (float)gEscArmSpinPwm, (float)gEscMaxPwm);
-
-  // Slew rate limit pada PWM kolektif akhir untuk kehalusan respon motor
-  float maxThrottleDelta = COLLECTIVE_SLEW_US_PER_S * dt;
-  verticalState.finalThrottle += constrain(requestedThrottle - verticalState.finalThrottle,
-                                           -maxThrottleDelta, maxThrottleDelta);
-
-  return constrain(verticalState.finalThrottle, (float)gEscArmSpinPwm, (float)gEscMaxPwm);
+  return constrain(verticalState.finalThrottle, (float)gEscMinPwm, (float)gEscMaxPwm);
 }
 
 void setEscPwmLimits(int minPwm, int armSpinPwm, int maxPwm)
@@ -321,7 +300,6 @@ void TaskMotors(void *pvParameters)
       setAllMotorsPWM(gEscMinPwm);  // Stop Total
       resetPidState();
       resetVerticalControl();
-      sensors_reset_fusion();
     }
     else
     {
@@ -345,12 +323,12 @@ void TaskMotors(void *pvParameters)
       if (nowMs - lastVerticalDebugMs >= VERTICAL_DEBUG_PERIOD_MS) {
         lastVerticalDebugMs = nowMs;
         Serial.print("[VCTRL] raw:"); Serial.print(gTargetThrottlePwm);
-        Serial.print(" tgtAlt:"); Serial.print(verticalState.targetAltitude, 2);
-        Serial.print(" alt:"); Serial.print(snap.alt, 2);
-        Serial.print(" tgtVz:"); Serial.print(verticalState.targetVz, 2);
-        Serial.print(" vz:"); Serial.print(snap.vz, 2);
-        Serial.print(" az:"); Serial.print(snap.worldAz, 2);
+        Serial.print(" target:"); Serial.print(verticalState.targetVz, 2);
+        Serial.print(" vz:"); Serial.print(verticalState.estimatedVz, 2);
+        Serial.print(" az:"); Serial.print(verticalState.verticalAccel, 2);
         Serial.print(" hover:"); Serial.print(verticalState.hoverThrottle, 1);
+        Serial.print(" pilot:"); Serial.print(verticalState.pilotCollective, 1);
+        Serial.print(" corr:"); Serial.print(verticalState.correction, 1);
         Serial.print(" out:"); Serial.println(targetThrottle, 1);
       }
 #endif
@@ -371,9 +349,6 @@ void TaskMotors(void *pvParameters)
       gSensorData.pitch = snap.pitch;
       gSensorData.yaw = snap.yaw;
       gSensorData.yawRate = snap.yawRate;
-      gSensorData.alt = snap.alt;
-      gSensorData.vz = snap.vz;
-      gSensorData.worldAz = snap.worldAz;
       gSensorData.bmiOK = snap.bmiOK;
       xSemaphoreGive(sensorMutex);
     }

@@ -213,12 +213,10 @@ Drone telah dilengkapi sistem kendali **Cascade (Dual-Loop) PID** (sesuai refere
 4. **Yawing (Putaran Heading / Arah Hadap)**:
    - Stik Yaw mengatur laju perputaran drone hingga maks $\pm 150.0^\circ/\text{s}$.
    - Saat stik dilepas, loop rate yaw aktif meredam dan menahan arah hadap (anti-spin).
-5. **Throttle & Altitude Hold (Sensor Fusion BMP180 + BMI160)**:
-   - **Stik Pegas di Tengah (128)**: Mode **Altitude Hold Lock**. Drone otomatis mengunci posisi ketinggian saat ini menggunakan perpaduan respons cepat akselerometer vertikal BMI160 dan referensi mutlak BMP180 (Complementary Observer 200 Hz).
-   - **Stik Didorong Naik (> 138)**: Mode **Climb**. Drone naik dengan kecepatan terukur (maks +0.8 m/s). Saat stik dilepas ke tengah, ketinggian baru langsung terkunci otomatis.
-   - **Stik Ditarik Turun (< 118)**: Mode **Descent**. Drone turun dengan kecepatan terukur (maks -0.7 m/s).
-   - **Stik Mentok Bawah (<= 5)**: Motor *cut-off* / turun ke stop PWM (1000 µs) untuk pendaratan darurat / disarm aman.
-   - **Ground Safety**: Saat baru di-ARM di tanah, motor berputar idle 1200 µs dan tidak akan melompat terbang sampai stik didorong ke atas.
+5. **Throttle (Daya Angkat)**:
+   - Stik Throttle pegas: netral (128) = Idle 20% (1200 us).
+   - Didorong ke atas (128 $\rightarrow$ 255) menaikkan throttle secara mulus (1200 s.d. 2000 us).
+   - Proteksi keselamatan: Integrator PID di-reset otomatis saat di tanah/idle untuk mencegah sentakan motor.
 
 ---
 

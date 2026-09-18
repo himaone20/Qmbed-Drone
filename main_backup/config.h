@@ -76,40 +76,36 @@
 
 #define MIX_ACTIVE_MIN_US        1150   // Ambang batas throttle aktif PID (> 1150us)
 
-/* ── Sensor Fusion (BMP180 + BMI160 2nd/3rd-Order Observer 200Hz) ────── */
-#define FUSION_K1                2.50f   // Baro position correction gain (redam noise)
-#define FUSION_K2                3.20f   // Baro velocity correction gain (anti-drift)
-#define FUSION_K3                0.20f   // Accel bias learning gain
-#define FUSION_ACCEL_LPF_ALPHA   0.25f   // Low-pass filter akselerasi vertikal (anti-getar)
-#define FUSION_ACCEL_DEADBAND    0.05f   // m/s^2 deadband noise akselerometer
-#define FUSION_MAX_ACCEL_MPS2    6.00f   // Batas akselerasi vertikal m/s^2
+/* ── Vertical Velocity Control (BMI160 only, no barometer feedback) ──── */
+// targetThrottle pada paket LoRa adalah command stick 0..255 dari remote.
+#define VERTICAL_THROTTLE_CENTER             128.0f
+#define VERTICAL_THROTTLE_DEADBAND            8.0f
+#define VERTICAL_MAX_TARGET_SPEED_MPS         0.60f
+#define VERTICAL_STICK_EXPO                   0.45f
+#define VERTICAL_TARGET_SLEW_MPS2             0.80f
+#define VERTICAL_ACCEL_LPF_ALPHA              0.12f
+#define VERTICAL_MAX_ACCEL_MPS2                4.0f
+#define VERTICAL_VELOCITY_LPF_ALPHA           0.10f
+#define VERTICAL_VELOCITY_LEAK_PER_S          0.80f
+#define VERTICAL_MAX_ESTIMATED_SPEED_MPS      2.00f
+#define VERTICAL_ACCEL_DAMP_US_PER_MPS2       5.0f
+// IMU velocity is only short-term damping. It must not be able to cancel
+// the pilot collective command because accelerometer integration drifts.
+#define VERTICAL_KP_FULL_ERROR_FRACTION        0.18f
+#define VERTICAL_OUTPUT_LIMIT_FRACTION         0.22f
 
-/* ── Cascaded Altitude Hold Controller ────────────────────────────────── */
-#define ALTHOLD_STICK_CENTER         128.0f  // Posisi tengah netral stik throttle
-#define ALTHOLD_STICK_DEADBAND        10.0f  // Deadband pegas (128 +/- 10)
-#define ALTHOLD_STICK_EXPO            0.40f  // Kurva eksponensial respon gas
-#define ALTHOLD_MAX_CLIMB_MPS         0.80f  // Kecepatan naik maksimal (m/s)
-#define ALTHOLD_MAX_DESCENT_MPS       0.70f  // Kecepatan turun maksimal (m/s)
-#define ALTHOLD_TARGET_SLEW_MPS2      1.20f  // Batas akselerasi target kecepatan (m/s^2)
+// Nilai awal hover tidak mengikuti Max ESC GUI: Max ESC hanya mengatur headroom
+// stick, bukan thrust hover. Sesuaikan setelah uji tethered bila diperlukan.
+#define HOVER_THROTTLE_INITIAL_US             1260.0f
+#define HOVER_THROTTLE_MARGIN_US              0.0f
+#define HOVER_ADAPT_RATE_US_PER_S             0.25f
+#define HOVER_ADAPT_MAX_VZ_MPS                0.10f
+#define HOVER_ADAPT_MAX_ACCEL_MPS2            0.35f
+#define HOVER_ADAPT_MAX_ATTITUDE_DEG          10.0f
+#define COLLECTIVE_SLEW_US_PER_S              700.0f
 
-// Outer Loop (Position Loop): Galat Ketinggian -> Target Kecepatan Vertikal (m/s)
-#define ALTHOLD_POS_KP                1.20f  // Position P gain (galat 1m -> target 1.2 m/s)
-#define ALTHOLD_MAX_POS_CORR_MPS      0.60f  // Batas kecepatan koreksi outer loop (m/s)
-
-// Inner Loop (Velocity Loop): Galat Kecepatan -> Koreksi PWM Motor (us)
-#define ALTHOLD_VEL_KP               85.00f  // Velocity P gain (galat 1 m/s -> 85 us PWM)
-#define ALTHOLD_VEL_KI               22.00f  // Velocity I gain (integrator steady-state)
-#define ALTHOLD_VEL_KD                8.00f  // Derivative-on-measurement (peredam getar az)
-#define ALTHOLD_VEL_I_MAX            90.00f  // Batas anti-windup akumulasi integral (us)
-#define ALTHOLD_OUTPUT_MAX_US       150.00f  // Batas koreksi total altitude hold (us)
-
-// Nilai awal hover (disinkronkan dari GUI window tuning PID drone_viewer.py)
-#define HOVER_THROTTLE_INITIAL_US   1260.0f
-#define HOVER_THROTTLE_MARGIN_US       0.0f
-#define COLLECTIVE_SLEW_US_PER_S     700.0f  // Laju perubahan PWM motor (us/detik)
-
-#define VERTICAL_DEBUG                 0
-#define VERTICAL_DEBUG_PERIOD_MS       200
+#define VERTICAL_DEBUG                         0
+#define VERTICAL_DEBUG_PERIOD_MS               200
 
 struct PidParams {
   float angleKp, angleKi, angleKd;
@@ -121,7 +117,6 @@ struct PidParams {
   float escMinPwm;
   float escArmSpinPwm;
   float escMaxPwm;
-  float hoverThrottlePwm;
 };
 
 /* ── LED Indikator ───────────────────────────────────────────────────── */
@@ -227,8 +222,7 @@ struct SensorData {
   float gx, gy, gz;      // deg/s
   float press;           // hPa
   float alt;             // meter relatif
-  float vz;              // m/s kecepatan vertikal (climb/descent rate, fusi 200Hz)
-  float worldAz;         // m/s^2 akselerasi vertikal bumi bebas gravitasi (fusi 200Hz)
+  float vz;              // m/s kecepatan vertikal (climb/descent rate)
   float roll;            // derajat, complementary filter onboard
   float pitch;           // derajat, complementary filter onboard
   float yaw;             // derajat, integrasi gyro 200Hz onboard
