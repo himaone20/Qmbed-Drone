@@ -23,9 +23,16 @@ extern int gEscArmSpinPwm;
 extern int gEscMaxPwm;
 extern float gHoverThrottlePwm;
 
+// Fault Tolerant Control (FTC) & Motor Fault Injection
+extern uint8_t gMotorFaultActive[4];   // 0 = normal, 1 = fault aktif
+extern float   gMotorFaultPercent[4];  // 0.0 s.d. 100.0% reduksi RPM
+extern bool    gEnableFtc;            // true = algoritma FTC aktif
+
 void motors_init();
 void setEscPwmLimits(int minPwm, int armSpinPwm, int maxPwm);
 void setHoverThrottlePwm(float hoverPwm);
+void setMotorFault(int motorIndex, uint8_t active, float percent);
+void setFtcEnabled(bool enabled);
 void writeMotorMix(float basePwm, float uRoll = 0.0f, float uPitch = 0.0f, float uYaw = 0.0f);
 void setAllMotorsPWM(int us);
 int  getMotorPWM(int index);

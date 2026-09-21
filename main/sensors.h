@@ -20,10 +20,6 @@ bool sensors_init();
 float readVBat();
 bool sensors_step_imu(SensorData &outData);
 void sensors_poll_telemetry();
-void sensors_reset_fusion();
-float sensors_get_fused_alt();
-float sensors_get_fused_vz();
-float sensors_get_world_az();
 void TaskSensors(void *pvParameters);
 
 #endif // SENSORS_H

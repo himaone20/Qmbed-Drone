@@ -30,13 +30,6 @@ static float az_f = 9.80665f;
 static bool attitudeInitialized = false;
 static unsigned long lastAttitudeUs = 0;
 
-/* ── Sensor Fusion Altitude & Vertical Velocity State (200Hz) ────────── */
-static float fusion_alt = 0.0f;
-static float fusion_vz  = 0.0f;
-static float fusion_az  = 0.0f;
-static float fusion_accel_bias = 0.0f;
-static bool  fusion_initialized = false;
-
 /* ── Baro Altitude PT1 + Median Filter ─────────────────────────────────── */
 struct MedianFilter5 {
   float buf[5];
@@ -233,7 +226,7 @@ struct bmp180_calib {
 };
 
 static bmp180_calib cal180;
-static const uint8_t bmp180_oss = 3; // Ultra High Resolution (8 sampel internal, 25.5ms, noise minimum)
+static const uint8_t bmp180_oss = 2; // High Resolution (4 sampel internal, 13.5ms, noise rendah ~0.2m)
 static int32_t bmp180_b5 = 4000;
 
 static bool bmp180_init(void)
@@ -317,7 +310,7 @@ static bool bmp180_poll(float &press_hpa, float &alt_m)
     } else {
       uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
       i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
-      due_ms = now + 26; // OSS 3 delay = 25.5 ms
+      due_ms = now + 14; // OSS 2 delay = 13.5 ms
       phase = 2;
     }
     return false;
@@ -337,11 +330,11 @@ static bool bmp180_poll(float &press_hpa, float &alt_m)
     // Langsung trigger pembacaan tekanan
     uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
     i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
-    due_ms = now + 26;
+    due_ms = now + 14;
     phase = 2;
     return false;
   }
-  
+
   if (phase == 2) {
     phase = 0;
     uint8_t p_buf[3];
@@ -373,7 +366,7 @@ static bool bmp180_read_sync(float *press_hpa, float *alt_m)
 
   uint8_t press_cmd = BMP180_CMD_READ_PRESS + (bmp180_oss << 6);
   i2c_write_reg(BMP180_ADDR, BMP180_REG_CONTROL, press_cmd);
-  delay(26);
+  delay(14);
   uint8_t p_buf[3];
   if (!i2c_read_regs(BMP180_ADDR, BMP180_REG_RESULT, p_buf, 3)) {
     return false;
@@ -629,48 +622,6 @@ bool sensors_step_imu(SensorData &outData)
     }
   }
 
-  // 5. Sensor Fusion Ketinggian & Kecepatan Vertikal 200 Hz (Complementary Observer 3rd-Order)
-  // Hitung akselerasi vertikal bumi (Z-Up) dengan mengeliminasi gravitasi 9.80665 m/s^2
-  float rollRad  = roll_f * DEG_TO_RAD;
-  float pitchRad = pitch_f * DEG_TO_RAD;
-  const float gravity = 9.80665f;
-
-  float worldUpSpecificForce = ax_f * sinf(pitchRad) +
-                               ay_f * sinf(rollRad) * cosf(pitchRad) +
-                               az_f * cosf(rollRad) * cosf(pitchRad);
-  float raw_az_world = worldUpSpecificForce - gravity;
-
-  // Deadband noise akselerometer & batas aman akselerasi
-  if (fabsf(raw_az_world) < FUSION_ACCEL_DEADBAND) {
-    raw_az_world = 0.0f;
-  }
-  raw_az_world = constrain(raw_az_world, -FUSION_MAX_ACCEL_MPS2, FUSION_MAX_ACCEL_MPS2);
-
-  // Filter peredam getaran baling-baling/rangka (low-pass filter)
-  fusion_az += FUSION_ACCEL_LPF_ALPHA * (raw_az_world - fusion_az);
-
-  if (!fusion_initialized) {
-    fusion_alt = alt_filtered;
-    fusion_vz  = 0.0f;
-    fusion_accel_bias = 0.0f;
-    fusion_initialized = true;
-  }
-
-  // Galat barometer terhadap estimasi posisi saat ini
-  float baro_error = alt_filtered - fusion_alt;
-
-  // Estimasi bias akselerometer (perlahan menyerap drift sensor)
-  fusion_accel_bias += -FUSION_K3 * baro_error * dt;
-  fusion_accel_bias = constrain(fusion_accel_bias, -1.0f, 1.0f);
-  float az_corrected = fusion_az - fusion_accel_bias;
-
-  // Pembaruan keadaan integrasi posisi (ketinggian) & kecepatan vertikal
-  fusion_alt += fusion_vz * dt + 0.5f * az_corrected * dt * dt + (FUSION_K1 * baro_error * dt);
-  fusion_vz  += az_corrected * dt + (FUSION_K2 * baro_error * dt);
-
-  fusion_alt = constrain(fusion_alt, -20.0f, 150.0f);
-  fusion_vz  = constrain(fusion_vz, -4.0f, 4.0f);
-
   // Populate output
   outData.ax = ax_f;
   outData.ay = ay_f;
@@ -682,9 +633,6 @@ bool sensors_step_imu(SensorData &outData)
   outData.pitch = pitch_f; // degrees (+ when nose up)
   outData.yaw = yaw_f;     // degrees (+ when turning right/CW)
   outData.yawRate = gz_f;
-  outData.alt = fusion_alt;       // Ketinggian fusi murni (m)
-  outData.vz  = fusion_vz;        // Kecepatan vertikal fusi murni (m/s)
-  outData.worldAz = az_corrected; // Akselerasi vertikal bumi bebas gravitasi (m/s^2)
   outData.bmiOK = true;
   outData.gyroCalibValid = gSensorData.gyroCalibValid;
 
@@ -697,6 +645,8 @@ void sensors_poll_telemetry()
 {
   static unsigned long last_vbat_ms = 0;
   static unsigned long last_baro_ms = 0;
+  static float prev_alt = 0.0f;
+  static float vz_filtered = 0.0f;
   static float vbat_f = 11.1f;
   static uint8_t batt_committed_stage = BATT_OK;
   static uint8_t batt_candidate_stage = BATT_OK;
@@ -736,10 +686,18 @@ void sensors_poll_telemetry()
 
     float cond_alt = altitudeFilter.update(raw_a, dt_baro);
     float raw_rel_alt = cond_alt - altitude_offset;
+
+    float baro_vz = (raw_rel_alt - prev_alt) / dt_baro;
+    prev_alt = raw_rel_alt;
+    if (fabsf(baro_vz) < ALT_VZ_DEADBAND) baro_vz = 0.0f;
+
+    vz_filtered = VZ_ACCEL_WEIGHT * vz_filtered + VZ_BARO_WEIGHT * baro_vz;
     alt_filtered = raw_rel_alt;
 
     if (sensorMutex && xSemaphoreTake(sensorMutex, 0) == pdTRUE) {
       gSensorData.press = raw_p;
+      gSensorData.alt = alt_filtered;
+      gSensorData.vz = vz_filtered;
       xSemaphoreGive(sensorMutex);
     }
   }
@@ -751,29 +709,6 @@ void sensors_poll_telemetry()
     gSensorData.battStage = batt_committed_stage;
     xSemaphoreGive(sensorMutex);
   }
-}
-
-void sensors_reset_fusion()
-{
-  fusion_alt = alt_filtered;
-  fusion_vz  = 0.0f;
-  fusion_az  = 0.0f;
-  fusion_accel_bias = 0.0f;
-}
-
-float sensors_get_fused_alt()
-{
-  return fusion_alt;
-}
-
-float sensors_get_fused_vz()
-{
-  return fusion_vz;
-}
-
-float sensors_get_world_az()
-{
-  return fusion_az - fusion_accel_bias;
 }
 
 /* ========================= LEGACY TaskSensors (Optional) ================= */

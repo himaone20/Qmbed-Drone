@@ -774,6 +774,28 @@ void loop()
       guiThrottle = 0;
       guiOverride  = false;
       Serial.println("[STICK] Reset: throttle=0, override OFF");
+    } else if (input.startsWith("FAULT ")) {
+      // Injeksi kegagalan motor / FTC: FAULT <m1_a> <m1_p> <m2_a> <m2_p> <m3_a> <m3_p> <m4_a> <m4_p>
+      String payload = input.substring(6);
+      payload.trim();
+      int a1, p1, a2, p2, a3, p3, a4, p4;
+      int count = sscanf(payload.c_str(), "%d %d %d %d %d %d %d %d",
+                         &a1, &p1, &a2, &p2, &a3, &p3, &a4, &p4);
+      if (count == 8) {
+        Serial.print("[FAULT] OK M1="); Serial.print(a1 ? p1 : 0);
+        Serial.print("% M2="); Serial.print(a2 ? p2 : 0);
+        Serial.print("% M3="); Serial.print(a3 ? p3 : 0);
+        Serial.print("% M4="); Serial.print(a4 ? p4 : 0);
+        Serial.println("%");
+      } else {
+        Serial.println("[FAULT] ERR FORMAT (need 8 integer values)");
+      }
+    } else if (input.startsWith("FTC ")) {
+      String payload = input.substring(4);
+      payload.trim();
+      int mode = payload.toInt();
+      Serial.print("[FTC] MODE=");
+      Serial.println(mode ? "ACTIVE" : "STANDBY");
     } else if (input.startsWith("PID ")) {
       String payload = input.substring(4);
       payload.trim();

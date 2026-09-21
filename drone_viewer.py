@@ -7,7 +7,7 @@ import time
 import csv
 from datetime import datetime
 from collections import deque
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QPoint, QUrl
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QPoint, QUrl, Signal
 from PySide6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QFontMetricsF,
     QRadialGradient, QLinearGradient, QPolygonF, QPainterPath,
@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QFrame,
     QGraphicsDropShadowEffect,
-    QStackedWidget, QMenu, QFormLayout, QDoubleSpinBox, QScrollArea
+    QStackedWidget, QMenu, QFormLayout, QDoubleSpinBox, QScrollArea,
+    QSlider, QSpinBox, QDialog, QGridLayout, QGroupBox, QProgressBar
 )
 
 try:
@@ -53,6 +54,12 @@ PID_OK_RE = re.compile(
 )
 FLAGS_RE = re.compile(
     r"\[FLAGS\]\s*G:(\d)\s*B:(\d)\s*P:(\d)\s*V:(\d)\s*BS:(\d)\s*FS:(\d)"
+)
+FAULT_OK_RE = re.compile(
+    r"\[FAULT\]\s*OK.*"
+)
+FTC_OK_RE = re.compile(
+    r"\[FTC\]\s*.*"
 )
 
 PID_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pid_config.json")
@@ -2186,6 +2193,780 @@ class BenchCheckCard(QFrame):
             """)
 
 
+# ───────────────────── FTC (Fault Tolerant Control) Widgets ─────────────────────
+
+class FtcMotorMixWidget(QWidget):
+    """Diagram Quad-X tampak atas interaktif khusus pengujian Fault Tolerant Control (FTC).
+    Menampilkan animasi baling-baling real-time, visualisasi motor yang dimatikan/tereduksi
+    secara dinamis, perbandingan output daya nominal vs aktual dengan injeksi kegagalan,
+    serta indikator re-alokasi torsi penyeimbang saat FTC aktif."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(420, 420)
+        self.roll = self.pitch = self.yaw = 0.0
+        self.ur = self.up = self.uy = 0.0
+        self.throttle = 1200.0
+        self.armed = False
+        self.ftc_enabled = True
+
+        # Status fault per motor: active (bool) & percent (0..100)
+        self.faults = [
+            {"active": False, "percent": 100.0},
+            {"active": False, "percent": 100.0},
+            {"active": False, "percent": 100.0},
+            {"active": False, "percent": 100.0},
+        ]
+
+        # Nilai PWM nominal & aktual (dengan fault/FTC)
+        self.pwm_nom = [1200.0, 1200.0, 1200.0, 1200.0]
+        self.pwm_act = [1200.0, 1200.0, 1200.0, 1200.0]
+        self._pwm_smooth = [1200.0, 1200.0, 1200.0, 1200.0]
+
+        self._prop_angles = [0.0, 0.0, 0.0, 0.0]
+        self._pulse_phase = 0.0
+
+        # Metrik torsi tidak seimbang
+        self.delta_roll_torque = 0.0
+        self.delta_pitch_torque = 0.0
+
+        # Posisi relatif 4 motor Quad-X (tampak atas: +X kanan, +Y bawah)
+        self._motors_meta = [
+            {"id": "M1", "pos": "FL", "pin": "PB6", "cw": True,  "dx": -1.0, "dy": -1.0, "bar_side": -1},
+            {"id": "M2", "pos": "FR", "pin": "PB7", "cw": False, "dx":  1.0, "dy": -1.0, "bar_side":  1},
+            {"id": "M3", "pos": "BR", "pin": "PB8", "cw": True,  "dx":  1.0, "dy":  1.0, "bar_side":  1},
+            {"id": "M4", "pos": "BL", "pin": "PB9", "cw": False, "dx": -1.0, "dy":  1.0, "bar_side": -1},
+        ]
+
+    def set_data(self, roll, pitch, yaw, ur, up, uy, throttle, armed,
+                 faults, ftc_enabled, pwm_nom, pwm_act, d_roll, d_pitch):
+        self.roll, self.pitch, self.yaw = roll, pitch, yaw
+        self.ur, self.up, self.uy = ur, up, uy
+        self.throttle = throttle
+        self.armed = armed
+        self.faults = faults
+        self.ftc_enabled = ftc_enabled
+        self.pwm_nom = list(pwm_nom)
+        self.pwm_act = list(pwm_act)
+        self.delta_roll_torque = d_roll
+        self.delta_pitch_torque = d_pitch
+
+    def animate(self):
+        ease = 0.22
+        for i in range(4):
+            self._pwm_smooth[i] += (self.pwm_act[i] - self._pwm_smooth[i]) * ease
+
+            # Hitung laju putaran baling-baling berdasarkan status fault & daya motor
+            f = self.faults[i]
+            if not self.armed:
+                speed = 0.0
+            elif f["active"] and f["percent"] >= 99.5:
+                speed = 0.0
+            else:
+                loss = (f["percent"] / 100.0) if f["active"] else 0.0
+                eff = max(0.0, 1.0 - loss)
+                speed = 15.0 * eff
+
+            cw = self._motors_meta[i]["cw"]
+            dir_mult = 1.0 if cw else -1.0
+            self._prop_angles[i] = (self._prop_angles[i] + speed * dir_mult) % 360.0
+
+        self._pulse_phase = (self._pulse_phase + 0.08) % (2.0 * math.pi)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+
+        # ── Kartu Utama ──
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD))
+        p.drawRoundedRect(rect, 14, 14)
+
+        # ── Zona 1: Header (36 px) ──
+        header_rect = QRectF(rect.left() + 16, rect.top() + 10, rect.width() - 32, 26)
+        p.setPen(COL_TEXT)
+        p.setFont(qfont(FONT_UI, 10, QFont.Bold, letter_spacing=0.8))
+        p.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter, "FTC · QUAD-X LIVE ALLOCATION")
+
+        # Badges kanan (Mode FTC + Arm Status)
+        arm_txt = "ARMED" if self.armed else "DISARMED"
+        arm_bg = QColor("#DCFCE7") if self.armed else QColor("#F1F5F9")
+        arm_fg = QColor("#166534") if self.armed else QColor("#64748B")
+
+        ftc_txt = "FTC ACTIVE" if self.ftc_enabled else "STD MIXER (NO FTC)"
+        ftc_bg = QColor("#E0F2FE") if self.ftc_enabled else QColor("#FEF3C7")
+        ftc_fg = QColor("#0369A1") if self.ftc_enabled else QColor("#92400E")
+
+        bf = qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.0)
+        p.setFont(bf)
+
+        bw_arm = QFontMetricsF(bf).horizontalAdvance(arm_txt) + 16
+        pill_arm = QRectF(header_rect.right() - bw_arm, header_rect.center().y() - 10, bw_arm, 20)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(arm_bg))
+        p.drawRoundedRect(pill_arm, 10, 10)
+        p.setPen(arm_fg)
+        p.drawText(pill_arm, Qt.AlignCenter, arm_txt)
+
+        bw_ftc = QFontMetricsF(bf).horizontalAdvance(ftc_txt) + 16
+        pill_ftc = QRectF(pill_arm.left() - 8 - bw_ftc, header_rect.center().y() - 10, bw_ftc, 20)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(ftc_bg))
+        p.drawRoundedRect(pill_ftc, 10, 10)
+        p.setPen(ftc_fg)
+        p.drawText(pill_ftc, Qt.AlignCenter, ftc_txt)
+
+        # ── Zona 3: Footer Telemetri Kapsul Bawah (44 px) ──
+        bottom_h = 42.0
+        bottom_top = rect.bottom() - 12 - bottom_h
+
+        # Hitung status keseimbangan torsi
+        any_fault = any(f["active"] for f in self.faults)
+        if not any_fault:
+            bal_txt = "SEIMBANG (NORMAL)"
+            bal_col = COL_OK
+        elif self.ftc_enabled:
+            bal_txt = "FTC STABIL (LEVEL)"
+            bal_col = COL_ACCENT
+        else:
+            bal_txt = "UNBALANCED (FLIP!)"
+            bal_col = COL_ERR
+
+        telemetry_items = [
+            ("COLLECTIVE", f"{self.throttle:.0f} us", COL_TEXT),
+            ("uROLL / uPITCH", f"{self.ur:+.0f} / {self.up:+.0f}", COL_TEXT),
+            ("NET TORQUE \u0394", f"R:{self.delta_roll_torque:+.0f} P:{self.delta_pitch_torque:+.0f}",
+             COL_OK if abs(self.delta_roll_torque) < 15 and abs(self.delta_pitch_torque) < 15 else COL_ERR),
+            ("EQUILIBRIUM", bal_txt, bal_col),
+        ]
+
+        num_items = len(telemetry_items)
+        gap = 8.0
+        total_w = rect.width() - 32
+        item_w = (total_w - (num_items - 1) * gap) / num_items
+
+        for idx, (label, val_str, col) in enumerate(telemetry_items):
+            ix = rect.left() + 16 + idx * (item_w + gap)
+            item_rect = QRectF(ix, bottom_top, item_w, bottom_h)
+            p.setPen(QPen(COL_BORDER, 1))
+            p.setBrush(QBrush(COL_CARD_ALT))
+            p.drawRoundedRect(item_rect, 7, 7)
+
+            p.setPen(COL_MUTED)
+            p.setFont(qfont(FONT_UI, 6, QFont.Bold, letter_spacing=1.0))
+            p.drawText(QRectF(item_rect.left(), item_rect.top() + 4, item_rect.width(), 12),
+                       Qt.AlignCenter, label)
+
+            p.setPen(col)
+            p.setFont(qfont(FONT_MONO, 8, QFont.Bold))
+            p.drawText(QRectF(item_rect.left(), item_rect.top() + 18, item_rect.width(), 18),
+                       Qt.AlignCenter, val_str)
+
+        # ── Zona 2: Area Visual Drone 2D (Tampak Atas Quad-X) ──
+        panel = QRectF(rect.left() + 14, header_rect.bottom() + 6,
+                       rect.width() - 28, bottom_top - header_rect.bottom() - 12)
+        p.setPen(QPen(COL_BORDER, 1))
+        p.setBrush(QBrush(COL_CARD_ALT))
+        p.drawRoundedRect(panel, 10, 10)
+
+        cx = panel.center().x()
+        cy = panel.center().y()
+
+        # Penanda Arah Depan (FRONT ▲)
+        fwd_box = QRectF(cx - 40, panel.top() + 6, 80, 18)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(COL_ACCENT_XLT))
+        p.drawRoundedRect(fwd_box, 9, 9)
+        p.setPen(COL_ACCENT_DK)
+        p.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.2))
+        p.drawText(fwd_box, Qt.AlignCenter, "\u25B2  FRONT (X)")
+
+        # Geometri Quad-X proporsional
+        half_w = panel.width() * 0.5 - 20
+        half_h = panel.height() * 0.5 - 24
+        max_arm_w = (half_w - 32) / 1.42
+        max_arm_h = (half_h - 28) / 1.35
+        arm_d = max(30.0, min(max_arm_w, max_arm_h, 80.0))
+
+        arm_dx = arm_d * 1.05
+        arm_dy = arm_d * 0.88
+        prop_r = arm_d * 0.40
+        motor_r = max(10.0, prop_r * 0.44)
+        body_r = arm_d * 0.32
+
+        # 1. Lengan Karbon X (Arm)
+        p.setPen(QPen(QColor("#334155"), 6, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx - arm_dx, cy - arm_dy), QPointF(cx + arm_dx, cy + arm_dy))
+        p.drawLine(QPointF(cx + arm_dx, cy - arm_dy), QPointF(cx - arm_dx, cy + arm_dy))
+
+        p.setPen(QPen(QColor("#64748B"), 2.5, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx - arm_dx, cy - arm_dy), QPointF(cx + arm_dx, cy + arm_dy))
+        p.drawLine(QPointF(cx + arm_dx, cy - arm_dy), QPointF(cx - arm_dx, cy + arm_dy))
+
+        # 2. Bodi Pusat Drone (Fuselage / FC Hub)
+        body_rect = QRectF(cx - body_r, cy - body_r, body_r * 2, body_r * 2)
+        body_grad = QLinearGradient(body_rect.topLeft(), body_rect.bottomRight())
+        body_grad.setColorAt(0.0, QColor("#1E293B"))
+        body_grad.setColorAt(1.0, QColor("#0F172A"))
+        p.setPen(QPen(COL_BORDER, 1.2))
+        p.setBrush(QBrush(body_grad))
+        p.drawRoundedRect(body_rect, 8, 8)
+
+        # LED status FC di tengah
+        if any_fault and not self.ftc_enabled:
+            led_col = COL_ERR
+        elif any_fault and self.ftc_enabled:
+            led_col = COL_ACCENT_LT
+        else:
+            led_col = COL_OK if self.armed else COL_ACCENT
+
+        led_grad = QRadialGradient(cx, cy, body_r * 0.34)
+        led_grad.setColorAt(0.0, QColor("#FFFFFF"))
+        led_grad.setColorAt(0.5, led_col)
+        led_grad.setColorAt(1.0, QColor(led_col.red(), led_col.green(), led_col.blue(), 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(led_grad))
+        p.drawEllipse(QPointF(cx, cy), body_r * 0.34, body_r * 0.34)
+
+        # Label status FTC mini di bodi
+        status_txt = "FTC OK" if (any_fault and self.ftc_enabled) else ("FAIL!" if any_fault else "NOMINAL")
+        p.setPen(QColor("#FFFFFF"))
+        p.setFont(qfont(FONT_MONO, 6, QFont.Bold))
+        p.drawText(QRectF(cx - body_r, cy + body_r * 0.22, body_r * 2, 11),
+                   Qt.AlignCenter, status_txt)
+
+        # 3. Empat Rumah Motor & Status Fault Injeksi
+        esc_min = 1000.0
+        esc_max = 1300.0
+
+        for i, meta in enumerate(self._motors_meta):
+            mx = cx + meta["dx"] * arm_dx
+            my = cy + meta["dy"] * arm_dy
+            cw = meta["cw"]
+            f = self.faults[i]
+            is_fault = f["active"]
+            pct = f["percent"]
+            pwm_act = self._pwm_smooth[i]
+
+            # Aura Peringatan Berkedip Halus jika Motor Mengalami Fault
+            if is_fault:
+                pulse_alpha = int(45 + 35 * math.sin(self._pulse_phase))
+                pulse_r = prop_r * 1.15
+                halo = QRadialGradient(mx, my, pulse_r)
+                halo.setColorAt(0.0, QColor(239, 68, 68, pulse_alpha))
+                halo.setColorAt(0.6, QColor(245, 158, 11, int(pulse_alpha * 0.6)))
+                halo.setColorAt(1.0, QColor(239, 68, 68, 0))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(halo))
+                p.drawEllipse(QPointF(mx, my), pulse_r, pulse_r)
+
+            # Piringan Baling-baling (Propeller Disk)
+            p.save()
+            p.translate(mx, my)
+
+            if is_fault and pct >= 99.5:
+                # Motor Mati Total: Piringan redup & garis putus-putus merah
+                p.setPen(QPen(QColor("#EF4444"), 1.2, Qt.DashLine))
+                p.setBrush(QBrush(QColor(239, 68, 68, 25)))
+                p.drawEllipse(QPointF(0, 0), prop_r, prop_r)
+
+                # Indikator Silang Merah (X) Motor Cut-Off
+                p.setPen(QPen(QColor("#EF4444"), 1.8, Qt.SolidLine, Qt.RoundCap))
+                cr = prop_r * 0.45
+                p.drawLine(QPointF(-cr, -cr), QPointF(cr, cr))
+                p.drawLine(QPointF(-cr, cr), QPointF(cr, -cr))
+            else:
+                # Motor Berputar
+                if is_fault:
+                    disc_col = QColor("#F59E0B")  # Amber jika terdegradasi
+                else:
+                    disc_col = QColor(COL_ACCENT) if cw else QColor(COL_ACCENT_LT)
+
+                p_grad = QRadialGradient(0, 0, prop_r)
+                p_grad.setColorAt(0.0, QColor(disc_col.red(), disc_col.green(), disc_col.blue(), 65))
+                p_grad.setColorAt(0.7, QColor(disc_col.red(), disc_col.green(), disc_col.blue(), 25))
+                p_grad.setColorAt(1.0, QColor(disc_col.red(), disc_col.green(), disc_col.blue(), 0))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(p_grad))
+                p.drawEllipse(QPointF(0, 0), prop_r, prop_r)
+
+                # Bilah baling-baling berputar
+                p.rotate(self._prop_angles[i])
+                blade_alpha = 150 if not is_fault else 100
+                p.setPen(QPen(QColor(disc_col.red(), disc_col.green(), disc_col.blue(), blade_alpha), 1.6, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(QPointF(-prop_r * 0.85, 0), QPointF(prop_r * 0.85, 0))
+                p.drawLine(QPointF(0, -prop_r * 0.85), QPointF(0, prop_r * 0.85))
+
+            p.restore()
+
+            # Rumah Motor (Motor Hub)
+            m_grad = QRadialGradient(mx - 1.5, my - 1.5, motor_r * 1.2)
+            if is_fault and pct >= 99.5:
+                m_grad.setColorAt(0.0, QColor("#FCA5A5"))
+                m_grad.setColorAt(0.5, QColor("#EF4444"))
+                m_grad.setColorAt(1.0, QColor("#991B1B"))
+                hub_border = QColor("#7F1D1D")
+            elif is_fault:
+                m_grad.setColorAt(0.0, QColor("#FEF08A"))
+                m_grad.setColorAt(0.5, QColor("#F59E0B"))
+                m_grad.setColorAt(1.0, QColor("#B45309"))
+                hub_border = QColor("#92400E")
+            else:
+                m_grad.setColorAt(0.0, QColor("#FFFFFF"))
+                m_grad.setColorAt(0.4, QColor("#CBD5E1"))
+                m_grad.setColorAt(1.0, QColor("#475569"))
+                hub_border = COL_TEXT
+
+            p.setPen(QPen(hub_border, 1.2))
+            p.setBrush(QBrush(m_grad))
+            p.drawEllipse(QPointF(mx, my), motor_r, motor_r)
+
+            # Label Motor (M1, M2, M3, M4)
+            p.setPen(QColor("#FFFFFF") if is_fault else COL_TEXT)
+            p.setFont(qfont(FONT_UI, 6.5, QFont.Bold))
+            p.drawText(QRectF(mx - motor_r, my - motor_r, motor_r * 2, motor_r * 2),
+                       Qt.AlignCenter, meta["id"])
+
+            # Badge Status & Nilai Daya di Bawah/Atas Motor
+            meta_y = my + motor_r + 2 if meta["dy"] > 0 else my - motor_r - 23
+            badge_w = 68.0
+            badge_rect = QRectF(mx - badge_w / 2.0, meta_y, badge_w, 20)
+
+            if is_fault and pct >= 99.5:
+                status_str = "OFF (0%)"
+                status_bg = QColor("#FEE2E2")
+                status_fg = QColor("#991B1B")
+            elif is_fault:
+                status_str = f"-{pct:.0f}% RPM"
+                status_bg = QColor("#FEF3C7")
+                status_fg = QColor("#92400E")
+            else:
+                status_str = f"{meta['pos']} · 100%"
+                status_bg = QColor("#F1F5F9")
+                status_fg = QColor("#475569")
+
+            p.setPen(QPen(QColor("#CBD5E1"), 0.8))
+            p.setBrush(QBrush(status_bg))
+            p.drawRoundedRect(badge_rect, 4, 4)
+
+            p.setPen(status_fg)
+            p.setFont(qfont(FONT_UI, 5.5, QFont.Bold))
+            p.drawText(QRectF(badge_rect.left(), badge_rect.top() + 2, badge_rect.width(), 9),
+                       Qt.AlignCenter, status_str)
+
+            p.setPen(status_fg)
+            p.setFont(qfont(FONT_MONO, 5.5, QFont.Bold))
+            p.drawText(QRectF(badge_rect.left(), badge_rect.top() + 10, badge_rect.width(), 9),
+                       Qt.AlignCenter, f"{pwm_act:.0f} us")
+
+            # ── Bar Tingkat Daya Vertikal di Samping Motor ──
+            bar_w = 7.0
+            bar_h_max = prop_r * 0.85
+            bar_x = mx + meta["bar_side"] * (prop_r + 4)
+            if meta["bar_side"] < 0:
+                bar_x -= bar_w
+            bar_y_bot = my + bar_h_max
+
+            # Slot Background
+            slot_rect = QRectF(bar_x, my - bar_h_max, bar_w, bar_h_max * 2)
+            p.setPen(QPen(COL_BORDER, 1))
+            p.setBrush(QBrush(QColor("#FFFFFF")))
+            p.drawRoundedRect(slot_rect, 2, 2)
+
+            # Isi Bar Aktual (Hijau jika normal, Amber jika degradasi, Merah jika cut)
+            h_frac = max(0.0, min(1.0, (pwm_act - esc_min) / max(1.0, esc_max - esc_min)))
+            fill_h = h_frac * (bar_h_max * 2.0)
+            fill_rect = QRectF(bar_x + 1, bar_y_bot - fill_h, bar_w - 2, fill_h)
+
+            if is_fault and pct >= 99.5:
+                bar_col = COL_ERR
+            elif is_fault:
+                bar_col = COL_WARN
+            else:
+                bar_col = COL_OK
+
+            if fill_h > 0.5:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(bar_col))
+                p.drawRoundedRect(fill_rect, 1.5, 1.5)
+
+        p.end()
+
+
+class MotorFaultControlCard(QFrame):
+    """Kartu kontrol mandiri untuk satu motor (M1, M2, M3, atau M4):
+    1) Tombol toggle besar bernilai 1 dan 0 (sekali klik 1, klik lagi 0)
+    2) Slider & SpinBox persentase reduksi RPM (0% - 100%)
+    3) Tombol preset cepat (25%, 50%, 75%, 100% CUT)
+    4) Indikator status live telemetry daya nominal vs aktual."""
+
+    fault_changed = Signal(int, bool, float)  # motor_idx, active (0/1), percent
+
+    def __init__(self, motor_idx: int, name: str, desc: str, pin: str,
+                 cw: bool, parent=None):
+        super().__init__(parent)
+        self._motor_idx = motor_idx
+        self._name = name
+        self._desc = desc
+        self._pin = pin
+        self._cw = cw
+        self._active = False
+        self._percent = 100.0
+        self._pwm_nom = 1200.0
+        self._pwm_act = 1200.0
+
+        self.setObjectName("MotorFaultControlCard")
+        self.setStyleSheet(f"""
+            #MotorFaultControlCard {{
+                background: {COL_CARD.name()};
+                border: 1px solid {COL_BORDER.name()};
+                border-left: 4px solid {'#2563EB' if cw else '#0284C7'};
+                border-radius: 12px;
+            }}
+        """)
+        add_shadow(self, blur=14, dy=1, alpha=16)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        # ── Row 1: Header (Nama motor, Pin, Rotasi, Status badge) ──
+        h_row = QHBoxLayout()
+        h_row.setContentsMargins(0, 0, 0, 0)
+
+        rot_str = "CW \u21B7" if cw else "CCW \u21B6"
+        self._title_lbl = QLabel(f"<b>{name}</b> \u00B7 {desc}")
+        self._title_lbl.setFont(qfont(FONT_UI, 9, QFont.Bold, letter_spacing=0.8))
+        self._title_lbl.setStyleSheet(f"color: {COL_TEXT.name()};")
+        h_row.addWidget(self._title_lbl)
+
+        meta_lbl = QLabel(f"({pin} \u00B7 {rot_str})")
+        meta_lbl.setFont(qfont(FONT_UI, 7.5, QFont.Normal))
+        meta_lbl.setStyleSheet(f"color: {COL_MUTED.name()};")
+        h_row.addWidget(meta_lbl)
+
+        h_row.addStretch()
+
+        self._badge = QLabel("NORMAL [0]")
+        self._badge.setFixedHeight(22)
+        self._badge.setAlignment(Qt.AlignCenter)
+        self._badge.setFont(qfont(FONT_UI, 7.5, QFont.Bold, letter_spacing=1.0))
+        self._badge.setStyleSheet("""
+            background: #DCFCE7; color: #166534;
+            border: 1px solid #BBF7D0;
+            border-radius: 11px; padding: 0 10px;
+        """)
+        h_row.addWidget(self._badge)
+        lay.addLayout(h_row)
+
+        # ── Row 2: Tombol Toggle Utama (1 dan 0) ──
+        self._toggle_btn = QPushButton("\u25CF  [ 0 ] MOTOR NORMAL (AKTIF)")
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(False)
+        self._toggle_btn.setFixedHeight(34)
+        self._toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._toggle_btn.setFont(qfont(FONT_UI, 8.5, QFont.Bold, letter_spacing=1.0))
+        self._apply_toggle_style(False)
+        self._toggle_btn.clicked.connect(self._on_toggle_clicked)
+        lay.addWidget(self._toggle_btn)
+
+        # ── Row 3: Pengaturan Persentase Reduksi RPM (% Slider & SpinBox) ──
+        slider_frame = QFrame()
+        slider_frame.setStyleSheet(f"""
+            background: {COL_CARD_ALT.name()};
+            border: 1px solid {COL_BORDER.name()};
+            border-radius: 8px;
+        """)
+        sf_lay = QVBoxLayout(slider_frame)
+        sf_lay.setContentsMargins(10, 8, 10, 8)
+        sf_lay.setSpacing(6)
+
+        # Label & info reduksi
+        lbl_row = QHBoxLayout()
+        lbl_row.setContentsMargins(0, 0, 0, 0)
+        param_title = QLabel("REDUKSI RPM MOTOR :")
+        param_title.setFont(qfont(FONT_UI, 7.5, QFont.Bold, letter_spacing=0.8))
+        param_title.setStyleSheet(f"color: {COL_SUBTEXT.name()};")
+        lbl_row.addWidget(param_title)
+
+        lbl_row.addStretch()
+
+        self._pct_info = QLabel("100% (MATI TOTAL)")
+        self._pct_info.setFont(qfont(FONT_MONO, 8, QFont.Bold))
+        self._pct_info.setStyleSheet("color: #DC2626;")
+        lbl_row.addWidget(self._pct_info)
+        sf_lay.addLayout(lbl_row)
+
+        # Slider + SpinBox
+        ctl_row = QHBoxLayout()
+        ctl_row.setContentsMargins(0, 0, 0, 0)
+        ctl_row.setSpacing(10)
+
+        self._slider = QSlider(Qt.Horizontal)
+        self._slider.setRange(0, 100)
+        self._slider.setValue(100)
+        self._slider.setFixedHeight(22)
+        self._slider.setCursor(Qt.PointingHandCursor)
+        self._slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                border: 1px solid {COL_BORDER.name()};
+                height: 6px;
+                background: #FFFFFF;
+                border-radius: 3px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: #EF4444;
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: #FFFFFF;
+                border: 2px solid #DC2626;
+                width: 16px;
+                margin-top: -6px;
+                margin-bottom: -6px;
+                border-radius: 8px;
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: #FEE2E2;
+                border-color: #B91C1C;
+            }}
+        """)
+        ctl_row.addWidget(self._slider, stretch=1)
+
+        self._spin = QSpinBox()
+        self._spin.setRange(0, 100)
+        self._spin.setValue(100)
+        self._spin.setSuffix(" %")
+        self._spin.setFixedWidth(68)
+        self._spin.setFixedHeight(26)
+        self._spin.setFont(qfont(FONT_MONO, 8.5, QFont.Bold))
+        self._spin.setStyleSheet(f"""
+            QSpinBox {{
+                background: #FFFFFF;
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 5px;
+                color: {COL_TEXT.name()};
+                padding-left: 4px;
+            }}
+            QSpinBox:focus {{
+                border-color: {COL_ACCENT.name()};
+            }}
+        """)
+        ctl_row.addWidget(self._spin)
+        sf_lay.addLayout(ctl_row)
+
+        # Sinkronisasi Slider & SpinBox
+        self._slider.valueChanged.connect(self._on_slider_changed)
+        self._spin.valueChanged.connect(self._on_spin_changed)
+
+        # Tombol Preset Cepat (25%, 50%, 75%, 100% CUT)
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 2, 0, 0)
+        preset_row.setSpacing(6)
+        for pval, plbl in [(25, "25%"), (50, "50%"), (75, "75%"), (100, "100% CUT")]:
+            pbtn = QPushButton(plbl)
+            pbtn.setFixedHeight(22)
+            pbtn.setCursor(Qt.PointingHandCursor)
+            pbtn.setFont(qfont(FONT_UI, 6.5, QFont.Bold, letter_spacing=0.6))
+            pbtn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #FFFFFF;
+                    color: {COL_SUBTEXT.name()};
+                    border: 1px solid {COL_BORDER.name()};
+                    border-radius: 4px;
+                    padding: 0 4px;
+                }}
+                QPushButton:hover {{
+                    background: {COL_ACCENT_XLT.name()};
+                    color: {COL_ACCENT_DK.name()};
+                    border-color: {COL_ACCENT_LT.name()};
+                }}
+            """)
+            pbtn.clicked.connect(lambda checked=False, v=pval: self.set_percent(v))
+            preset_row.addWidget(pbtn, stretch=1)
+        sf_lay.addLayout(preset_row)
+
+        lay.addWidget(slider_frame)
+
+        # ── Row 4: Readout Output Telemetri Aktual ──
+        readout_row = QHBoxLayout()
+        readout_row.setContentsMargins(0, 0, 0, 0)
+        readout_row.setSpacing(8)
+
+        self._pill_nom = QLabel("NOM: 1200 us")
+        self._pill_act = QLabel("AKTUAL: 1200 us")
+        for pill in (self._pill_nom, self._pill_act):
+            pill.setFixedHeight(22)
+            pill.setAlignment(Qt.AlignCenter)
+            pill.setFont(qfont(FONT_MONO, 7.5, QFont.Bold))
+            pill.setStyleSheet(f"""
+                background: #FFFFFF;
+                border: 1px solid {COL_BORDER.name()};
+                border-radius: 5px;
+                color: {COL_SUBTEXT.name()};
+            """)
+            readout_row.addWidget(pill, stretch=1)
+        lay.addLayout(readout_row)
+
+    def _apply_toggle_style(self, active: bool):
+        if active:
+            self._toggle_btn.setText("\u26A0  [ 1 ] MOTOR DIMATIKAN (FAULT AKTIF)")
+            self._toggle_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #DC2626, stop:1 #EF4444);
+                    color: #FFFFFF;
+                    border: 1.5px solid #B91C1C;
+                    border-radius: 8px;
+                    padding: 0 10px;
+                }}
+                QPushButton:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #B91C1C, stop:1 #DC2626);
+                }}
+            """)
+            self._badge.setText("FAULT [1]")
+            self._badge.setStyleSheet("""
+                background: #FEE2E2; color: #991B1B;
+                border: 1px solid #FECACA;
+                border-radius: 11px; padding: 0 10px;
+            """)
+            self.setStyleSheet(f"""
+                #MotorFaultControlCard {{
+                    background: {COL_CARD.name()};
+                    border: 1.5px solid #FCA5A5;
+                    border-left: 4px solid #EF4444;
+                    border-radius: 12px;
+                }}
+            """)
+        else:
+            self._toggle_btn.setText("\u25CF  [ 0 ] MOTOR NORMAL (AKTIF)")
+            self._toggle_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #F8FAFC;
+                    color: {COL_TEXT.name()};
+                    border: 1.5px solid {COL_BORDER.name()};
+                    border-radius: 8px;
+                    padding: 0 10px;
+                }}
+                QPushButton:hover {{
+                    background: #F1F5F9;
+                    border-color: {COL_ACCENT.name()};
+                    color: {COL_ACCENT.name()};
+                }}
+            """)
+            self._badge.setText("NORMAL [0]")
+            self._badge.setStyleSheet("""
+                background: #DCFCE7; color: #166534;
+                border: 1px solid #BBF7D0;
+                border-radius: 11px; padding: 0 10px;
+            """)
+            self.setStyleSheet(f"""
+                #MotorFaultControlCard {{
+                    background: {COL_CARD.name()};
+                    border: 1px solid {COL_BORDER.name()};
+                    border-left: 4px solid {'#2563EB' if self._cw else '#0284C7'};
+                    border-radius: 12px;
+                }}
+            """)
+
+    def _update_info_label(self, val: int):
+        if val >= 100:
+            self._pct_info.setText("100% (MATI TOTAL)")
+            self._pct_info.setStyleSheet("color: #DC2626;")
+        elif val == 0:
+            self._pct_info.setText("0% (DAYA UTUH)")
+            self._pct_info.setStyleSheet("color: #16A34A;")
+        else:
+            self._pct_info.setText(f"{val}% (SISA {100 - val}%)")
+            self._pct_info.setStyleSheet("color: #D97706;")
+
+    def _on_toggle_clicked(self, checked: bool):
+        self._active = checked
+        self._apply_toggle_style(checked)
+        self.fault_changed.emit(self._motor_idx, self._active, self._percent)
+
+    def _on_slider_changed(self, val: int):
+        self._percent = float(val)
+        self._spin.blockSignals(True)
+        self._spin.setValue(val)
+        self._spin.blockSignals(False)
+        self._update_info_label(val)
+        self.fault_changed.emit(self._motor_idx, self._active, self._percent)
+
+    def _on_spin_changed(self, val: int):
+        self._percent = float(val)
+        self._slider.blockSignals(True)
+        self._slider.setValue(val)
+        self._slider.blockSignals(False)
+        self._update_info_label(val)
+        self.fault_changed.emit(self._motor_idx, self._active, self._percent)
+
+    def set_percent(self, val: int):
+        val = max(0, min(100, val))
+        self._slider.setValue(val)
+
+    def set_active(self, active: bool):
+        self._active = active
+        self._toggle_btn.setChecked(active)
+        self._apply_toggle_style(active)
+        self.fault_changed.emit(self._motor_idx, self._active, self._percent)
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def get_percent(self) -> float:
+        return self._percent
+
+    def update_telemetry(self, pwm_nom: float, pwm_act: float):
+        self._pwm_nom = pwm_nom
+        self._pwm_act = pwm_act
+        self._pill_nom.setText(f"NOM: {pwm_nom:.0f} us")
+        self._pill_act.setText(f"AKTUAL: {pwm_act:.0f} us")
+        if self._active:
+            if self._percent >= 99.5:
+                self._pill_act.setStyleSheet("""
+                    background: #FEE2E2; border: 1px solid #FCA5A5;
+                    border-radius: 5px; color: #991B1B; font-weight: bold;
+                """)
+            else:
+                self._pill_act.setStyleSheet("""
+                    background: #FEF3C7; border: 1px solid #FCD34D;
+                    border-radius: 5px; color: #92400E; font-weight: bold;
+                """)
+        else:
+            self._pill_act.setStyleSheet(f"""
+                background: #FFFFFF; border: 1px solid {COL_BORDER.name()};
+                border-radius: 5px; color: #16A34A; font-weight: bold;
+            """)
+
+
+class FtcStandaloneWindow(QMainWindow):
+    """Jendela terpisah (Standalone Window) untuk pengujian Fault Tolerant Control (FTC).
+    Memungkinkan pengguna memonitor dan mengontrol injeksi kegagalan motor
+    di layar monitor kedua atau window mengambang."""
+
+    closed = Signal()
+
+    def __init__(self, content_widget: QWidget, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("QMBED \u2014 FAULT TOLERANT CONTROL (FTC) LAB")
+        self.setMinimumSize(980, 700)
+        self.resize(1080, 760)
+
+        central = QWidget()
+        central.setStyleSheet(f"background: {COL_BG.name()};")
+        self.setCentralWidget(central)
+
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.addWidget(content_widget)
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 # ───────────────────── Main Window ─────────────────────
 
 class MainWindow(QMainWindow):
@@ -2239,6 +3020,19 @@ class MainWindow(QMainWindow):
         self._bench_imu = (0.0, 0.0, 0.0)           # (gx, gy, gz) deg/s
         self._bench_alt_press = (0.0, 0.0)          # (alt, press)
 
+        # ── Fault Tolerant Control (FTC) state ──
+        self._ftc_faults = [
+            {"active": False, "percent": 100.0},
+            {"active": False, "percent": 100.0},
+            {"active": False, "percent": 100.0},
+            {"active": False, "percent": 100.0},
+        ]
+        self._ftc_enabled = True
+        self._ftc_standalone_win = None
+        self._ftc_cards = []
+        self._ftc_diag_badge = None
+        self._ftc_diag_text = None
+
         # ── Telemetry & PID CSV Recorder state ──
         self._is_recording = False
         self._record_file = None
@@ -2275,6 +3069,7 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._build_rc_tab())        # 1
         self._stack.addWidget(self._build_bench_tab())     # 2
         self._stack.addWidget(self._build_pid_tab())       # 3
+        self._stack.addWidget(self._build_ftc_tab())       # 4
         body_lay.addWidget(self._stack, stretch=1)
 
         # Muat konfigurasi parameter PID terakhir yang tersimpan
@@ -2379,6 +3174,32 @@ class MainWindow(QMainWindow):
             p.setPen(QPen(COL_ACCENT, 1.5))
             p.drawPath(path)
 
+        elif icon_type == "FTC":
+            # ── FTC / Shield & Fault Motor Indicator Icon ──
+            p.setPen(QPen(COL_ACCENT_DK, 1.3))
+            p.setBrush(QBrush(QColor("#E0F2FE")))
+            # Perisai pelindung (Shield)
+            shield = QPainterPath()
+            shield.moveTo(center, center - r)
+            shield.lineTo(center + r * 0.82, center - r * 0.45)
+            shield.quadTo(center + r * 0.78, center + r * 0.4, center, center + r)
+            shield.quadTo(center - r * 0.78, center + r * 0.4, center - r * 0.82, center - r * 0.45)
+            shield.closeSubpath()
+            p.drawPath(shield)
+
+            # Lambang baut/lightning/warning di tengah perisai
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor("#EF4444")))
+            bolt = QPolygonF([
+                QPointF(center + 0.5, center - r * 0.5),
+                QPointF(center - 2.5, center),
+                QPointF(center - 0.2, center),
+                QPointF(center - 0.5, center + r * 0.5),
+                QPointF(center + 2.5, center - 0.2),
+                QPointF(center + 0.2, center - 0.2),
+            ])
+            p.drawPolygon(bolt)
+
         p.end()
         return QIcon(pixmap)
 
@@ -2410,6 +3231,7 @@ class MainWindow(QMainWindow):
             ("CONTROL", 1, "CONTROL", self._create_nav_icon("CONTROL")),
             ("BENCH TEST", 2, "BENCH TEST", self._create_nav_icon("BENCH")),
             ("PID TUNING", 3, "PID TUNING", self._create_nav_icon("PID")),
+            ("FAULT TOLERANT", 4, "FTC", self._create_nav_icon("FTC")),
         ]
         for title, idx, short_name, icon in views:
             action = QAction(icon, f"  {title}", self)
@@ -3585,6 +4407,559 @@ class MainWindow(QMainWindow):
                 self._pid_inputs[k].setValue(v)
         self.set_hint("Parameter PID & Limit ESC PWM dikembalikan ke nilai default.", level="ok")
 
+    # ────────── Fault Tolerant Control (FTC) Tab ──────────
+
+    def _build_ftc_tab(self):
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(10)
+
+        # ── 1. Header Banner & Action Bar ──
+        banner = QFrame()
+        banner.setStyleSheet(f"""
+            background: {COL_CARD.name()};
+            border: 1px solid {COL_BORDER.name()};
+            border-radius: 12px;
+        """)
+        add_shadow(banner, blur=14, dy=1, alpha=16)
+
+        bl = QHBoxLayout(banner)
+        bl.setContentsMargins(16, 10, 16, 10)
+        bl.setSpacing(12)
+
+        icon_lbl = QLabel("🛡️")
+        icon_lbl.setFont(qfont(FONT_UI, 14))
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setFixedWidth(30)
+        bl.addWidget(icon_lbl, 0, Qt.AlignVCenter)
+
+        btxt = QLabel("<b style='color:#0369A1; font-size:11px; letter-spacing:0.8px;'>FAULT TOLERANT CONTROL (FTC) TESTBENCH :</b> "
+                      "<span style='color:#0F172A; font-size:10px; font-weight:500;'>Uji toleransi kegagalan motor (Loss of Effectiveness). "
+                      "Gunakan tombol toggle <b>[0 / 1]</b> untuk mematikan motor dan sesuaikan slider <b>% RPM</b> "
+                      "untuk menguji kestabilan sikap (Roll & Pitch level) drone.</span>")
+        btxt.setWordWrap(True)
+        bl.addWidget(btxt, stretch=1)
+
+        # Tombol Toggle Mode Algoritma FTC
+        self._ftc_mode_btn = QPushButton("🛡️ FTC: AKTIF (TOLERAN)")
+        self._ftc_mode_btn.setCheckable(True)
+        self._ftc_mode_btn.setChecked(True)
+        self._ftc_mode_btn.setFixedHeight(30)
+        self._ftc_mode_btn.setCursor(Qt.PointingHandCursor)
+        self._ftc_mode_btn.setFont(qfont(FONT_UI, 7.5, QFont.Bold, letter_spacing=0.8))
+        self._ftc_mode_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #E0F2FE; color: #0369A1;
+                border: 1px solid #BAE6FD; border-radius: 7px;
+                padding: 0 10px;
+            }}
+            QPushButton:hover {{
+                background: #BAE6FD;
+            }}
+            QPushButton:!checked {{
+                background: #FEF3C7; color: #92400E;
+                border: 1px solid #FDE68A;
+            }}
+        """)
+        self._ftc_mode_btn.toggled.connect(self._on_ftc_mode_toggled)
+        bl.addWidget(self._ftc_mode_btn)
+
+        # Tombol Reset Semua Motor ke Normal
+        self._ftc_reset_btn = QPushButton("NORMALKAN (0% FAULT)")
+        self._ftc_reset_btn.setFixedHeight(30)
+        self._ftc_reset_btn.setCursor(Qt.PointingHandCursor)
+        self._ftc_reset_btn.setFont(qfont(FONT_UI, 7.5, QFont.Bold, letter_spacing=0.8))
+        self._ftc_reset_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #F1F5F9; color: {COL_TEXT.name()};
+                border: 1px solid {COL_BORDER.name()}; border-radius: 7px;
+                padding: 0 10px;
+            }}
+            QPushButton:hover {{
+                background: #E2E8F0;
+            }}
+        """)
+        self._ftc_reset_btn.clicked.connect(self._reset_all_ftc_faults)
+        bl.addWidget(self._ftc_reset_btn)
+
+        # Tombol Buka di Jendela Terpisah (Standalone Pop-out)
+        self._ftc_detach_btn = QPushButton("⤢ WINDOW TERPISAH")
+        self._ftc_detach_btn.setFixedHeight(30)
+        self._ftc_detach_btn.setCursor(Qt.PointingHandCursor)
+        self._ftc_detach_btn.setFont(qfont(FONT_UI, 7.5, QFont.Bold, letter_spacing=0.8))
+        self._ftc_detach_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #EFF6FF; color: #1D4ED8;
+                border: 1px solid #BFDBFE; border-radius: 7px;
+                padding: 0 10px;
+            }}
+            QPushButton:hover {{
+                background: #DBEAFE;
+            }}
+        """)
+        self._ftc_detach_btn.clicked.connect(self._open_ftc_standalone_window)
+        bl.addWidget(self._ftc_detach_btn)
+
+        lay.addWidget(banner)
+
+        # ── 2. Main Body Content (Dua Kolom: Visual Quad-X + 4 Motor Fault Cards) ──
+        body_row = QHBoxLayout()
+        body_row.setSpacing(12)
+
+        # ── Kolom Kiri: Diagram Interaktif Quad-X FTC + Kartu Analisis ──
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+
+        self._ftc_mix = FtcMotorMixWidget()
+        add_shadow(self._ftc_mix, blur=18, dy=2, alpha=20)
+        left_col.addWidget(self._ftc_mix, stretch=1)
+
+        # Kartu Analisis & Diagnostik Respon FTC
+        diag_card = QFrame()
+        diag_card.setStyleSheet(f"""
+            background: {COL_CARD.name()};
+            border: 1px solid {COL_BORDER.name()};
+            border-radius: 12px;
+        """)
+        add_shadow(diag_card, blur=14, dy=1, alpha=16)
+        diag_lay = QVBoxLayout(diag_card)
+        diag_lay.setContentsMargins(14, 10, 14, 10)
+        diag_lay.setSpacing(6)
+
+        diag_header = QHBoxLayout()
+        diag_header.setContentsMargins(0, 0, 0, 0)
+        diag_title = QLabel("ANALISIS KESEIMBANGAN & ALOKASI TORSI")
+        diag_title.setFont(qfont(FONT_UI, 8.5, QFont.Bold, letter_spacing=1.0))
+        diag_title.setStyleSheet(f"color: {COL_TEXT.name()};")
+        diag_header.addWidget(diag_title)
+
+        diag_header.addStretch()
+
+        self._ftc_diag_badge = QLabel("SISTEM NORMAL")
+        self._ftc_diag_badge.setFixedHeight(20)
+        self._ftc_diag_badge.setAlignment(Qt.AlignCenter)
+        self._ftc_diag_badge.setFont(qfont(FONT_UI, 7, QFont.Bold, letter_spacing=1.0))
+        self._ftc_diag_badge.setStyleSheet("""
+            background: #DCFCE7; color: #166534;
+            border-radius: 10px; padding: 0 10px;
+        """)
+        diag_header.addWidget(self._ftc_diag_badge)
+        diag_lay.addLayout(diag_header)
+
+        self._ftc_diag_text = QLabel(
+            "Semua 4 motor beroperasi dalam kondisi nominal. "
+            "Torsi Roll, Pitch, dan Yaw seimbang sempurna untuk menahan sikap datar (level horizon)."
+        )
+        self._ftc_diag_text.setFont(qfont(FONT_UI, 8, QFont.Normal))
+        self._ftc_diag_text.setStyleSheet(f"color: {COL_SUBTEXT.name()};")
+        self._ftc_diag_text.setWordWrap(True)
+        diag_lay.addWidget(self._ftc_diag_text)
+
+        left_col.addWidget(diag_card)
+        body_row.addLayout(left_col, stretch=5)
+
+        # ── Kolom Kanan: 4 Kartu Motor Quad-X (2x2 Grid) & Toolbar Skenario ──
+        right_col = QVBoxLayout()
+        right_col.setSpacing(10)
+
+        # 2x2 Grid Motor Control Cards:
+        # Sesuai orientasi fisik drone:
+        # M1 (FL, Depan-Kiri)   | M2 (FR, Depan-Kanan)
+        # M4 (BL, Belakang-Kiri)| M3 (BR, Belakang-Kanan)
+        grid = QGridLayout()
+        grid.setSpacing(10)
+
+        motors_info = [
+            (0, "M1", "DEPAN-KIRI (FL)",   "PB6", True,  0, 0),
+            (1, "M2", "DEPAN-KANAN (FR)",  "PB7", False, 0, 1),
+            (3, "M4", "BELAKANG-KIRI (BL)","PB9", False, 1, 0),
+            (2, "M3", "BELAKANG-KANAN (BR)","PB8", True,  1, 1),
+        ]
+
+        self._ftc_cards = [None, None, None, None]
+        for idx, m_id, desc, pin, cw, r, c in motors_info:
+            card = MotorFaultControlCard(idx, m_id, desc, pin, cw)
+            card.fault_changed.connect(self._on_ftc_fault_changed)
+            grid.addWidget(card, r, c)
+            self._ftc_cards[idx] = card
+
+        right_col.addLayout(grid, stretch=1)
+
+        # Toolbar Skenario Uji Cepat (Quick Bench Scenarios)
+        scen_card = QFrame()
+        scen_card.setStyleSheet(f"""
+            background: {COL_CARD.name()};
+            border: 1px solid {COL_BORDER.name()};
+            border-radius: 10px;
+        """)
+        scen_lay = QHBoxLayout(scen_card)
+        scen_lay.setContentsMargins(12, 6, 12, 6)
+        scen_lay.setSpacing(8)
+
+        scen_lbl = QLabel("SKENARIO CEPAT :")
+        scen_lbl.setFont(qfont(FONT_UI, 7.5, QFont.Bold, letter_spacing=0.8))
+        scen_lbl.setStyleSheet(f"color: {COL_SUBTEXT.name()};")
+        scen_lay.addWidget(scen_lbl)
+
+        scenarios = [
+            ("M1 FAIL 100%", lambda: self._apply_ftc_scenario(0, 100)),
+            ("M2 FAIL 100%", lambda: self._apply_ftc_scenario(1, 100)),
+            ("M3 FAIL 100%", lambda: self._apply_ftc_scenario(2, 100)),
+            ("M4 FAIL 100%", lambda: self._apply_ftc_scenario(3, 100)),
+            ("M1 50% LOSS",  lambda: self._apply_ftc_scenario(0, 50)),
+        ]
+
+        for s_title, s_fn in scenarios:
+            sbtn = QPushButton(s_title)
+            sbtn.setFixedHeight(24)
+            sbtn.setCursor(Qt.PointingHandCursor)
+            sbtn.setFont(qfont(FONT_UI, 7, QFont.Bold))
+            sbtn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COL_CARD_ALT.name()};
+                    color: {COL_TEXT.name()};
+                    border: 1px solid {COL_BORDER.name()};
+                    border-radius: 5px;
+                    padding: 0 6px;
+                }}
+                QPushButton:hover {{
+                    background: #FEE2E2;
+                    color: #991B1B;
+                    border-color: #FCA5A5;
+                }}
+            """)
+            sbtn.clicked.connect(s_fn)
+            scen_lay.addWidget(sbtn, stretch=1)
+
+        right_col.addWidget(scen_card)
+        body_row.addLayout(right_col, stretch=6)
+
+        lay.addLayout(body_row, stretch=1)
+        return page
+
+    def _on_ftc_fault_changed(self, motor_idx: int, active: bool, percent: float):
+        if 0 <= motor_idx < 4:
+            self._ftc_faults[motor_idx] = {"active": active, "percent": percent}
+
+        # Sinkronkan tampilan jika standalone window terbuka
+        if hasattr(self, "_ftc_standalone_cards") and self._ftc_standalone_cards:
+            if 0 <= motor_idx < len(self._ftc_standalone_cards):
+                card = self._ftc_standalone_cards[motor_idx]
+                if card:
+                    card.blockSignals(True)
+                    card.set_active(active)
+                    card.set_percent(int(percent))
+                    card.blockSignals(False)
+
+        # Kirim perintah FAULT ke ESP32 / STM32 via Serial
+        self._send_ftc_command()
+
+    def _on_ftc_mode_toggled(self, checked: bool):
+        self._ftc_enabled = checked
+        if checked:
+            self._ftc_mode_btn.setText("🛡️ FTC: AKTIF (TOLERAN)")
+            self._ftc_mode_btn.setStyleSheet("""
+                QPushButton {
+                    background: #E0F2FE; color: #0369A1;
+                    border: 1px solid #BAE6FD; border-radius: 7px;
+                    padding: 0 10px;
+                }
+                QPushButton:hover { background: #BAE6FD; }
+            """)
+            self.set_hint("Mode FTC: AKTIF \u2014 Algoritma re-alokasi torsi Quad-X aktif toleran kegagalan.", level="ok")
+        else:
+            self._ftc_mode_btn.setText("⚠️ FTC: OFF (MIXER STANDAR)")
+            self._ftc_mode_btn.setStyleSheet("""
+                QPushButton {
+                    background: #FEF3C7; color: #92400E;
+                    border: 1px solid #FDE68A; border-radius: 7px;
+                    padding: 0 10px;
+                }
+                QPushButton:hover { background: #FDE68A; }
+            """)
+            self.set_hint("Mode FTC: NONAKTIF \u2014 Menggunakan mixer standar tanpa re-alokasi penyeimbang.", level="warn")
+
+        # Kirim perintah mode FTC jika serial terhubung
+        if self._serial and self._serial.is_open:
+            cmd = b"FTC 1\n" if checked else b"FTC 0\n"
+            try:
+                self._serial.write(cmd)
+                self._serial.flush()
+            except Exception:
+                pass
+
+    def _reset_all_ftc_faults(self):
+        for idx in range(4):
+            self._ftc_faults[idx] = {"active": False, "percent": 100.0}
+            if hasattr(self, "_ftc_cards") and self._ftc_cards and self._ftc_cards[idx]:
+                card = self._ftc_cards[idx]
+                card.blockSignals(True)
+                card.set_active(False)
+                card.set_percent(100)
+                card.blockSignals(False)
+            if hasattr(self, "_ftc_standalone_cards") and self._ftc_standalone_cards and self._ftc_standalone_cards[idx]:
+                scard = self._ftc_standalone_cards[idx]
+                scard.blockSignals(True)
+                scard.set_active(False)
+                scard.set_percent(100)
+                scard.blockSignals(False)
+
+        self._send_ftc_command()
+        self.set_hint("Semua motor dinormalkan kembali (0% fault, daya 100%) \u2713", level="ok")
+
+    def _apply_ftc_scenario(self, failed_idx: int, percent: int):
+        for idx in range(4):
+            is_target = (idx == failed_idx)
+            pct = float(percent) if is_target else 100.0
+            self._ftc_faults[idx] = {"active": is_target, "percent": pct}
+            if hasattr(self, "_ftc_cards") and self._ftc_cards and self._ftc_cards[idx]:
+                card = self._ftc_cards[idx]
+                card.blockSignals(True)
+                card.set_active(is_target)
+                card.set_percent(int(pct))
+                card.blockSignals(False)
+            if hasattr(self, "_ftc_standalone_cards") and self._ftc_standalone_cards and self._ftc_standalone_cards[idx]:
+                scard = self._ftc_standalone_cards[idx]
+                scard.blockSignals(True)
+                scard.set_active(is_target)
+                scard.set_percent(int(pct))
+                scard.blockSignals(False)
+
+        self._send_ftc_command()
+        self.set_hint(f"Skenario diterapkan: Motor {failed_idx + 1} fault reduksi {percent}% \u2713", level="warn")
+
+    def _send_ftc_command(self):
+        m1_a = 1 if self._ftc_faults[0]["active"] else 0
+        m1_p = int(self._ftc_faults[0]["percent"])
+        m2_a = 1 if self._ftc_faults[1]["active"] else 0
+        m2_p = int(self._ftc_faults[1]["percent"])
+        m3_a = 1 if self._ftc_faults[2]["active"] else 0
+        m3_p = int(self._ftc_faults[2]["percent"])
+        m4_a = 1 if self._ftc_faults[3]["active"] else 0
+        m4_p = int(self._ftc_faults[3]["percent"])
+
+        cmd_str = f"FAULT {m1_a} {m1_p} {m2_a} {m2_p} {m3_a} {m3_p} {m4_a} {m4_p}\n"
+        if self._serial and self._serial.is_open:
+            try:
+                self._serial.write(cmd_str.encode("ascii"))
+                self._serial.flush()
+            except Exception as e:
+                self.set_hint(f"Gagal mengirim perintah FAULT via serial: {e}", level="err")
+
+    def _update_ftc(self):
+        roll = self._bench_smc[0]
+        pitch = self._bench_smc[1]
+        yaw = self._bench_smc[2]
+        ur = self._bench_smc[3]
+        up = self._bench_smc[4]
+        uy = self._bench_smc[5]
+
+        throttle = self._update_gui_throttle()
+
+        esc_min = 1000.0
+        esc_arm = 1200.0
+        esc_max = 1300.0
+        if hasattr(self, "_pid_inputs") and self._pid_inputs:
+            if "esc_min_pwm" in self._pid_inputs:
+                esc_min = self._pid_inputs["esc_min_pwm"].value()
+            if "esc_arm_spin_pwm" in self._pid_inputs:
+                esc_arm = self._pid_inputs["esc_arm_spin_pwm"].value()
+            if "esc_max_pwm" in self._pid_inputs:
+                esc_max = self._pid_inputs["esc_max_pwm"].value()
+
+        # Mixer nominal Quad-X
+        # M1 (FL CW):  base + ur + up - uy
+        # M2 (FR CCW): base - ur + up + uy
+        # M3 (BR CW):  base - ur - up - uy
+        # M4 (BL CCW): base + ur - up + uy
+        m1_nom = max(esc_min, min(esc_max, throttle + ur + up - uy))
+        m2_nom = max(esc_min, min(esc_max, throttle - ur + up + uy))
+        m3_nom = max(esc_min, min(esc_max, throttle - ur - up - uy))
+        m4_nom = max(esc_min, min(esc_max, throttle + ur - up + uy))
+        pwm_nom = [m1_nom, m2_nom, m3_nom, m4_nom]
+        pwm_act = list(pwm_nom)
+
+        active_fault_indices = [i for i in range(4) if self._ftc_faults[i]["active"]]
+        n_faults = len(active_fault_indices)
+
+        if not self._ftc_enabled or n_faults == 0:
+            # Mode Mixer Standar: daya motor langsung terpotong tanpa re-alokasi
+            for i in range(4):
+                if self._ftc_faults[i]["active"]:
+                    loss = max(0.0, min(1.0, self._ftc_faults[i]["percent"] / 100.0))
+                    eff = 1.0 - loss
+                    pwm_act[i] = esc_min + (pwm_nom[i] - esc_min) * eff
+        else:
+            # Mode FTC: Algoritma Re-alokasi Torsi & Keseimbangan Sikap
+            if n_faults == 1:
+                fail_idx = active_fault_indices[0]
+                loss = max(0.0, min(1.0, self._ftc_faults[fail_idx]["percent"] / 100.0))
+                eff = 1.0 - loss
+
+                # 1. Terapkan penurunan pada motor yang rusak
+                pwm_act[fail_idx] = esc_min + (pwm_nom[fail_idx] - esc_min) * eff
+
+                # 2. Re-alokasi: motor diagonal diatur turun untuk meniadakan momen miring,
+                # sedangkan pasangan motor ortogonal dinaikkan untuk menahan collective thrust
+                diag_map = {0: 2, 1: 3, 2: 0, 3: 1}
+                ortho_map = {0: (1, 3), 1: (0, 2), 2: (1, 3), 3: (0, 2)}
+
+                diag_idx = diag_map[fail_idx]
+                ortho1, ortho2 = ortho_map[fail_idx]
+
+                # Kurangi motor diagonal agar torsi Roll & Pitch seimbang
+                pwm_act[diag_idx] = esc_min + (pwm_nom[diag_idx] - esc_min) * eff
+
+                # Berikan daya kompensasi ke dua motor tersisa
+                lost_thrust = (pwm_nom[fail_idx] - esc_min) * loss
+                boost = lost_thrust * 0.52
+                pwm_act[ortho1] = max(esc_min, min(esc_max, pwm_nom[ortho1] + boost))
+                pwm_act[ortho2] = max(esc_min, min(esc_max, pwm_nom[ortho2] + boost))
+            else:
+                # Bila lebih dari 1 motor rusak
+                for i in range(4):
+                    if self._ftc_faults[i]["active"]:
+                        loss = max(0.0, min(1.0, self._ftc_faults[i]["percent"] / 100.0))
+                        eff = 1.0 - loss
+                        pwm_act[i] = esc_min + (pwm_nom[i] - esc_min) * eff
+
+        # Hitung selisih torsi aktual (Roll & Pitch net moments)
+        # Roll moment: (M1 + M4) - (M2 + M3)
+        d_roll = ((pwm_act[0] + pwm_act[3]) - (pwm_act[1] + pwm_act[2])) * 0.5
+        # Pitch moment: (M1 + M2) - (M3 + M4)
+        d_pitch = ((pwm_act[0] + pwm_act[1]) - (pwm_act[2] + pwm_act[3])) * 0.5
+
+        # Update widget mixer visual
+        if hasattr(self, "_ftc_mix"):
+            self._ftc_mix.set_data(roll, pitch, yaw, ur, up, uy,
+                                   throttle, self._armed, self._ftc_faults,
+                                   self._ftc_enabled, pwm_nom, pwm_act,
+                                   d_roll, d_pitch)
+
+        if hasattr(self, "_ftc_standalone_mix") and self._ftc_standalone_mix:
+            self._ftc_standalone_mix.set_data(roll, pitch, yaw, ur, up, uy,
+                                              throttle, self._armed, self._ftc_faults,
+                                              self._ftc_enabled, pwm_nom, pwm_act,
+                                              d_roll, d_pitch)
+
+        # Update readout pada kartu motor
+        if hasattr(self, "_ftc_cards") and self._ftc_cards:
+            for i in range(4):
+                if self._ftc_cards[i]:
+                    self._ftc_cards[i].update_telemetry(pwm_nom[i], pwm_act[i])
+
+        # Update readout pada kartu motor standalone window jika ada
+        if hasattr(self, "_ftc_standalone_cards") and self._ftc_standalone_cards:
+            for i in range(4):
+                if self._ftc_standalone_cards[i]:
+                    self._ftc_standalone_cards[i].update_telemetry(pwm_nom[i], pwm_act[i])
+
+        # Update kartu diagnostik
+        if hasattr(self, "_ftc_diag_badge") and self._ftc_diag_badge:
+            if n_faults == 0:
+                self._ftc_diag_badge.setText("SISTEM NORMAL")
+                self._ftc_diag_badge.setStyleSheet("""
+                    background: #DCFCE7; color: #166534;
+                    border-radius: 10px; padding: 0 10px;
+                """)
+                self._ftc_diag_text.setText(
+                    "Semua 4 motor beroperasi dalam kondisi nominal. "
+                    "Torsi Roll, Pitch, dan Yaw seimbang sempurna untuk menahan sikap datar (level horizon)."
+                )
+            elif n_faults == 1:
+                f_idx = active_fault_indices[0]
+                m_name = f"M{f_idx + 1}"
+                pct = int(self._ftc_faults[f_idx]["percent"])
+                if self._ftc_enabled:
+                    self._ftc_diag_badge.setText(f"FTC RECOVERY ({m_name} FAIL)")
+                    self._ftc_diag_badge.setStyleSheet("""
+                        background: #E0F2FE; color: #0369A1;
+                        border-radius: 10px; padding: 0 10px;
+                    """)
+                    diag_desc = (
+                        f"<b>FTC AKTIF:</b> Terdeteksi degradasi {pct}% pada motor {m_name}. "
+                        f"Algoritma secara otomatis merelaksasi kendali Yaw (uYaw \u2248 0) dan menyesuaikan "
+                        f"motor diagonal serta menaikkan pasangan motor ortogonal. Net moment terkendali: "
+                        f"\u0394Roll: {d_roll:+.1f} \u00B7 \u0394Pitch: {d_pitch:+.1f} (Drone tetap datar/level)."
+                    )
+                    self._ftc_diag_text.setText(diag_desc)
+                else:
+                    self._ftc_diag_badge.setText(f"BAHAYA ({m_name} FAIL)")
+                    self._ftc_diag_badge.setStyleSheet("""
+                        background: #FEE2E2; color: #991B1B;
+                        border-radius: 10px; padding: 0 10px;
+                    """)
+                    diag_desc = (
+                        f"<b style='color:#DC2626;'>PERINGATAN (NON-FTC):</b> Motor {m_name} terpotong {pct}%. "
+                        f"Tanpa re-alokasi FTC, drone mengalami ketidakseimbangan torsi parah: "
+                        f"\u0394Roll: {d_roll:+.1f} \u00B7 \u0394Pitch: {d_pitch:+.1f}. Drone akan miring hebat dan berguling!"
+                    )
+                    self._ftc_diag_text.setText(diag_desc)
+            else:
+                self._ftc_diag_badge.setText(f"MULTI-MOTOR FAULT ({n_faults} FAILS)")
+                self._ftc_diag_badge.setStyleSheet("""
+                    background: #FEE2E2; color: #991B1B;
+                    border-radius: 10px; padding: 0 10px;
+                """)
+                self._ftc_diag_text.setText(
+                    f"Peringatan: {n_faults} motor mengalami kegagalan simultan. "
+                    "Segera lakukan pendaratan darurat (Emergency Cut-Off / Disarm)."
+                )
+
+    def _open_ftc_standalone_window(self):
+        if self._ftc_standalone_win is not None:
+            self._ftc_standalone_win.showNormal()
+            self._ftc_standalone_win.activateWindow()
+            return
+
+        # Buat content terpisah yang sinkron
+        win_content = QWidget()
+        w_lay = QVBoxLayout(win_content)
+        w_lay.setContentsMargins(0, 0, 0, 0)
+        w_lay.setSpacing(12)
+
+        # Main horizontal layout
+        h_row = QHBoxLayout()
+        h_row.setSpacing(12)
+
+        self._ftc_standalone_mix = FtcMotorMixWidget()
+        add_shadow(self._ftc_standalone_mix, blur=18, dy=2, alpha=20)
+        h_row.addWidget(self._ftc_standalone_mix, stretch=5)
+
+        # Right grid
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        motors_info = [
+            (0, "M1", "DEPAN-KIRI (FL)",   "PB6", True,  0, 0),
+            (1, "M2", "DEPAN-KANAN (FR)",  "PB7", False, 0, 1),
+            (3, "M4", "BELAKANG-KIRI (BL)","PB9", False, 1, 0),
+            (2, "M3", "BELAKANG-KANAN (BR)","PB8", True,  1, 1),
+        ]
+
+        self._ftc_standalone_cards = [None, None, None, None]
+        for idx, m_id, desc, pin, cw, r, c in motors_info:
+            scard = MotorFaultControlCard(idx, m_id, desc, pin, cw)
+            # Muat status fault saat ini
+            scard.set_active(self._ftc_faults[idx]["active"])
+            scard.set_percent(int(self._ftc_faults[idx]["percent"]))
+            scard.fault_changed.connect(self._on_ftc_fault_changed)
+            grid.addWidget(scard, r, c)
+            self._ftc_standalone_cards[idx] = scard
+
+        h_row.addLayout(grid, stretch=6)
+        w_lay.addLayout(h_row)
+
+        self._ftc_standalone_win = FtcStandaloneWindow(win_content, parent=self)
+        self._ftc_standalone_win.closed.connect(self._on_ftc_standalone_closed)
+        self._ftc_standalone_win.show()
+        self.set_hint("Window FTC Mandiri (Standalone) berhasil dibuka \u2713", level="ok")
+
+    def _on_ftc_standalone_closed(self):
+        self._ftc_standalone_win = None
+        self._ftc_standalone_cards = []
+
     # ────────── CSV Recording (Telemetry & PID) ──────────
 
     def _toggle_recording(self):
@@ -3788,6 +5163,11 @@ class MainWindow(QMainWindow):
                 self._serial.close()
             except Exception:
                 pass
+        if hasattr(self, "_ftc_standalone_win") and self._ftc_standalone_win:
+            try:
+                self._ftc_standalone_win.close()
+            except Exception:
+                pass
         super().closeEvent(event)
 
     # ────────── lifecycle ──────────
@@ -3799,6 +5179,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_bench_mix"):
             self._bench_mix.animate()
             self._update_bench()
+        if hasattr(self, "_ftc_mix"):
+            self._ftc_mix.animate()
+            self._update_ftc()
 
     # ────────── IMU calibration ──────────
 
@@ -4130,6 +5513,16 @@ class MainWindow(QMainWindow):
         m = PID_OK_RE.search(text)
         if m:
             self.set_hint("Parameter PID berhasil diterapkan ke Drone \u2713", level="ok")
+            return
+
+        m = FAULT_OK_RE.search(text)
+        if m:
+            self.set_hint(f"Konfirmasi Drone: {text.strip()} \u2713", level="ok")
+            return
+
+        m = FTC_OK_RE.search(text)
+        if m:
+            self.set_hint(f"Konfirmasi FTC: {text.strip()} \u2713", level="ok")
             return
 
         m = CAL_OK_RE.search(text)

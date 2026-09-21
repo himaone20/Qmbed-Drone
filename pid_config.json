@@ -1,17 +1,17 @@
 {
     "angle_kp": 7.0,
-    "angle_ki": 0.7,
-    "angle_kd": 0.004,
-    "rate_kp": 1.017,
-    "rate_ki": 0.15,
-    "rate_kd": 0.017,
+    "angle_ki": 0.0,
+    "angle_kd": 0.0005,
+    "rate_kp": 1.5,
+    "rate_ki": 1.0,
+    "rate_kd": 0.0002,
     "yaw_kp": 2.0,
     "yaw_ki": 0.15,
     "yaw_kd": 0.0,
     "esc_min_pwm": 1000.0,
     "esc_arm_spin_pwm": 1200.0,
-    "esc_max_pwm": 1600.0,
-    "hover_throttle_pwm": 1330.0,
-    "max_delta_pwm": 100.0,
-    "max_angle": 10.0
+    "esc_max_pwm": 1800.0,
+    "hover_throttle_pwm": 1475.0,
+    "max_delta_pwm": 150.0,
+    "max_angle": 7.0
 }
